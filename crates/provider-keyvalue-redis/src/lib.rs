@@ -30,6 +30,7 @@ mod bindings {
             "wrpc:keyvalue/atomics@0.2.0-draft": generate,
             "wrpc:keyvalue/batch@0.2.0-draft": generate,
             "wrpc:keyvalue/store@0.2.0-draft": generate,
+            "wrpc:keyvalue/watcher@0.2.0-draft": generate,
         }
     });
 }
@@ -317,6 +318,18 @@ impl keyvalue::batch::Handler<Option<Context>> for KvRedisProvider {
     }
 }
 
+impl keyvalue::watcher::Handler<Option<Context>> for KvRedisProvider {
+    async  fn on_set(&self,cx:Option<Context>,bucket:String,key:String,value: wit_bindgen_wrpc::bytes::Bytes,) -> wit_bindgen_wrpc::anyhow::Result<()> {
+        check_bucket_name(&bucket);
+        let mut noti_cmd = redis::cmd("PSUBSCRIBE");
+        noti_cmd.arg("__keyevent@0__:set").arg(key);
+        match self.exec_cmd(cx, &mut noti_cmd).await {
+            Ok(_) => Ok(()),
+            Err(err) => Err(err.into()),
+        }
+    }
+}
+
 /// Handle provider control commands
 impl Provider for KvRedisProvider {
     /// Provider should perform any operations needed for a new link,
@@ -380,6 +393,64 @@ impl Provider for KvRedisProvider {
 
         Ok(())
     }
+
+    async fn receive_link_config_as_source(
+    &self,
+    LinkConfig {
+        target_id,
+        config,
+        secrets,
+        link_name,
+        ..
+    }: LinkConfig<'_>,
+) -> anyhow::Result<()> {
+    let cmd = redis::cmd("CONFIG SET notify-keyspace-events KE");
+    
+    let url = secrets
+        .keys()
+        .find(|k| k.eq_ignore_ascii_case(CONFIG_REDIS_URL_KEY))
+        .and_then(|url_key| config.get(url_key))
+        .or_else(|| {
+            warn!("Redis connection URLs can be sensitive. Consider using secrets to pass this value.");
+            config.keys()
+                .find(|k| k.eq_ignore_ascii_case(CONFIG_REDIS_URL_KEY))
+                .and_then(|url_key| config.get(url_key))
+        });
+
+    let conn = if let Some(url) = url {
+        match redis::Client::open(url.to_string()) {
+            Ok(client) => match client.get_connection_manager().await {
+                Ok(conn) => {
+                    info!(url, "Established link");
+                    conn
+                }
+                Err(err) => {
+                    warn!(url, ?err, "Failed to create Redis connection manager for target [{target_id}]. Key-value operations will fail.");
+                    bail!("Failed to create Redis connection manager");
+                }
+            },
+            Err(err) => {
+                warn!(?err, "Failed to create Redis client for target [{target_id}]. Key-value operations will fail.");
+                bail!("Failed to create Redis client");
+            }
+        }
+    } else {
+        self.get_default_connection().await.map_err(|err| {
+            error!(error = ?err, "Failed to get default connection for link");
+            err
+        })?
+    };
+
+    let mut sources = self.sources.write().await;
+    sources.insert((target_id.to_string(), link_name.to_string()), conn.clone());
+    
+    cmd.query_async::<_, ()>(&mut conn.clone()).await.map_err(|e| {
+        error!("Failed to execute Redis command: {e}");
+        keyvalue::store::Error::Other(format!("Failed to execute Redis command: {e}"))
+    })?;
+
+    Ok(())
+}
 
     /// Handle notification that a link is dropped - close the connection
     #[instrument(level = "info", skip_all, fields(source_id = info.get_source_id()))]
