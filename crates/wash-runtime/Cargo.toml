@@ -15,7 +15,7 @@ path = "src/lib.rs"
 workspace = true
 
 [features]
-default = ["wasi-config", "wasi-logging", "wasi-blobstore", "wasi-keyvalue", "wasmcloud-postgres", "washlet", "wasi-otel"]
+default = ["wasi-config", "wasi-logging", "wasi-blobstore", "wasi-keyvalue", "wasmcloud-postgres", "washlet", "wasi-otel", "wasmcloud-smtp"]
 oci = ["dep:oci-client", "dep:oci-wasm", "dep:docker_credential", "dep:sha2", "dep:wit-component"]
 wasi-otel = []
 washlet = ["oci"]
@@ -31,10 +31,12 @@ wasmcloud-postgres = [
     "dep:bit-vec", "dep:cidr", "dep:geo-types",
     "dep:ulid",
 ]
+wasmcloud-smtp = ["dep:html2text", "dep:lettre"]
 
 [dependencies]
 anyhow = { workspace = true }
 async-nats = { workspace = true, features = ["aws-lc-rs"] }
+dashmap = { version = "6" }
 async-trait = { workspace = true }
 bytes = { workspace = true }
 chrono = { workspace = true }
@@ -109,6 +111,11 @@ postgres-types = { optional = true, workspace = true, features = ["derive", "wit
 tokio-postgres = { optional = true, workspace = true, features = [ "runtime", "with-serde_json-1", "with-chrono-0_4", "with-geo-types-0_7", "array-impls", "with-bit-vec-0_6", "with-uuid-1" ] }
 tokio-postgres-rustls = { optional = true, workspace = true }
 ulid = { optional = true, workspace = true, features = ["std"] }
+
+# SMTP dependencies (optional, behind 'wasmcloud-smtp' feature)
+html2text = { version = "0.14", default-features = false, optional = true }
+lettre = { version = "0.11", default-features = false, features = ["tokio1", "tokio1-rustls-tls", "smtp-transport", "builder", "hostname", "pool"], optional = true }
+
 url = { workspace = true }
 webpki-roots = { workspace = true }
 
@@ -123,3 +130,4 @@ tracing-subscriber = { workspace = true }
 reqwest = { workspace = true }
 wat = { workspace = true, features = ["component-model"] }
 gag = "1.0"
+testcontainers = "0.23"

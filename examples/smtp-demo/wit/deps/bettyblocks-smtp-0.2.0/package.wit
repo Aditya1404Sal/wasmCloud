@@ -1,0 +1,53 @@
+package bettyblocks:smtp@0.2.0;
+
+interface client {
+    record credentials {
+        host: string,
+        port: option<u16>,
+        username: option<string>,
+        password: option<string>,
+        tls-mode: tls-mode,
+    }
+
+    enum tls-mode {
+        none,
+        starttls,
+        implicit,
+    }
+
+    record sender {
+        %from: string,
+        reply-to: option<string>,
+        display-name: option<string>,
+    }
+
+    record recipient {
+        to: list<string>,
+        cc: option<list<string>>,
+        bcc: option<list<string>>,
+    }
+
+    record attachment {
+        filename: string,
+        content-type: string,
+        content: list<u8>,
+    }
+
+    record message {
+        sender: sender,
+        recipient: recipient,
+        subject: string,
+        body: string,
+        attachments: option<list<attachment>>,
+    }
+
+    record send-result {
+        accepted: bool,
+        server: option<string>,
+        message-id: option<string>,
+    }
+
+    connect: func(creds: credentials) -> result<string, string>;
+    send: func(connection-key: string, msg: message) -> result<send-result, string>;
+    disconnect: func(connection-key: string) -> result<_, string>;
+}

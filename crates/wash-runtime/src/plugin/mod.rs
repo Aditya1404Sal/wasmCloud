@@ -50,6 +50,9 @@ pub mod wasmcloud_postgres;
 #[cfg(feature = "wasi-otel")]
 pub mod wasi_otel;
 
+#[cfg(feature = "wasmcloud-smtp")]
+pub mod smtp;
+
 pub mod wasmcloud_messaging;
 
 #[cfg(all(feature = "wasi-webgpu", not(target_os = "windows")))]
