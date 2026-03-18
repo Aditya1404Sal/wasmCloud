@@ -67,9 +67,16 @@ func (ht *HostTracker) Resolve(ctx context.Context, req *http.Request) LookupRes
 	ht.lock.RLock()
 	defer ht.lock.RUnlock()
 
-	workloads, ok := ht.hostnames[req.Host]
+	// X-Route-Host allows WASM components to route cross-workload HTTP
+	// requests despite WASI HTTP forbidding explicit Host header manipulation.
+	lookupHost := req.Host
+	if routeHost := req.Header.Get("X-Route-Host"); routeHost != "" {
+		lookupHost = routeHost
+	}
+
+	workloads, ok := ht.hostnames[lookupHost]
 	if !ok {
-		scheme, endpoint := ht.Fallback.InvalidHostname(req.Host)
+		scheme, endpoint := ht.Fallback.InvalidHostname(lookupHost)
 		return LookupResult{
 			Hostname: endpoint,
 			Scheme:   scheme,
@@ -77,7 +84,7 @@ func (ht *HostTracker) Resolve(ctx context.Context, req *http.Request) LookupRes
 	}
 
 	if workloads.Len() == 0 {
-		scheme, endpoint := ht.Fallback.NoWorkloads(req.Host)
+		scheme, endpoint := ht.Fallback.NoWorkloads(lookupHost)
 		return LookupResult{
 			Hostname: endpoint,
 			Scheme:   scheme,
@@ -91,7 +98,7 @@ func (ht *HostTracker) Resolve(ctx context.Context, req *http.Request) LookupRes
 	// (should always exist if the workload exists)
 	hostID, ok := ht.workloads[workloadID]
 	if !ok {
-		scheme, endpoint := ht.Fallback.NoWorkloads(req.Host)
+		scheme, endpoint := ht.Fallback.NoWorkloads(lookupHost)
 		return LookupResult{
 			Hostname: endpoint,
 			Scheme:   scheme,
@@ -102,7 +109,7 @@ func (ht *HostTracker) Resolve(ctx context.Context, req *http.Request) LookupRes
 	// (should always exist if the host is healthy)
 	hostname, ok := ht.hosts[hostID]
 	if !ok {
-		scheme, endpoint := ht.Fallback.NoWorkloads(req.Host)
+		scheme, endpoint := ht.Fallback.NoWorkloads(lookupHost)
 		return LookupResult{
 			Hostname: endpoint,
 			Scheme:   scheme,

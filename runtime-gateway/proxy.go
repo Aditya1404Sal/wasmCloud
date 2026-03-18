@@ -85,7 +85,12 @@ func (h *HTTPGateway) rewrite(req *httputil.ProxyRequest) {
 		req.Out.Header.Set("X-Workload-Id", lookupRes.WorkloadID)
 	}
 
-	req.Out.Host = req.In.Host
+	if routeHost := req.In.Header.Get("X-Route-Host"); routeHost != "" {
+		req.Out.Host = routeHost
+		req.Out.Header.Del("X-Route-Host")
+	} else {
+		req.Out.Host = req.In.Host
+	}
 }
 
 func (h *HTTPGateway) modifyResponse(resp *http.Response) error {
