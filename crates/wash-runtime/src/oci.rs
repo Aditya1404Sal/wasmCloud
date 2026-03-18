@@ -38,7 +38,7 @@ use oci_client::{
 use oci_wasm::{ToConfig, WASM_LAYER_MEDIA_TYPE, WasmConfig};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -70,6 +70,8 @@ pub struct OciConfig {
     /// Timeout for OCI operations (pull, push, etc.)
     /// If None, uses default timeout from oci-client
     pub timeout: Option<Duration>,
+    /// List of insecure registries that are allowed to use HTTP
+    pub insecure_registries: HashSet<String>,
 }
 
 impl OciConfig {
@@ -375,7 +377,11 @@ pub async fn pull_component(
 
     // Configure OCI client
     let client_config = ClientConfig {
-        protocol: if config.insecure {
+        protocol: if config.insecure
+            || config
+                .insecure_registries
+                .contains(reference_parsed.registry())
+        {
             ClientProtocol::Http
         } else {
             ClientProtocol::Https
@@ -538,7 +544,11 @@ pub async fn push_component(
 
     // Configure OCI client
     let client_config = ClientConfig {
-        protocol: if config.insecure {
+        protocol: if config.insecure
+            || config
+                .insecure_registries
+                .contains(reference_parsed.registry())
+        {
             ClientProtocol::Http
         } else {
             ClientProtocol::Https
