@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1-labs
 
 
-FROM lukemathwalker/cargo-chef:latest-rust-1.90.0-alpine3.22 AS chef
+FROM lukemathwalker/cargo-chef:latest-rust-1.91.0-alpine3.22 AS chef
 USER root
 WORKDIR /src
 
