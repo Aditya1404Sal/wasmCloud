@@ -16,6 +16,8 @@ workspace = true
 
 [features]
 default = ["wasi-config", "wasi-logging", "wasi-blobstore", "wasi-keyvalue", "wasmcloud-postgres", "washlet", "wasi-otel"]
+# Builds test fixture Wasm components in build.rs; auto-enabled via self dev-dependency
+test-fixtures = []
 oci = ["dep:oci-client", "dep:oci-wasm", "dep:docker_credential", "dep:sha2", "dep:wit-component"]
 wasi-otel = []
 washlet = ["oci"]
@@ -118,6 +120,7 @@ tonic-prost-build = { workspace = true, default-features = true }
 pbjson-build = { workspace = true, default-features = true }
 
 [dev-dependencies]
+wash-runtime = { path = ".", features = ["test-fixtures"] }
 tokio = { workspace = true, features = ["full"] }
 tracing-subscriber = { workspace = true }
 reqwest = { workspace = true }

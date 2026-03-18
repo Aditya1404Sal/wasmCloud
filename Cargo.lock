@@ -6877,6 +6877,7 @@ dependencies = [
  "ulid",
  "url",
  "uuid",
+ "wash-runtime",
  "wasi-graphics-context-wasmtime",
  "wasi-webgpu-wasmtime",
  "wasmtime",
