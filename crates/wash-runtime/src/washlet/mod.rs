@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -370,10 +371,23 @@ async fn workload_start(
         anyhow::bail!("workload_id is required");
     }
 
+    let insecure_registries: HashSet<String> = std::env::var("INSECURE_REGISTRIES")
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .collect();
+
+    if !insecure_registries.is_empty() {
+        info!("insecure registries {:?}", insecure_registries);
+    }
+
     let (components, host_interfaces) = if let Some(wit_world) = wit_world {
         let mut pulled_components = Vec::with_capacity(wit_world.components.len());
         for component in &wit_world.components {
-            let oci_config = image_pull_secret_to_oci_config(config, &component.image_pull_secret);
+            let mut oci_config = image_pull_secret_to_oci_config(config, &component.image_pull_secret);
+            oci_config.insecure_registries = insecure_registries.clone();
             let (bytes, digest) = match oci::pull_component(
                 &component.image,
                 oci_config,
@@ -421,7 +435,8 @@ async fn workload_start(
     };
 
     let service = if let Some(service) = service {
-        let oci_config = image_pull_secret_to_oci_config(config, &service.image_pull_secret);
+        let mut oci_config = image_pull_secret_to_oci_config(config, &service.image_pull_secret);
+        oci_config.insecure_registries = insecure_registries.clone();
         let (bytes, digest) = match oci::pull_component(
             &service.image,
             oci_config,
