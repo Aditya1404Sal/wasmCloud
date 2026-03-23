@@ -785,6 +785,11 @@ pub struct HostConfig {
     pub allow_oci_insecure: bool,
     pub oci_pull_timeout: Option<Duration>,
     pub oci_cache_dir: Option<PathBuf>,
+    /// Directory for storing compiled component artifacts (.cwasm files).
+    /// When set, compiled components are loaded via file-backed mmap, allowing the OS
+    /// to page compiled code in/out of RAM on demand instead of pinning it in memory.
+    /// See `FILE_BACKED_MMAP_COMPILED_CACHE.md` for details.
+    pub compiled_cache_dir: Option<PathBuf>,
 }
 
 impl Default for HostConfig {
@@ -793,6 +798,7 @@ impl Default for HostConfig {
             allow_oci_insecure: false,
             oci_pull_timeout: Duration::from_secs(30).into(),
             oci_cache_dir: None,
+            compiled_cache_dir: None,
         }
     }
 }
@@ -922,10 +928,16 @@ impl HostBuilder {
     /// # Errors
     /// Returns an error if the default engine cannot be created (when no engine is provided).
     pub fn build(self) -> anyhow::Result<Host> {
+        let config = self.config.unwrap_or_default();
+
         let engine = if let Some(engine) = self.engine {
             engine
         } else {
-            Engine::builder().build()?
+            let mut builder = Engine::builder();
+            if let Some(ref dir) = config.compiled_cache_dir {
+                builder = builder.with_compiled_cache_dir(dir);
+            }
+            builder.build()?
         };
 
         // Get hostname from system if not provided
@@ -962,7 +974,7 @@ impl HostBuilder {
             started_at: chrono::Utc::now(),
             system_monitor: Arc::new(RwLock::new(SystemMonitor::new())),
             http_handler,
-            config: self.config.unwrap_or_default(),
+            config,
             meters: self.meters,
         })
     }
