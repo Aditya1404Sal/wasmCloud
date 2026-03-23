@@ -190,6 +190,10 @@ pub struct Engine {
     // wasmtime engine
     pub(crate) inner: wasmtime::Engine,
     pub(crate) cache: Cache<CacheKey, CacheValue>,
+    /// Optional directory for storing compiled component artifacts (.cwasm files).
+    /// When set, compiled components are serialized to disk and loaded via file-backed
+    /// mmap, allowing the OS to page compiled code in/out instead of pinning it in RAM.
+    pub(crate) compiled_cache_dir: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
@@ -409,6 +413,11 @@ impl Engine {
     }
 
     /// Load a WebAssembly component from raw bytes or yields a previously compiled one.
+    ///
+    /// When a `compiled_cache_dir` is configured on the engine, compiled components are
+    /// stored as `.cwasm` files on disk and loaded via file-backed mmap. This means the
+    /// compiled native code is backed by a file rather than anonymous memory, allowing the
+    /// OS kernel to page it in/out on demand and reducing resident memory usage.
     #[instrument(name = "load_component_bytes", skip_all, fields(digest = %digest.as_ref().map(|d| d.as_ref()).unwrap_or("none")))]
     fn load_component_bytes(
         &self,
@@ -427,13 +436,17 @@ impl Engine {
                 let key = CacheKey(digest.as_ref().to_string());
                 let inner = &self.inner;
                 let bytes_ref = bytes.as_ref();
+                let compiled_cache_dir = self.compiled_cache_dir.clone();
 
                 self.cache
                     .try_get_with(key, || {
-                        Component::new(inner, bytes_ref)
-                            .map_err(anyhow::Error::from)
-                            .context("failed to compile component from bytes")
-                            .map(CacheValue)
+                        Self::load_or_compile(
+                            inner,
+                            bytes_ref,
+                            compiled_cache_dir.as_deref(),
+                            digest.as_ref(),
+                        )
+                        .map(CacheValue)
                     })
                     .map_err(|e: Arc<anyhow::Error>| {
                         anyhow::anyhow!(e).context("compilation cache error")
@@ -441,6 +454,108 @@ impl Engine {
                     .map(|v| v.0)
             }
         }
+    }
+
+    fn load_or_compile(
+        engine: &wasmtime::Engine,
+        wasm_bytes: &[u8],
+        compiled_cache_dir: Option<&std::path::Path>,
+        digest: &str,
+    ) -> anyhow::Result<Component> {
+        let Some(cache_dir) = compiled_cache_dir else {
+            return Component::new(engine, wasm_bytes)
+                .map_err(anyhow::Error::from)
+                .context("failed to compile component from bytes");
+        };
+
+        let cwasm_path = cache_dir.join(format!("{}.cwasm", Self::sanitize_digest(digest)));
+
+        if let Some(cached) = Self::load_cached(engine, &cwasm_path) {
+            return Ok(cached);
+        }
+
+        let compiled = Component::new(engine, wasm_bytes)
+            .map_err(anyhow::Error::from)
+            .context("failed to compile component from bytes")?;
+
+        Ok(Self::persist_and_reload(engine, compiled, &cwasm_path))
+    }
+
+    #[allow(unsafe_code)]
+    fn load_cached(engine: &wasmtime::Engine, cwasm_path: &std::path::Path) -> Option<Component> {
+        if !cwasm_path.exists() {
+            return None;
+        }
+
+        tracing::debug!(path = %cwasm_path.display(), "loading compiled component from disk cache");
+        match unsafe { Component::deserialize_file(engine, cwasm_path) } {
+            Ok(component) => Some(component),
+            Err(e) => {
+                tracing::warn!(
+                    path = %cwasm_path.display(),
+                    err = %e,
+                    "failed to deserialize cached component, recompiling"
+                );
+                let _ = std::fs::remove_file(cwasm_path);
+                None
+            }
+        }
+    }
+
+    /// Serialize a compiled component to disk and reload it via file-backed mmap.
+    ///
+    /// The reload step is essential: `Component::new()` stores compiled code in anonymous
+    /// mmap pages (pinned in RSS, only reclaimable via swap). `Component::deserialize_file()`
+    /// stores it in file-backed mmap pages that the kernel can evict and re-read from disk
+    /// on demand. Without the reload, the compiled code would remain in anonymous memory
+    /// and we'd only benefit from the disk cache on future process starts.
+    ///
+    /// Falls back to the original in-memory component on any failure.
+    #[allow(unsafe_code)]
+    fn persist_and_reload(
+        engine: &wasmtime::Engine,
+        compiled: Component,
+        cwasm_path: &std::path::Path,
+    ) -> Component {
+        let serialized = match compiled.serialize() {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(err = %e, "failed to serialize compiled component, using in-memory version");
+                return compiled;
+            }
+        };
+
+        if let Err(e) = std::fs::write(cwasm_path, &serialized) {
+            tracing::warn!(
+                path = %cwasm_path.display(),
+                err = %e,
+                "failed to write compiled component to disk, using in-memory version"
+            );
+            return compiled;
+        }
+
+        tracing::debug!(
+            path = %cwasm_path.display(),
+            size_bytes = serialized.len(),
+            "saved compiled component to disk cache"
+        );
+
+        // Reload from the file we just wrote so the compiled code lives in file-backed
+        // mmap pages instead of the anonymous pages from Component::new().
+        match unsafe { Component::deserialize_file(engine, cwasm_path) } {
+            Ok(file_backed) => file_backed,
+            Err(e) => {
+                tracing::warn!(
+                    err = %e,
+                    "failed to reload compiled component from file, using in-memory version"
+                );
+                compiled
+            }
+        }
+    }
+
+    fn sanitize_digest(digest: &str) -> String {
+        digest.replace(['/', ':', '@'], "-")
     }
 
     /// Initialize a component that is a part of a workload, add wasi@0.2 interfaces (and
@@ -517,6 +632,7 @@ pub struct EngineBuilder {
     compilation_cache_size: Option<u64>,
     compilation_cache_ttl: Option<Duration>,
     fuel_consumption: bool,
+    compiled_cache_dir: Option<PathBuf>,
 }
 
 impl EngineBuilder {
@@ -568,6 +684,19 @@ impl EngineBuilder {
         self.compilation_cache_ttl = Some(ttl);
         self
     }
+
+    /// Sets a directory for storing compiled component artifacts on disk.
+    ///
+    /// When configured, compiled components are serialized as `.cwasm` files and
+    /// loaded via file-backed mmap (`Component::deserialize_file`). This allows the
+    /// OS to page compiled code in and out of RAM on demand, significantly reducing
+    /// resident memory usage compared to anonymous mmap.
+    ///
+    /// The directory will be created automatically if it does not exist.
+    pub fn with_compiled_cache_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.compiled_cache_dir = Some(dir.into());
+        self
+    }
 }
 
 impl EngineBuilder {
@@ -614,7 +743,21 @@ impl EngineBuilder {
                     .unwrap_or(Duration::from_secs(600)),
             )
             .build();
-        Ok(Engine { inner, cache })
+
+        if let Some(ref dir) = self.compiled_cache_dir {
+            std::fs::create_dir_all(dir).with_context(|| {
+                format!(
+                    "failed to create compiled cache directory: {}",
+                    dir.display()
+                )
+            })?;
+        }
+
+        Ok(Engine {
+            inner,
+            cache,
+            compiled_cache_dir: self.compiled_cache_dir,
+        })
     }
 }
 

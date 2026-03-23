@@ -87,6 +87,11 @@ pub struct HostCommand {
     #[clap(long = "oci-cache-dir")]
     pub oci_cache_dir: Option<PathBuf>,
 
+    /// Directory for caching compiled component artifacts (.cwasm files).
+    /// Enables file-backed mmap for compiled code, reducing memory usage.
+    #[clap(long = "compiled-cache-dir")]
+    pub compiled_cache_dir: Option<PathBuf>,
+
     /// Enable WASI OpenTelemetry plugin
     #[clap(long = "wasi-otel", default_value_t = false)]
     pub wasi_otel: bool,
@@ -129,12 +134,16 @@ impl CliCommand for HostCommand {
             allow_oci_insecure: self.allow_insecure_registries,
             oci_pull_timeout: Some(self.registry_pull_timeout),
             oci_cache_dir: self.oci_cache_dir.clone(),
+            compiled_cache_dir: self.compiled_cache_dir.clone(),
         };
 
-        let engine = Engine::builder()
+        let mut engine_builder = Engine::builder()
             .with_pooling_allocator(true)
-            .with_fuel_consumption(ctx.enable_meters())
-            .build()?;
+            .with_fuel_consumption(ctx.enable_meters());
+        if let Some(ref dir) = self.compiled_cache_dir {
+            engine_builder = engine_builder.with_compiled_cache_dir(dir);
+        }
+        let engine = engine_builder.build()?;
 
         let mut cluster_host_builder = wash_runtime::washlet::ClusterHostBuilder::default()
             .with_engine(engine)
