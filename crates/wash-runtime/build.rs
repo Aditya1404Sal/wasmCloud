@@ -131,6 +131,7 @@ fn main() {
         "inter-component-call-callee",
         "inter-component-call-middleware",
         "http-allowed-hosts",
+        "smtp-demo",
     ];
 
     // Rebuild fixtures if examples changed

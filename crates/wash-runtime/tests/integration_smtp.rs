@@ -16,7 +16,7 @@ use wash_runtime::{
     wit::WitInterface,
 };
 
-const SMTP_DEMO_WASM: &[u8] = include_bytes!("fixtures/smtp_demo.wasm");
+const SMTP_DEMO_WASM: &[u8] = include_bytes!("wasm/smtp_demo.wasm");
 
 async fn find_available_port() -> Result<u16> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
@@ -70,10 +70,10 @@ fn create_workload_request(name: &str, host_header: &str) -> WorkloadStartReques
                     name: None,
                 },
                 WitInterface {
-                    namespace: "bettyblocks".to_string(),
+                    namespace: "betty-blocks".to_string(),
                     package: "smtp".to_string(),
                     interfaces: ["client".to_string()].into_iter().collect(),
-                    version: Some(semver::Version::parse("0.2.0").unwrap()),
+                    version: None,
                     config: HashMap::new(),
                     name: None,
                 },

@@ -9,7 +9,7 @@ mod bindings {
 }
 
 use bindings::{
-    bettyblocks::smtp::client::{
+    betty_blocks::smtp::client::{
         self, Attachment, Credentials, Message, Recipient, Sender, TlsMode,
     },
     exports::wasi::http::incoming_handler::Guest,
