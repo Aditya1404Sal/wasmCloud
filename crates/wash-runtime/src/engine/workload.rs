@@ -61,6 +61,8 @@ pub struct WorkloadMetadata {
     loopback: Arc<std::sync::Mutex<loopback::Network>>,
     /// Linked component ids
     linked_components: HashSet<Arc<str>>,
+    /// Interface Configs
+    interface_config: HashMap<String, HashMap<String, String>>,
 }
 
 impl WorkloadMetadata {
@@ -249,6 +251,7 @@ impl WorkloadService {
                 plugins: None,
                 loopback,
                 linked_components: Default::default(),
+                interface_config: HashMap::new(),
             },
             handle: None,
             max_restarts,
@@ -301,6 +304,7 @@ impl WorkloadComponent {
         volume_mounts: Vec<(PathBuf, VolumeMount)>,
         local_resources: LocalResources,
         loopback: Arc<std::sync::Mutex<loopback::Network>>,
+        interface_config: HashMap<String, HashMap<String, String>>,
     ) -> Self {
         Self {
             metadata: WorkloadMetadata {
@@ -315,6 +319,7 @@ impl WorkloadComponent {
                 plugins: None,
                 loopback,
                 linked_components: Default::default(),
+                interface_config,
             },
             name: component_name.into(),
             // TODO: Implement pooling and instance limits
@@ -335,6 +340,13 @@ impl WorkloadComponent {
 
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    pub fn http_config(&self) -> Option<HashMap<String, String>> {
+        self.metadata
+            .interface_config
+            .get("wasi:http/incoming-handler")
+            .cloned()
     }
 }
 
@@ -535,6 +547,10 @@ impl ResolvedWorkload {
                 // TODO(#11): It's probably a good idea to skip registering wasi@0.2 interfaces
                 match name.split_once('@') {
                     Some(("wasmcloud:wash/plugin", _)) => {
+                        trace!(name, "skipping internal plugin export");
+                        continue;
+                    }
+                    Some((interface_name, _)) if interface_name.starts_with("wasi:http/") => {
                         trace!(name, "skipping internal plugin export");
                         continue;
                     }
@@ -1612,9 +1628,7 @@ impl UnresolvedWorkload {
         }
 
         if let Some(component_id) = incoming_http_component
-            && let Err(e) = http_handler
-                .on_workload_resolved(&resolved_workload, &component_id)
-                .await
+            && let Err(e) = http_handler.on_workload_resolved(&resolved_workload).await
         {
             warn!(
                 component_id = component_id,
@@ -1914,6 +1928,7 @@ mod tests {
             Vec::new(),
             local_resources,
             Arc::default(),
+            HashMap::new(),
         )
     }
 
@@ -1936,6 +1951,7 @@ mod tests {
             Vec::new(),
             local_resources,
             Arc::default(),
+            HashMap::new(),
         )
     }
 

@@ -328,6 +328,7 @@ async fn create_workload(host: &Host, config: &Config, bytes: Bytes) -> anyhow::
             },
             pool_size: -1,
             max_invocations: -1,
+            interface_config: HashMap::new(),
         });
 
         if let Some(service_path) = &dev_config.service_file {
@@ -382,6 +383,7 @@ async fn create_workload(host: &Host, config: &Config, bytes: Bytes) -> anyhow::
             },
             pool_size: -1,
             max_invocations: -1,
+            interface_config: HashMap::new(),
         });
     }
 

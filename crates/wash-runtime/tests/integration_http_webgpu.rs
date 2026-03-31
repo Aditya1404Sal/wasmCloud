@@ -79,6 +79,7 @@ async fn test_http_webgpu_integration() -> Result<()> {
                 },
                 pool_size: 1,
                 max_invocations: 100,
+                interface_config: HashMap::new(),
             }],
             host_interfaces: vec![
                 WitInterface {

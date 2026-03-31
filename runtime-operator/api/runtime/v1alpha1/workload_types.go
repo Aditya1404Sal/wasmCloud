@@ -100,6 +100,11 @@ type WorkloadComponent struct {
 	MaxInvocations int32 `json:"maxInvocations,omitempty"`
 	// +kubebuilder:validation:Optional
 	LocalResources *LocalResources `json:"localResources,omitempty"`
+	// Per-component configuration keyed by WIT interface identifier.
+	// Example: {"wasi:http/incoming-handler": {"path": "/user/{id}"}}
+	// This is the preferred way to provide per-component interface overrides.
+	// +kubebuilder:validation:Optional
+	InterfaceConfig map[string]map[string]string `json:"interfaceConfig,omitempty"`
 }
 
 // WorkloadService represents a long-running service that is part of the workload.

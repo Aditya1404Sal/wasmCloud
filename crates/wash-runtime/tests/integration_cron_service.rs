@@ -59,6 +59,7 @@ async fn test_cron_service_integration() -> Result<()> {
                 local_resources: Default::default(),
                 max_invocations: 1,
                 pool_size: 0,
+                interface_config: HashMap::new(),
             }],
             host_interfaces: vec![],
             volumes: vec![],

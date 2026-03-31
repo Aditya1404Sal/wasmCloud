@@ -123,6 +123,16 @@ spec:
                                   type: string
                               type: object
                               x-kubernetes-map-type: atomic
+                            interfaceConfig:
+                              additionalProperties:
+                                additionalProperties:
+                                  type: string
+                                type: object
+                              description: |-
+                                Per-component configuration keyed by WIT interface identifier.
+                                Example: {"wasi:http/incoming-handler": {"path": "/user/{id}"}}
+                                This is the preferred way to provide per-component interface overrides.
+                              type: object
                             localResources:
                               description: LocalResources describes resources that
                                 will be made available to a workload component.

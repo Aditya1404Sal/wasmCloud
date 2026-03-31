@@ -221,6 +221,7 @@ async fn test_inter_component_call() -> Result<()> {
                     },
                     pool_size: 1,
                     max_invocations: 100,
+                    interface_config: HashMap::new(),
                 },
                 Component {
                     name: "middleware".to_string(),
@@ -236,6 +237,7 @@ async fn test_inter_component_call() -> Result<()> {
                     },
                     pool_size: 2,
                     max_invocations: 100,
+                    interface_config: HashMap::new(),
                 },
                 Component {
                     name: "callee".to_string(),
@@ -251,6 +253,7 @@ async fn test_inter_component_call() -> Result<()> {
                     },
                     pool_size: 2,
                     max_invocations: 100,
+                    interface_config: HashMap::new(),
                 },
             ],
             host_interfaces: vec![

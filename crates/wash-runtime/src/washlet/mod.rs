@@ -91,6 +91,11 @@ impl ClusterHostBuilder {
         self
     }
 
+    pub fn with_label(mut self, key: impl AsRef<str>, value: impl AsRef<str>) -> Self {
+        self.host_builder = self.host_builder.with_label(key, value);
+        self
+    }
+
     pub fn build(self) -> anyhow::Result<ClusterHost> {
         let Some(nats_client) = self.nats_client else {
             anyhow::bail!("nats_client is required");
@@ -386,7 +391,8 @@ async fn workload_start(
     let (components, host_interfaces) = if let Some(wit_world) = wit_world {
         let mut pulled_components = Vec::with_capacity(wit_world.components.len());
         for component in &wit_world.components {
-            let mut oci_config = image_pull_secret_to_oci_config(config, &component.image_pull_secret);
+            let mut oci_config =
+                image_pull_secret_to_oci_config(config, &component.image_pull_secret);
             oci_config.insecure_registries = insecure_registries.clone();
             let (bytes, digest) = match oci::pull_component(
                 &component.image,
@@ -420,6 +426,11 @@ async fn workload_start(
                     .unwrap_or_default(),
                 pool_size: component.pool_size,
                 max_invocations: component.max_invocations,
+                interface_config: component
+                    .interface_config
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.config.clone()))
+                    .collect(),
             })
         }
         (

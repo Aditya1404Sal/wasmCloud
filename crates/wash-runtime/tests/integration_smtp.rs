@@ -47,6 +47,7 @@ fn create_workload_request(name: &str, host_header: &str) -> WorkloadStartReques
                 },
                 pool_size: 1,
                 max_invocations: 100,
+                interface_config: HashMap::new(),
             }],
             host_interfaces: vec![
                 WitInterface {

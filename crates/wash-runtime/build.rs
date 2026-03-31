@@ -131,6 +131,8 @@ fn main() {
         "inter-component-call-callee",
         "inter-component-call-middleware",
         "http-allowed-hosts",
+        "user-component",
+        "admin-component",
     ];
 
     // Rebuild fixtures if examples changed

@@ -120,6 +120,7 @@ fn http_counter_workload_request(
                 local_resources,
                 pool_size: 1,
                 max_invocations: 100,
+                interface_config: HashMap::new(),
             }],
             host_interfaces: http_counter_host_interfaces(http_host_config),
             volumes: vec![],

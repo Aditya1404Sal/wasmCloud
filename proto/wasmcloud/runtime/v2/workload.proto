@@ -93,6 +93,15 @@ message Component {
   ImagePullSecret image_pull_secret = 5;
   string name = 6;
   ImagePullPolicy image_pull_policy = 7;
+  // Per-component configuration keyed by WIT interface identifier.
+  // Example: { "wasi:http/incoming-handler": { config: { "path": "/user/{id}" } } }
+  // This is the preferred way to provide per-component interface overrides.
+  map<string, InterfaceConfig> interface_config = 8;
+}
+
+// Configuration for a specific WIT interface on a component.
+message InterfaceConfig {
+  map<string, string> config = 1;
 }
 
 message LocalResources {

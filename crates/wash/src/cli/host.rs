@@ -65,6 +65,10 @@ pub struct HostCommand {
     #[clap(long = "http-addr")]
     pub http_addr: Option<SocketAddr>,
 
+    /// HTTP routing mode: "host" (route by Host header, default) or "path" (route by URL path pattern)
+    #[clap(long = "router-mode", default_value = "host")]
+    pub router_mode: String,
+
     /// Enable WASI WebGPU support
     #[cfg(not(target_os = "windows"))]
     #[clap(long = "wasi-webgpu", default_value_t = false)]
@@ -175,10 +179,34 @@ impl CliCommand for HostCommand {
         }
 
         if let Some(addr) = self.http_addr {
-            let http_router = wash_runtime::host::http::DynamicRouter::default();
-            cluster_host_builder = cluster_host_builder.with_http_handler(Arc::new(
-                wash_runtime::host::http::HttpServer::new(http_router, addr).await?,
-            ));
+            let http_handler: Arc<dyn wash_runtime::host::http::HostHandler> =
+                match self.router_mode.as_str() {
+                    "path" => {
+                        info!("Using path-based HTTP router");
+                        Arc::new(
+                            wash_runtime::host::http::HttpServer::new(
+                                wash_runtime::host::http::PathRouter::default(),
+                                addr,
+                            )
+                            .await
+                            .context("failed to create path-based HTTP server")?,
+                        )
+                    }
+                    _ => {
+                        info!("Using host-header HTTP router");
+                        Arc::new(
+                            wash_runtime::host::http::HttpServer::new(
+                                wash_runtime::host::http::DynamicRouter::default(),
+                                addr,
+                            )
+                            .await
+                            .context("failed to create HTTP server")?,
+                        )
+                    }
+                };
+            cluster_host_builder = cluster_host_builder.with_http_handler(http_handler);
+            cluster_host_builder =
+                cluster_host_builder.with_label("router-mode", &self.router_mode);
         }
 
         // Enable otel plugin
