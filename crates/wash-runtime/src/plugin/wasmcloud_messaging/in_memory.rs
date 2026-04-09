@@ -335,11 +335,14 @@ impl HostPlugin for InMemoryMessaging {
                         break;
                     }
                     _ = notify.notified() => {
-                        // Try to get a message from the queue
+                        // Drain all queued messages, not just one. notify_one() calls
+                        // collapse when the listener isn't ready, so we must process
+                        // everything available on each wake to avoid dropping messages.
+                        'drain: loop {
                         let msg = pending_messages.write().await.pop_front();
 
                         let Some(msg) = msg else {
-                            continue;
+                            break 'drain;
                         };
 
                         debug!(subject = %msg.subject, reply_to = %msg.reply_to.as_deref().unwrap_or("<none>"), "Processing message");
@@ -395,6 +398,7 @@ impl HostPlugin for InMemoryMessaging {
                                 }
                             };
                         });
+                        }//end drain loop
                     }
                 }
             }
