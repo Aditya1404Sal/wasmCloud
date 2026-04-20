@@ -47,7 +47,7 @@ pub async fn handle_component_request_p3(
     // The handler invocation, response conversion, AND body collection must all
     // happen inside run_concurrent since the body stream requires the concurrent
     // runtime to pump data from the component.
-    let result: anyhow::Result<hyper::Response<http_body_util::Collected<bytes::Bytes>>> = store
+    let run_result = store
         .run_concurrent(async move |store| {
             let handler_fut = async {
                 let result = service.handle(store, wasi_req).await;
@@ -62,7 +62,10 @@ pub async fn handle_component_request_p3(
                         Ok(hyper::Response::from_parts(parts, body))
                     }
                     Ok(Err(error_code)) => {
-                        tracing::error!(?error_code, "P3 HTTP handler returned error");
+                        tracing::error!(
+                            error_code = ?error_code,
+                            "P3 HTTP handler returned ErrorCode",
+                        );
                         let body = http_body_util::Empty::new()
                             .map_err(|never| match never {})
                             .boxed_unsync()
@@ -85,9 +88,13 @@ pub async fn handle_component_request_p3(
             let (handler_result, _) = tokio::join!(handler_fut, io_fut);
             handler_result
         })
-        .await?;
+        .await;
 
-    // Convert collected body back to a streaming body for the hyper response
+    let result = match run_result {
+        Ok(inner) => inner,
+        Err(e) => Err(anyhow::Error::from(e).context("P3 run_concurrent failed")),
+    };
+
     match result {
         Ok(response) => {
             let (parts, collected) = response.into_parts();

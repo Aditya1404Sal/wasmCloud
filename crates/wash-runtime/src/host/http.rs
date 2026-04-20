@@ -665,18 +665,61 @@ async fn run_http_server<T: Router>(
     Ok(())
 }
 
+pub const TRACE_ID_HEADER: &str = "x-wash-trace-id";
+
+fn new_trace_id() -> String {
+    let uuid = uuid::Uuid::new_v4().simple().to_string();
+    uuid[..12].to_string()
+}
+
 /// Build an error response with the given status code.
 /// Building HTTP responses with valid status codes is infallible.
 #[allow(clippy::expect_used)]
-fn error_response(status: u16) -> hyper::Response<HyperOutgoingBody> {
+fn error_response(status: u16, trace_id: &str) -> hyper::Response<HyperOutgoingBody> {
     hyper::Response::builder()
         .status(status)
+        .header(TRACE_ID_HEADER, trace_id)
         .body(HyperOutgoingBody::default())
         .expect("building HTTP response with valid status code should never fail")
 }
 
+#[derive(Debug)]
+enum ComponentErrorKind {
+    Trap,
+    NoResponse,
+    Other,
+}
+
+fn classify_error(e: &anyhow::Error) -> ComponentErrorKind {
+    for cause in e.chain() {
+        if cause.is::<wasmtime::Trap>() {
+            return ComponentErrorKind::Trap;
+        }
+        if cause.is::<tokio::sync::oneshot::error::RecvError>() {
+            return ComponentErrorKind::NoResponse;
+        }
+    }
+    ComponentErrorKind::Other
+}
+
+/// Panic payloads are `Box<dyn Any>`; `&str` and `String` cover the common cases.
+fn describe_join_error(join_err: tokio::task::JoinError) -> String {
+    if !join_err.is_panic() {
+        return format!("{join_err}");
+    }
+    let payload = join_err.into_panic();
+    if let Some(s) = payload.downcast_ref::<&'static str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "<non-string panic payload>".to_string()
+    }
+}
+
 /// Handle individual HTTP requests by looking up workload and invoking component
 #[instrument(skip_all, fields(
+    trace_id = tracing::field::Empty,
     http.method = %req.method(),
     http.uri = %req.uri(),
     http.host = %req.headers().get(hyper::header::HOST).and_then(|h| h.to_str().ok()).unwrap_or("unknown"),
@@ -687,14 +730,28 @@ async fn handle_http_request<T: Router>(
     workload_handles: WorkloadHandles,
     fuel_meter: FuelConsumptionMeter,
 ) -> Result<hyper::Response<HyperOutgoingBody>, hyper::Error> {
+    let trace_id = new_trace_id();
+    tracing::Span::current().record("trace_id", tracing::field::display(&trace_id));
+
     let method = req.method().clone();
     let uri = req.uri().clone();
 
-    let Ok(workload_id) = handler.route_incoming_request(&req) else {
-        return Ok(error_response(400));
+    let workload_id = match handler.route_incoming_request(&req) {
+        Ok(id) => id,
+        Err(reason) => {
+            warn!(
+                trace_id = %trace_id,
+                method = %method,
+                uri = %uri,
+                reason = ?reason,
+                "no route matched incoming request",
+            );
+            return Ok(error_response(400, &trace_id));
+        }
     };
 
     debug!(
+        trace_id = %trace_id,
         method = %method,
         uri = %uri,
         host = %workload_id,
@@ -715,24 +772,47 @@ async fn handle_http_request<T: Router>(
             let req_span = tracing::span!(
                 tracing::Level::INFO,
                 "invoke_component_handler",
+                trace_id = %trace_id,
                 workload.name = handle.name(),
                 workload.namespace = handle.namespace(),
                 workload.id = handle.id(),
             );
-            match invoke_component_handler(handle, instance_pre, &component_id, req, fuel_meter)
+            match invoke_component_handler(&handle, instance_pre, &component_id, req, fuel_meter)
                 .instrument(req_span)
                 .await
             {
-                Ok(resp) => resp,
+                Ok(mut resp) => {
+                    resp.headers_mut().insert(
+                        TRACE_ID_HEADER,
+                        hyper::header::HeaderValue::from_str(&trace_id)
+                            .expect("uuid hex is always a valid header value"),
+                    );
+                    resp
+                }
                 Err(e) => {
-                    error!(err = ?e, "failed to invoke component");
-                    error_response(500)
+                    let kind = classify_error(&e);
+                    error!(
+                        trace_id = %trace_id,
+                        workload.id = handle.id(),
+                        workload.name = handle.name(),
+                        workload.namespace = handle.namespace(),
+                        component.id = %component_id,
+                        error.kind = ?kind,
+                        error.chain = ?e,
+                        error.display = %format!("{e:#}"),
+                        "component HTTP handler failed",
+                    );
+                    error_response(500, &trace_id)
                 }
             }
         }
         None => {
-            warn!(host = %workload_id, "No workload bound to host header or wildcard '*'");
-            error_response(404)
+            warn!(
+                trace_id = %trace_id,
+                host = %workload_id,
+                "no workload bound to host header or wildcard '*'",
+            );
+            error_response(404, &trace_id)
         }
     };
 
@@ -741,7 +821,7 @@ async fn handle_http_request<T: Router>(
 
 /// Invoke the component handler for the given workload
 async fn invoke_component_handler(
-    workload_handle: ResolvedWorkload,
+    workload_handle: &ResolvedWorkload,
     instance_pre: InstancePre<SharedCtx>,
     component_id: &str,
     req: hyper::Request<hyper::body::Incoming>,
@@ -836,27 +916,22 @@ pub async fn handle_component_request(
         .in_current_span(),
     );
 
+    // receiver drops when the task ends without setting the outparam;
+    // join the task to recover the real cause (trap, panic, or clean exit).
     match receiver.await {
-        // If the client calls `response-outparam::set` then one of these
-        // methods will be called.
         Ok(Ok(resp)) => Ok(resp),
-        Ok(Err(e)) => Err(e.into()),
-
-        // Otherwise the `sender` will get dropped along with the `Store`
-        // meaning that the oneshot will get disconnected
-        Err(e) => {
-            if let Err(task_error) = task.await {
-                error!(err = ?task_error, "error receiving http response");
-                Err(anyhow::anyhow!(
-                    "error receiving http response: {task_error}"
-                ))
-            } else {
-                error!(err = ?e, "error receiving http response");
-                Err(anyhow::anyhow!(
-                    "oneshot channel closed but no response was sent"
-                ))
-            }
-        }
+        Ok(Err(e)) => Err(anyhow::Error::from(e).context("component returned HTTP error")),
+        Err(recv_err) => match task.await {
+            Ok(Err(task_err)) => Err(task_err.context(
+                "component task failed before calling response-outparam::set",
+            )),
+            Ok(Ok(())) => Err(anyhow::Error::from(recv_err)
+                .context("component returned without calling response-outparam::set")),
+            Err(join_err) => Err(anyhow::anyhow!(
+                "component task panicked: {}",
+                describe_join_error(join_err)
+            )),
+        },
     }
 }
 
@@ -1186,7 +1261,41 @@ mod tests {
 
     #[test]
     fn error_response_returns_correct_status() {
-        assert_eq!(error_response(404).status(), 404);
-        assert_eq!(error_response(500).status(), 500);
+        let resp = error_response(404, "abc123");
+        assert_eq!(resp.status(), 404);
+        assert_eq!(
+            resp.headers().get(TRACE_ID_HEADER).unwrap().to_str().unwrap(),
+            "abc123"
+        );
+        assert_eq!(error_response(500, "").status(), 500);
+    }
+
+    #[test]
+    fn classify_error_identifies_trap() {
+        let bare: anyhow::Error = anyhow::Error::from(wasmtime::Trap::UnreachableCodeReached);
+        assert!(matches!(classify_error(&bare), ComponentErrorKind::Trap));
+
+        // In practice traps reach classify_error wrapped via .context() in
+        // handle_component_request — make sure the chain walk still finds them.
+        let wrapped: anyhow::Error = anyhow::Error::from(wasmtime::Trap::UnreachableCodeReached)
+            .context("component task failed");
+        assert!(matches!(classify_error(&wrapped), ComponentErrorKind::Trap));
+    }
+
+    #[tokio::test]
+    async fn classify_error_identifies_recv_error() {
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        drop(tx);
+        let err: anyhow::Error = anyhow::Error::from(rx.await.unwrap_err());
+        assert!(matches!(
+            classify_error(&err),
+            ComponentErrorKind::NoResponse
+        ));
+    }
+
+    #[test]
+    fn classify_error_defaults_to_other() {
+        let err = anyhow::anyhow!("something unrelated");
+        assert!(matches!(classify_error(&err), ComponentErrorKind::Other));
     }
 }

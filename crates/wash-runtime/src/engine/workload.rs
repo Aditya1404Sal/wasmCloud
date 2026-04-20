@@ -1087,7 +1087,6 @@ impl ResolvedWorkload {
     ) -> anyhow::Result<Ctx> {
         let components = self.components.read().await;
 
-        // TODO: Consider stderr/stdout buffering + logging
         let mut wasi_ctx_builder = WasiCtxBuilder::new();
         wasi_ctx_builder
             .envs(
