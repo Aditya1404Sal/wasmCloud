@@ -177,7 +177,7 @@ impl HostPlugin for BettySmtp {
 
     fn world(&self) -> WitWorld {
         WitWorld {
-            imports: HashSet::from([WitInterface::from("betty-blocks:smtp/client@0.2.0")]),
+            imports: HashSet::from([WitInterface::from("betty-blocks:smtp/client")]),
             ..Default::default()
         }
     }

@@ -179,6 +179,7 @@ impl CliCommand for HostCommand {
             .with_plugin(Arc::new(plugin::wasi_keyvalue::NatsKeyValue::new(
                 &data_nats_client,
             )))?
+            .with_plugin(Arc::new(plugin::smtp::BettySmtp::new()))?
             .with_meters(Meters::new(ctx.enable_meters()));
 
         if let Some(postgres_url) = &self.postgres_url {

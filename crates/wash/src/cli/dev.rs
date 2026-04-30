@@ -77,6 +77,9 @@ impl CliCommand for DevCommand {
             plugin::wasmcloud_messaging::InMemoryMessaging::default(),
         ))?;
 
+        // Enable Betty SMTP
+        host_builder = host_builder.with_plugin(Arc::new(plugin::smtp::BettySmtp::new()))?;
+
         // Add blobstore plugin
         if let Some(blobstore_path) = &dev_config.wasi_blobstore_path {
             host_builder = host_builder.with_plugin(Arc::new(
