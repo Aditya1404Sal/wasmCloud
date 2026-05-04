@@ -7518,6 +7518,8 @@ dependencies = [
  "tempfile",
  "tokio",
  "url",
+ "wasmtime",
+ "wat",
 ]
 
 [[package]]
