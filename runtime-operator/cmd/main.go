@@ -118,8 +118,8 @@ func main() {
 		"Delegates Artifact reconciliation to an external controller.",
 	)
 	flag.BoolVar(
-		&disablePrecompileController, 
-		"disable-precompile-controller", 
+		&disablePrecompileController,
+		"disable-precompile-controller",
 		false,
 		"Disable the precompile controller (no Jobs will be emitted for Artifacts).",
 	)
