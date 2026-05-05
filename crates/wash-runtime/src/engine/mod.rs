@@ -518,6 +518,14 @@ impl Engine {
         }
     }
 
+    #[allow(unsafe_code)]
+    #[instrument(name = "load_precompiled_bytes", skip_all)]
+    fn load_precompiled_bytes(&self, bytes: impl AsRef<[u8]>) -> anyhow::Result<Component> {
+        unsafe { Component::deserialize(&self.inner, bytes.as_ref()) }
+            .map_err(anyhow::Error::from)
+            .context("failed to deserialize precompiled component bytes")
+    }
+
     fn load_or_compile(
         engine: &wasmtime::Engine,
         wasm_bytes: &[u8],
@@ -632,10 +640,13 @@ impl Engine {
         validated_volumes: &std::collections::HashMap<String, PathBuf>,
         loopback: Arc<std::sync::Mutex<loopback::Network>>,
     ) -> anyhow::Result<WorkloadComponent> {
-        // Create a wasmtime component from the bytes
-        let wasmtime_component = self
-            .load_component_bytes(component.bytes, component.digest)
-            .context("failed to create component from bytes")?;
+        // Create a wasmtime component — deserialize if precompiled, else compile from wasm.
+        let wasmtime_component = if component.is_precompiled {
+            self.load_precompiled_bytes(component.bytes)?
+        } else {
+            self.load_component_bytes(component.bytes, component.digest)
+                .context("failed to create component from bytes")?
+        };
 
         // Create a linker for this component
         let mut linker: Linker<SharedCtx> = Linker::new(&self.inner);
