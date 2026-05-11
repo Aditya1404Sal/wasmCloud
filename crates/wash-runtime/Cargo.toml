@@ -1,12 +1,34 @@
 [package]
 name = "wash-runtime"
-version = "0.2.0"
+version.workspace = true
 description = "Opinionated wasmtime wrapper that provides a runtime and workload API for executing Wasm components"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/wasmCloud/wasmCloud"
 authors = ["The wasmCloud Team"]
 categories = ["wasm"]
+readme = "README.md"
+# Not published to crates.io: the optional `wasi-webgpu` feature pulls in
+# git-only deps (`wasi-graphics-context-wasmtime`, `wasi-webgpu-wasmtime`
+# from wasi-gfx/wasi-gfx-runtime) that have no crates.io release, and
+# cargo's publish manifest check rejects deps without a version
+# requirement. Revisit once those crates are on crates.io or vendored.
+publish = false
+# Allowlist preserved for the eventual re-enable of publishing. Cargo
+# always includes Cargo.toml, Cargo.lock, Cargo.toml.orig, and
+# .cargo_vcs_info.json regardless. Anything else in the crate directory
+# (notably tests/ with hundreds of MB of gitignored-but-still-cargo-
+# visible fixtures, and any future scratch directory a contributor
+# commits) stays out of the published crate unless explicitly added
+# here.
+include = [
+    "src/**/*",
+    "wit/**/*",
+    "build.rs",
+    "wkg.lock",
+    "README.md",
+    "LICENSE",
+]
 
 [lib]
 path = "src/lib.rs"
@@ -32,7 +54,11 @@ wasmcloud-postgres = [
     "dep:ulid",
 ]
 wasmcloud-smtp = ["dep:html2text", "dep:lettre"]
-wasip3 = ["wasmtime-wasi/p3", "wasmtime-wasi-http/p3"]
+wasip3 = [
+    "wasmtime-wasi/p3",
+    "wasmtime-wasi-http/p3",
+    "wasmtime-wasi-http/component-model-async",
+]
 
 [dependencies]
 anyhow = { workspace = true }
@@ -64,7 +90,6 @@ cap-std = { workspace = true }
 io-lifetimes = { workspace = true }
 rustix = { workspace = true }
 rustls = { workspace = true, features = ["std", "tls12"] }
-rustls-pemfile = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 tokio-rustls = { workspace = true }
@@ -91,8 +116,8 @@ opentelemetry-http = { workspace = true }
 # Otel dependencies (optional, behind 'wasi-otel' feature)
 opentelemetry-otlp = { workspace = true, features = ["grpc-tonic","http-proto", "trace", "metrics", "logs"] }
 opentelemetry-semantic-conventions = { workspace = true, features = ["semconv_experimental"] }
-wasi-graphics-context-wasmtime = { git = "https://github.com/wasi-gfx/wasi-gfx-runtime.git", rev = "9d29c9aed18bfa3080233dfee4498953351cb14c", optional = true }
-wasi-webgpu-wasmtime = { git = "https://github.com/wasi-gfx/wasi-gfx-runtime.git", rev = "9d29c9aed18bfa3080233dfee4498953351cb14c", optional = true }
+wasi-graphics-context-wasmtime = { git = "https://github.com/wasi-gfx/wasi-gfx-runtime.git", rev = "4aa7436d2e358df013a0216346ba23564dd0a2b9", optional = true }
+wasi-webgpu-wasmtime = { git = "https://github.com/wasi-gfx/wasi-gfx-runtime.git", rev = "4aa7436d2e358df013a0216346ba23564dd0a2b9", optional = true }
 
 # OCI dependencies (optional, behind 'oci' feature)
 docker_credential = { workspace = true, optional = true }
@@ -133,4 +158,22 @@ tracing-subscriber = { workspace = true }
 reqwest = { workspace = true }
 wat = { workspace = true, features = ["component-model"] }
 gag = "1.0"
+rcgen = { version = "0.14.7", default-features = false, features = ["crypto", "aws_lc_rs", "pem"] }
 testcontainers = { workspace = true }
+criterion = { version = "0.5", features = ["async_tokio", "html_reports"] }
+
+[[bench]]
+name = "http_invoke"
+harness = false
+required-features = ["wasip3"]
+
+[[bench]]
+name = "wasmtime_baseline"
+harness = false
+required-features = ["wasip3"]
+
+[[bench]]
+name = "wasmtime_serve"
+harness = false
+required-features = ["wasip3"]
+

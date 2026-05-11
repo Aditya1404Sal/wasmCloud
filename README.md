@@ -54,7 +54,7 @@ Note: This quickstart requires the [Rust toolchain](https://www.rust-lang.org/to
 1. **Create a new component:**
 
    ```bash
-   wash new https://github.com/wasmCloud/wasmCloud.git --subfolder examples/http-hello-world
+   wash new https://github.com/wasmCloud/wasmCloud.git --subfolder templates/http-hello-world
    ```
 
 2. **Build your component:**
@@ -182,7 +182,7 @@ vivacious-band-6937    eb27df8b-c5b0-48a3-bafe-a7e92eb19746   default     True  
 ## Documentation
 
 - [WebAssembly Component Model](https://component-model.bytecodealliance.org/) - Learn about the component model
-- [WASI Preview 2](https://github.com/WebAssembly/WASI/tree/main/preview2) - WebAssembly System Interface
+- [WASI Preview 2](https://github.com/WebAssembly/WASI/blob/main/docs/Preview2.md) - WebAssembly System Interface
 - [wasmCloud Documentation](https://wasmcloud.com/docs) - Platform integration via plugins
 - [Contributing Guide](CONTRIBUTING.md) - How to contribute to this project
 

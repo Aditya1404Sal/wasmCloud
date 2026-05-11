@@ -632,12 +632,11 @@ impl ResolvedWorkload {
                         trace!(name, "skipping internal plugin export");
                         continue;
                     }
-                    None => {
-                        if name == "wasmcloud:wash/plugin" {
-                            trace!(name, "skipping internal plugin export");
-                            continue;
-                        }
+                    None if name == "wasmcloud:wash/plugin" => {
+                        trace!(name, "skipping internal plugin export");
+                        continue;
                     }
+                    None => {}
                     _ => {}
                 }
                 if let ComponentItem::ComponentInstance(_) = item {
@@ -1124,8 +1123,8 @@ impl ResolvedWorkload {
 
         // Mount all possible volume mounts in the workload since components share a WasiCtx
         for (host_path, mount) in &components
-            .iter()
-            .flat_map(|(_id, workload_component)| workload_component.metadata.volume_mounts.clone())
+            .values()
+            .flat_map(|workload_component| workload_component.metadata.volume_mounts.clone())
             .collect::<Vec<_>>()
         {
             let dir = tokio::fs::canonicalize(host_path).await?;
@@ -1680,7 +1679,7 @@ impl UnresolvedWorkload {
 
         // Notify plugins of the resolved workload
         for (plugin, component_ids) in bound_plugins.iter() {
-            trace!(
+            debug!(
                 plugin_id = plugin.id(),
                 component_count = component_ids.len(),
                 "notifying plugin of resolved workload"
@@ -1997,7 +1996,7 @@ mod tests {
     }
 
     fn service_wasm() -> Vec<u8> {
-        load_fixture("cpu-usage-service.wasm")
+        load_fixture("cpu_usage_service.wasm")
     }
     /// Creates a test component using the http_counter fixture.
     /// This provides a real component with actual WIT interface imports.

@@ -72,7 +72,7 @@ test: manifests generate fmt vet envtest ## Run tests.
 test-e2e: ## Run the e2e tests. Expected an isolated environment using Kind.
 	@command -v kind >/dev/null 2>&1 || { echo "kind is required"; exit 1; }
 	@kind get clusters | grep -q "$${KIND_CLUSTER_NAME:-kind}" || { echo "Kind cluster not found"; exit 1; }
-	go test ./test/e2e/ -v -ginkgo.v
+	go test ./test/e2e/ -v -ginkgo.v -timeout=30m
 
 .PHONY: lint
 lint: golangci-lint ## Run golangci-lint linter
@@ -176,7 +176,7 @@ GOLANGCI_LINT = $(LOCALBIN)/golangci-lint
 KUSTOMIZE_VERSION ?= v5.5.0
 CONTROLLER_TOOLS_VERSION ?= v0.16.4
 ENVTEST_VERSION ?= release-0.19
-GOLANGCI_LINT_VERSION ?= v2.1.6
+GOLANGCI_LINT_VERSION ?= v2.11.4
 
 .PHONY: kustomize
 kustomize: $(KUSTOMIZE) ## Download kustomize locally if necessary.

@@ -30,7 +30,9 @@ jobs:
       contents: read
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
       - uses: ./.github/actions/setup-go
       - uses: ./.github/actions/lint-go
         with:
@@ -39,7 +41,9 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
       - uses: ./.github/actions/setup-go
       - name: Build
         working-directory: runtime-operator
@@ -52,13 +56,15 @@ jobs:
     needs: [lint, test]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
       - name: Build operator image
         working-directory: runtime-operator
         run: make docker-build IMG=localhost/runtime-operator:e2e
       - name: Save operator image
         run: docker save localhost/runtime-operator:e2e -o /tmp/operator-image.tar
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: operator-image
           path: /tmp/operator-image.tar
@@ -69,15 +75,17 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
       - uses: ./.github/actions/setup-go
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: operator-image
           path: /tmp
       - name: Load operator image
         run: docker load -i /tmp/operator-image.tar
-      - uses: helm/kind-action@a1b0e391336a6ee6713a0583f8c6240d70863de3 # v1.12.0
+      - uses: helm/kind-action@ef37e7f390d99f746eb8b610417061a60e82a6cc # v1.14.0
         with:
           cluster_name: wasmcloud-e2e
           config: deploy/kind/kind-config.yaml
@@ -107,6 +115,9 @@ jobs:
           kubectl get workloaddeployments.runtime.wasmcloud.dev -A -o yaml || true
           kubectl get workloads.runtime.wasmcloud.dev -A -o yaml || true
 
+  # The `sha-<full-sha>` tag is what release-tag.yml pins to when promoting
+  # this canary digest as the immutable vX.Y.Z release tag. `canary` itself
+  # moves on every subsequent main push.
   canary:
     if: github.ref == 'refs/heads/main' || contains(github.event.pull_request.labels.*.name, 'canary')
     needs: [lint, test, test-e2e]
@@ -114,7 +125,6 @@ jobs:
       contents: write
       packages: write
     uses: ./.github/workflows/docker-build-push.yml
-    secrets: inherit
     with:
       working-directory: runtime-operator
       file: runtime-operator/Dockerfile
@@ -122,37 +132,4 @@ jobs:
       push: true
       tags: |
         type=raw,value=canary
-
-  release:
-    if: startsWith(github.ref, 'refs/tags/v')
-    needs: [lint, test, test-e2e]
-    permissions:
-      contents: write
-      packages: write
-    uses: ./.github/workflows/docker-build-push.yml
-    secrets: inherit
-    with:
-      working-directory: runtime-operator
-      file: runtime-operator/Dockerfile
-      image: ghcr.io/wasmcloud/runtime-operator
-      push: true
-      tags: |
-        type=semver,pattern={{version}},value=${{ github.ref_name }}
-
-  go-module-tag:
-    if: startsWith(github.ref, 'refs/tags/v')
-    needs: [release]
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
-      - name: Create Go module tag
-        run: |
-          TAG="runtime-operator/${GITHUB_REF_NAME}"
-          if git ls-remote --tags origin "${TAG}" | grep -q "${TAG}"; then
-            echo "Tag ${TAG} already exists, skipping"
-          else
-            git tag "${TAG}"
-            git push origin "${TAG}"
-          fi
+        type=sha,format=long,prefix=sha-

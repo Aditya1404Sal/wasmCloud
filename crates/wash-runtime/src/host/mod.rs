@@ -201,6 +201,7 @@ pub struct Host {
     id: String,
     hostname: String,
     friendly_name: String,
+    environment: String,
     version: String,
     labels: HashMap<String, String>,
     started_at: chrono::DateTime<chrono::Utc>,
@@ -429,6 +430,16 @@ impl Host {
         &self.friendly_name
     }
 
+    /// Get the environment this host advertises itself as running in.
+    ///
+    /// For Kubernetes host pods this is the pod's namespace; for
+    /// out-of-cluster hosts it is whatever was passed via
+    /// [`HostBuilder::with_environment`]. Empty when no environment was
+    /// configured.
+    pub fn environment(&self) -> &str {
+        &self.environment
+    }
+
     /// Returns the WIT (imports, exports) that this host can provide to any component.
     ///
     /// Put another way, this represents a simplified version of the host world. For
@@ -592,14 +603,15 @@ impl HostApi for Host {
 
         for plugin in self.plugins.values() {
             let world = plugin.world();
-            imports.extend(world.imports.into_iter());
-            exports.extend(world.exports.into_iter());
+            imports.extend(world.imports);
+            exports.extend(world.exports);
         }
 
         Ok(HostHeartbeat {
             id: self.id.clone(),
             hostname: self.hostname.clone(),
             friendly_name: self.friendly_name.clone(),
+            environment: self.environment.clone(),
             http_port: self.http_handler.port(),
             version: self.version.clone(),
             labels: self.labels.clone(),
@@ -773,6 +785,7 @@ impl std::fmt::Debug for Host {
             .field("id", &self.id)
             .field("hostname", &self.hostname)
             .field("friendly_name", &self.friendly_name)
+            .field("environment", &self.environment)
             .field("version", &self.version)
             .field("labels", &self.labels)
             .field("started_at", &self.started_at)
@@ -812,6 +825,7 @@ pub struct HostBuilder {
     plugins: HashMap<&'static str, Arc<dyn HostPlugin>>,
     hostname: Option<String>,
     friendly_name: Option<String>,
+    environment: Option<String>,
     labels: HashMap<String, String>,
     http_handler: Option<Arc<dyn crate::host::http::HostHandler>>,
     config: Option<HostConfig>,
@@ -826,6 +840,7 @@ impl Default for HostBuilder {
             plugins: Default::default(),
             hostname: Default::default(),
             friendly_name: Default::default(),
+            environment: Default::default(),
             labels: Default::default(),
             http_handler: Default::default(),
             config: Default::default(),
@@ -892,6 +907,23 @@ impl HostBuilder {
     /// The builder instance for method chaining.
     pub fn with_friendly_name(mut self, name: impl AsRef<str>) -> Self {
         self.friendly_name = Some(name.as_ref().to_string());
+        self
+    }
+
+    /// Sets the environment this host advertises itself as running in.
+    ///
+    /// For Kubernetes host pods this is typically the pod's namespace
+    /// (sourced via the downward API and passed as `--environment`); for
+    /// out-of-cluster hosts it can be any string identifying where the
+    /// host runs (e.g. a region or data center).
+    ///
+    /// # Arguments
+    /// * `environment` - The environment string to advertise
+    ///
+    /// # Returns
+    /// The builder instance for method chaining.
+    pub fn with_environment(mut self, environment: impl AsRef<str>) -> Self {
+        self.environment = Some(environment.as_ref().to_string());
         self
     }
 
@@ -971,6 +1003,7 @@ impl HostBuilder {
             id: self.id,
             hostname,
             friendly_name,
+            environment: self.environment.unwrap_or_default(),
             version: env!("CARGO_PKG_VERSION").to_string(),
             labels: self.labels,
             started_at: chrono::Utc::now(),

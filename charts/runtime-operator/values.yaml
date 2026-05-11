@@ -16,13 +16,13 @@ global:
     generate: true
     # -- Name of the Kubernetes Secrets holding the Private CA certificate ( NATS )
     caSecretName: wasmcloud-ca
-    # -- Name of the Kubernetes Secrets holding the TLS server certificates for NATS server (if enabled in this chart)
+    # -- Name of the Kubernetes Secret holding the TLS server certificate for the NATS server (if enabled in this chart)
     natsCertSecretName: wasmcloud-nats-tls
-    # -- Name of the Kubernetes Secrets holding the TLS client certificate for the operator
+    # -- Name of the Kubernetes Secret holding the TLS client certificate the operator presents to NATS
     operatorCertSecretName: wasmcloud-operator-tls
-    # -- Name of the Kubernetes Secrets holding the TLS server certificates for control plane
+    # -- Name of the Kubernetes Secret holding the TLS client certificate host pods present to the scheduler NATS connection
     runtimeCertSecretName: wasmcloud-runtime-tls
-    # -- Name of the Kubernetes Secrets holding the TLS server certificates for user data plane
+    # -- Name of the Kubernetes Secret holding the TLS client certificate host pods present to the data NATS connection
     dataCertSecretName: wasmcloud-data-tls
 
 # -- Values for installing a basic NATS Server with Ephemeral Storage. If you prefer to install NATS separately, set `enabled` to `false`.
@@ -36,7 +36,7 @@ nats:
     registry: docker.io
     repository: nats
     pull_policy: Always
-    tag: "2.11.3-alpine"
+    tag: "2.12.8-alpine"
   serviceAccount:
     # -- Specifies whether a service account should be created
     create: true
@@ -71,6 +71,28 @@ operator:
     annotations: {}
   # -- List of namespaces to watch. If empty, the operator watches all namespaces.
   watchNamespaces: []
+  # -- List of namespaces where host Pods run. The operator's Pod
+  # informer cache and per-namespace Pod RBAC cover this set so
+  # HostPodReconciler can manage finalizers on host Pods.
+  # Leave empty when host Pods only run in the operator's own namespace (the
+  # chart's default deployment topology).
+  hostNamespaces: []
+  # -- Allow WorkloadDeployments to schedule onto Hosts whose Environment
+  # differs from the WorkloadDeployment's own namespace, via
+  # spec.template.spec.environment. The default (true) preserves existing
+  # behavior where workloads with no `environment` set may schedule onto any
+  # matching host regardless of which tenant namespace the host runs in.
+  #
+  # SECURITY: This default is permissive across tenants. In a multi-tenant
+  # cluster where each tenant has its own namespace and host pods, a
+  # tenant in `namespace-a` can target hosts in `namespace-b` simply by
+  # setting `spec.template.spec.environment: namespace-b`. If your install
+  # relies on namespace boundaries for tenant isolation, set this to
+  # `false`: scheduling will then be locked to the workload's own
+  # namespace, and any cross-tenant `environment` is rejected with a
+  # `CrossEnvironmentSchedulingDenied` Warning Event and a
+  # `HostSelection=False` condition on the Workload.
+  allowSharedHosts: true
 
 gateway:
   # -- DEPRECATED: runtime-gateway is being removed. HTTP routing is now handled
@@ -116,14 +138,40 @@ runtime:
     tag: ""
   hostGroups:
     - name: default
+      # -- Namespace to deploy this host group's Deployment, Service, generated
+      # TLS Secret, and ServiceAccount into. Empty (default) deploys to the
+      # chart release's namespace. When overridden, ensure the namespace
+      # exists and is included in `operator.hostNamespaces` so the operator
+      # has Pod RBAC + cache access to manage host Pod lifecycle there.
+      namespace: ""
       replicas: 1
       service:
         type: ClusterIP
       webgpu:
         enabled: false
+      wasip3:
+        enabled: false
       http:
         enabled: true
         port: 9191
+        tls:
+          # -- Enable TLS for the HTTP server. Requires global.tls.enabled to be true.
+          # When enabled, a certificate is generated (if global.certificates.generate is true)
+          # and the host serves HTTPS instead of HTTP.
+          enabled: false
+          certificate:
+            # -- Name of the Kubernetes Secret holding the TLS server certificate for this host group. Ignored if global.certificates.generate is true.
+            secretName: ""
+            generate:
+              # -- Whether to generate a self-signed TLS certificate for this host group. Ignored if global.certificates.generate is false or if certificate.secretName is set.
+              enabled: false
+              # -- Validity period (in days) for the generated TLS certificate. Ignored if global.certificates.generate is false.
+              validity: 365
+              # -- Common Name (CN) for the generated TLS certificate.
+              commonName: ""
+              # -- List of DNS Subject Alternative Names (SANs) for the generated TLS certificate.
+              # Example: ["myapp.example.com", "myapp.default.svc.cluster.local"]
+              domains: []
       resources:
         requests:
           memory: "64Mi"

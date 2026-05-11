@@ -61,9 +61,30 @@ pub struct HostCommand {
     #[arg(long = "host-name")]
     pub host_name: Option<String>,
 
+    /// Environment the host advertises in its heartbeat. For Kubernetes
+    /// host pods this is typically the pod's namespace (passed by the
+    /// runtime-operator chart via the downward API). The runtime-operator
+    /// records this verbatim on the resulting Host CRD's
+    /// `spec.environment` field; scheduling uses it to enforce per-tenant
+    /// isolation.
+    #[arg(long = "environment", env = "WASMCLOUD_HOST_ENVIRONMENT")]
+    pub environment: Option<String>,
+
     /// The address on which the HTTP server will listen
     #[arg(long = "http-addr")]
     pub http_addr: Option<SocketAddr>,
+
+    /// Path to TLS certificate file for the HTTP server
+    #[arg(long = "tls-cert-path", requires = "tls_key_path")]
+    pub tls_cert_path: Option<PathBuf>,
+
+    /// Path to TLS private key file for the HTTP server
+    #[arg(long = "tls-key-path", requires = "tls_cert_path")]
+    pub tls_key_path: Option<PathBuf>,
+
+    /// Path to CA certificate file for mutual TLS on the HTTP server
+    #[arg(long = "tls-ca-path")]
+    pub tls_ca_path: Option<PathBuf>,
 
     /// Enable WASI WebGPU support
     #[cfg(not(target_os = "windows"))]
@@ -112,9 +133,9 @@ pub struct HostCommand {
 
 impl CliCommand for HostCommand {
     async fn handle(&self, ctx: &CliContext) -> anyhow::Result<CommandOutput> {
-        rustls::crypto::aws_lc_rs::default_provider()
-            .install_default()
-            .map_err(|e| anyhow::anyhow!(format!("failed to install crypto provider: {e:?}")))?;
+        // Installed before connect_nats so TLS-enabled NATS clusters have a
+        // crypto provider available. Idempotent; also called by HttpServer::new.
+        wash_runtime::init_crypto();
 
         let scheduler_nats_client = wash_runtime::washlet::connect_nats(
             self.scheduler_nats_url.clone(),
@@ -201,11 +222,27 @@ impl CliCommand for HostCommand {
             cluster_host_builder = cluster_host_builder.with_host_name(host_name);
         }
 
+        if let Some(environment) = &self.environment {
+            cluster_host_builder = cluster_host_builder.with_environment(environment);
+        }
+
         if let Some(addr) = self.http_addr {
             let http_router = wash_runtime::host::http::DynamicRouter::default();
-            cluster_host_builder = cluster_host_builder.with_http_handler(Arc::new(
-                wash_runtime::host::http::HttpServer::new(http_router, addr).await?,
-            ));
+            let http_server = if let (Some(cert_path), Some(key_path)) =
+                (&self.tls_cert_path, &self.tls_key_path)
+            {
+                wash_runtime::host::http::HttpServer::new_with_tls(
+                    http_router,
+                    addr,
+                    cert_path,
+                    key_path,
+                    self.tls_ca_path.as_deref(),
+                )
+                .await?
+            } else {
+                wash_runtime::host::http::HttpServer::new(http_router, addr).await?
+            };
+            cluster_host_builder = cluster_host_builder.with_http_handler(Arc::new(http_server));
         }
 
         // Enable otel plugin

@@ -53,8 +53,8 @@ use wasmtime_wasi_http::{
     },
 };
 
-use rustls::{ServerConfig, pki_types::CertificateDer};
-use rustls_pemfile::{certs, private_key};
+use rustls::ServerConfig;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
 use tokio::sync::{RwLock, mpsc};
 use tokio_rustls::TlsAcceptor;
 
@@ -72,6 +72,50 @@ fn is_valid_hostname(host: &str) -> bool {
                 && !label.ends_with('-')
         })
 }
+
+/// Why a request could not be routed to a workload.
+#[derive(Debug)]
+pub enum RouteError {
+    /// Request had no `Host` header a
+    /// genuinely malformed client request. Maps to 400.
+    MissingHost,
+    /// No workload is currently bound to the host.
+    /// `DynamicRouter` passes the offending host header; `DevRouter` is
+    /// host-agnostic and passes an empty string. Maps to 404.
+    NoWorkloadForHost(String),
+    /// Router is momentarily unable to read its routing table (lock
+    /// contention under heavy load). Retrying should succeed. Maps to 503.
+    Unavailable,
+}
+
+impl RouteError {
+    /// HTTP status code for this routing failure.
+    pub fn status(&self) -> u16 {
+        match self {
+            Self::MissingHost => 400,
+            Self::NoWorkloadForHost(_) => 404,
+            Self::Unavailable => 503,
+        }
+    }
+}
+
+impl std::fmt::Display for RouteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MissingHost => write!(f, "request has no Host header or :authority"),
+            // Empty host means the router is DevRouter and
+            // simply has no workload registered so the host header is
+            // irrelevant to the failure.
+            Self::NoWorkloadForHost(host) if host.is_empty() => {
+                write!(f, "no workload registered")
+            }
+            Self::NoWorkloadForHost(host) => write!(f, "no workload bound to host {host:?}"),
+            Self::Unavailable => write!(f, "router is temporarily unavailable"),
+        }
+    }
+}
+
+impl std::error::Error for RouteError {}
 
 /// Trait defining the routing behavior for HTTP requests
 /// Allows for custom routing logic based on workload IDs and requests
@@ -98,11 +142,14 @@ pub trait Router: Send + Sync + 'static {
         _allowed_hosts: &[String],
     ) -> anyhow::Result<()>;
 
-    /// Pick a workload ID based on the incoming request
+    /// Pick a workload ID based on the incoming request.
+    ///
+    /// On failure, the returned [`RouteError`] determines the HTTP status
+    /// code surfaced to the client (see [`RouteError::status`]).
     fn route_incoming_request(
         &self,
         req: &hyper::Request<hyper::body::Incoming>,
-    ) -> anyhow::Result<String>;
+    ) -> Result<String, RouteError>;
 }
 
 /// Router that routes requests by 'Host' header, configured via WitInterface config
@@ -208,23 +255,28 @@ impl Router for DynamicRouter {
     fn route_incoming_request(
         &self,
         req: &hyper::Request<hyper::body::Incoming>,
-    ) -> anyhow::Result<String> {
+    ) -> Result<String, RouteError> {
         tokio::task::block_in_place(move || {
-            let lock = self.host_to_workload.try_read()?;
+            let lock = self
+                .host_to_workload
+                .try_read()
+                .map_err(|_| RouteError::Unavailable)?;
             let workload_host = req
                 .headers()
                 .get(hyper::header::HOST)
                 .and_then(|h| h.to_str().ok())
                 .or_else(|| req.uri().authority().map(|a| a.as_str()))
-                .context("no Host header or :authority in request")?;
+                .ok_or(RouteError::MissingHost)?;
             let Some(workload_set) = lock.get(workload_host) else {
-                anyhow::bail!("no workload bound to host header: {}", workload_host);
+                return Err(RouteError::NoWorkloadForHost(workload_host.to_string()));
             };
 
+            // Entry exists but is empty so treat it as "no workload bound" from the
+            // caller's perspective; same 404 status
             let workload_id = workload_set
                 .iter()
                 .next()
-                .context("no workload IDs found for host header")?;
+                .ok_or_else(|| RouteError::NoWorkloadForHost(workload_host.to_string()))?;
 
             Ok(workload_id.clone())
         })
@@ -234,7 +286,7 @@ impl Router for DynamicRouter {
 /// Development router that routes all requests to the last resolved workload
 #[derive(Default)]
 pub struct DevRouter {
-    last_workload_id: tokio::sync::Mutex<Option<String>>,
+    last_workload_id: std::sync::RwLock<Option<String>>,
 }
 
 #[async_trait::async_trait]
@@ -244,13 +296,19 @@ impl Router for DevRouter {
         resolved_handle: &ResolvedWorkload,
         _component_id: &str,
     ) -> anyhow::Result<()> {
-        let mut lock = self.last_workload_id.lock().await;
+        let mut lock = self
+            .last_workload_id
+            .write()
+            .map_err(|e| anyhow::anyhow!("DevRouter write lock poisoned: {e}"))?;
         lock.replace(resolved_handle.id().to_string());
         Ok(())
     }
 
     async fn on_workload_unbind(&self, workload_id: &str) -> anyhow::Result<()> {
-        let mut lock = self.last_workload_id.lock().await;
+        let mut lock = self
+            .last_workload_id
+            .write()
+            .map_err(|e| anyhow::anyhow!("DevRouter write lock poisoned: {e}"))?;
         if let Some(current_id) = &*lock
             && current_id == workload_id
         {
@@ -273,11 +331,16 @@ impl Router for DevRouter {
     fn route_incoming_request(
         &self,
         _req: &hyper::Request<hyper::body::Incoming>,
-    ) -> anyhow::Result<String> {
-        let lock = self.last_workload_id.try_lock()?;
+    ) -> Result<String, RouteError> {
+        let lock = self
+            .last_workload_id
+            .try_read()
+            .map_err(|_| RouteError::Unavailable)?;
         match &*lock {
             Some(id) => Ok(id.clone()),
-            None => anyhow::bail!("no workload available to route request"),
+            // DevRouter is host-agnostic; signal "nothing registered" via an
+            // empty host string (see RouteError::NoWorkloadForHost docs).
+            None => Err(RouteError::NoWorkloadForHost(String::new())),
         }
     }
 }
@@ -398,10 +461,14 @@ impl<T: Router> HttpServer<T> {
     /// to let the OS pick a free port, then call [`addr()`](Self::addr) to
     /// discover the actual address.
     ///
+    /// Side effect: installs the process-level rustls crypto provider via
+    /// [`crate::init_crypto`] (idempotent).
+    ///
     /// # Arguments
     /// * `router` - The router implementation for handling requests
     /// * `addr` - The socket address to bind to
     pub async fn new(router: T, addr: SocketAddr) -> anyhow::Result<Self> {
+        crate::init_crypto();
         let listener = TcpListener::bind(addr).await?;
         let addr = listener.local_addr()?;
         Ok(Self {
@@ -422,6 +489,9 @@ impl<T: Router> HttpServer<T> {
 
     /// Creates a new HTTPS server with TLS support.
     ///
+    /// Side effect: installs the process-level rustls crypto provider via
+    /// [`crate::init_crypto`] (idempotent).
+    ///
     /// # Arguments
     /// * `router` - The router implementation for handling requests
     /// * `addr` - The socket address to bind to
@@ -441,6 +511,7 @@ impl<T: Router> HttpServer<T> {
         key_path: &Path,
         ca_path: Option<&Path>,
     ) -> anyhow::Result<Self> {
+        crate::init_crypto();
         let tls_config = load_tls_config(cert_path, key_path, ca_path).await?;
         let tls_acceptor = TlsAcceptor::from(Arc::new(tls_config));
 
@@ -480,7 +551,12 @@ impl<T: Router> HostHandler for HttpServer<T> {
             .await
             .take()
             .context("HTTP server listener already consumed")?;
-        info!(addr = ?addr, "HTTP server listening");
+        let protocol = if self.tls_acceptor.is_some() {
+            "HTTPS"
+        } else {
+            "HTTP"
+        };
+        info!(addr = ?addr, protocol = protocol, "{protocol} server listening");
         // Start the HTTP server, any incoming requests call Host::handle and then it's routed
         // to the workload based on host header.
         let handler = self.router.clone();
@@ -499,13 +575,6 @@ impl<T: Router> HostHandler for HttpServer<T> {
                 error!(err = ?e, addr = ?addr, "HTTP server error");
             }
         });
-
-        let protocol = if self.tls_acceptor.is_some() {
-            "HTTPS"
-        } else {
-            "HTTP"
-        };
-        debug!(addr = ?addr, protocol = protocol, "HTTP server starting");
         Ok(())
     }
 
@@ -922,9 +991,9 @@ pub async fn handle_component_request(
         Ok(Ok(resp)) => Ok(resp),
         Ok(Err(e)) => Err(anyhow::Error::from(e).context("component returned HTTP error")),
         Err(recv_err) => match task.await {
-            Ok(Err(task_err)) => Err(task_err.context(
-                "component task failed before calling response-outparam::set",
-            )),
+            Ok(Err(task_err)) => {
+                Err(task_err.context("component task failed before calling response-outparam::set"))
+            }
             Ok(Ok(())) => Err(anyhow::Error::from(recv_err)
                 .context("component returned without calling response-outparam::set")),
             Err(join_err) => Err(anyhow::anyhow!(
@@ -947,8 +1016,7 @@ async fn load_tls_config(
         "Failed to read certificate file: {}",
         cert_path.display()
     ))?;
-    let mut cert_reader = std::io::Cursor::new(cert_data);
-    let cert_chain: Vec<CertificateDer<'static>> = certs(&mut cert_reader)
+    let cert_chain: Vec<CertificateDer<'static>> = CertificateDer::pem_slice_iter(&cert_data)
         .collect::<Result<Vec<_>, _>>()
         .context(format!(
             "Failed to parse certificate file: {}",
@@ -966,13 +1034,10 @@ async fn load_tls_config(
         "Failed to read private key file: {}",
         key_path.display()
     ))?;
-    let mut key_reader = std::io::Cursor::new(key_data);
-    let key = private_key(&mut key_reader)
-        .context(format!(
-            "Failed to parse private key file: {}",
-            key_path.display()
-        ))?
-        .ok_or_else(|| anyhow::anyhow!("No private key found in file: {}", key_path.display()))?;
+    let key = PrivateKeyDer::from_pem_slice(&key_data).context(format!(
+        "Failed to parse private key file: {}",
+        key_path.display()
+    ))?;
 
     // Create rustls server config
     let mut config = ServerConfig::builder()
@@ -988,8 +1053,7 @@ async fn load_tls_config(
         let ca_data = tokio::fs::read(ca_path)
             .await
             .context(format!("Failed to read CA file: {}", ca_path.display()))?;
-        let mut ca_reader = std::io::Cursor::new(ca_data);
-        let ca_certs: Vec<CertificateDer<'static>> = certs(&mut ca_reader)
+        let ca_certs: Vec<CertificateDer<'static>> = CertificateDer::pem_slice_iter(&ca_data)
             .collect::<Result<Vec<_>, _>>()
             .context(format!("Failed to parse CA file: {}", ca_path.display()))?;
 
@@ -1264,7 +1328,11 @@ mod tests {
         let resp = error_response(404, "abc123");
         assert_eq!(resp.status(), 404);
         assert_eq!(
-            resp.headers().get(TRACE_ID_HEADER).unwrap().to_str().unwrap(),
+            resp.headers()
+                .get(TRACE_ID_HEADER)
+                .unwrap()
+                .to_str()
+                .unwrap(),
             "abc123"
         );
         assert_eq!(error_response(500, "").status(), 500);

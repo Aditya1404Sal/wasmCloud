@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     # P2 fixtures (wasm32-wasip2)
+    "http-handler-p2",
     "http-counter",
     "cron-service",
     "cron-component",
@@ -9,6 +10,7 @@ members = [
     "http-webgpu",
     "cpu-usage-service",
     "messaging-handler",
+    "messaging-echo",
     "inter-component-call-caller",
     "inter-component-call-callee",
     "inter-component-call-middleware",

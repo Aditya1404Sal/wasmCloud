@@ -4,6 +4,7 @@ package runtime_operator
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"github.com/nats-io/nats.go"
@@ -28,10 +29,23 @@ type EmbeddedOperatorConfig struct {
 	// Disable Artifact Controller. If set, Artifacts must be marked as 'Ready' elsewhere.
 	// Useful when introducing a custom artifact management solution.
 	DisableArtifactController bool
-	// Namespace restricts the HostPodReconciler to watching Pods in this
-	// namespace only. Should match the namespace the operator is deployed in.
-	// If empty, all namespaces are watched.
+	// Namespace is the namespace the operator itself runs in. Every Host
+	// CRD is created here regardless of where the underlying host pod
+	// runs; tenant attribution is carried on the Host's Environment
+	// field.
 	Namespace string
+	// HostNamespaces is the list of namespaces where host Pods run. The
+	// operator's Pod informer cache and per-namespace Pod RBAC cover this
+	// set so HostPodReconciler can manage finalizers on host Pods.
+	HostNamespaces []string
+	// AllowSharedHosts controls whether a WorkloadDeployment may schedule
+	// onto a Host whose Environment differs from the workload's own
+	// namespace (via WorkloadSpec.Environment). Default (true) preserves
+	// legacy Cluster-scope scheduling semantics: with Environment unset
+	// the scheduler imposes no Environment filter. When false, scheduling
+	// is locked to the workload's own namespace and any non-matching
+	// Environment is rejected with a Warning Event.
+	AllowSharedHosts bool
 }
 
 // EmbeddedOperator is the main struct for the embedded operator.
@@ -47,6 +61,13 @@ func NewEmbeddedOperator(
 	mgr manager.Manager,
 	cfg EmbeddedOperatorConfig,
 ) (*EmbeddedOperator, error) {
+	// Validate before any side effects (NATS connect, controller setup).
+	// Every Host CRD is created in cfg.Namespace, and the operator's
+	// namespaced Role for Host CRUD binds there.
+	if cfg.Namespace == "" {
+		return nil, errors.New("EmbeddedOperatorConfig.Namespace is required")
+	}
+
 	nc, err := wasmbus.NatsConnect(cfg.NatsURL, cfg.NatsOptions...)
 	if err != nil {
 		return nil, err
@@ -69,22 +90,26 @@ func NewEmbeddedOperator(
 		UnreachableTimeout: cfg.HeartbeatTTL,
 		CPUThreshold:       cfg.HostCPUThreshold,
 		MemoryThreshold:    cfg.HostMemoryThreshold,
+		OperatorNamespace:  cfg.Namespace,
 	}).SetupWithManager(mgr); err != nil {
 		return nil, err
 	}
 
 	if err = (&runtime_controllers.HostPodReconciler{
-		Client:    mgr.GetClient(),
-		Scheme:    mgr.GetScheme(),
-		Namespace: cfg.Namespace,
+		Client:            mgr.GetClient(),
+		Scheme:            mgr.GetScheme(),
+		OperatorNamespace: cfg.Namespace,
 	}).SetupWithManager(mgr); err != nil {
 		return nil, err
 	}
 
 	if err = (&runtime_controllers.WorkloadReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
-		Bus:    bus,
+		Client:            mgr.GetClient(),
+		Scheme:            mgr.GetScheme(),
+		Bus:               bus,
+		Recorder:          mgr.GetEventRecorder("workload-controller"),
+		OperatorNamespace: cfg.Namespace,
+		AllowSharedHosts:  cfg.AllowSharedHosts,
 	}).SetupWithManager(mgr); err != nil {
 		return nil, err
 	}
@@ -104,8 +129,9 @@ func NewEmbeddedOperator(
 	}
 
 	if err = (&runtime_controllers.WorkloadRouteReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
+		Client:            mgr.GetClient(),
+		Scheme:            mgr.GetScheme(),
+		OperatorNamespace: cfg.Namespace,
 	}).SetupWithManager(mgr); err != nil {
 		return nil, err
 	}
