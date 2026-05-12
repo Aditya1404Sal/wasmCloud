@@ -201,19 +201,19 @@ func main() {
 	}
 
 	operatorCfg := runtime_operator.EmbeddedOperatorConfig{
-		DisableArtifactController: disableArtifactController,
-		NatsURL:                   natsUrl,
-		HeartbeatTTL:              60 * time.Second,
-		HostCPUThreshold:          cpuBackpressureThreshold,
-		HostMemoryThreshold:       memoryBackpressureThreshold,
-		Namespace:                 operatorNamespace,
-		HostNamespaces:            splitCSVList(hostNamespaces),
-		AllowSharedHosts:          allowSharedHosts,
+		DisableArtifactController:   disableArtifactController,
+		NatsURL:                     natsUrl,
+		HeartbeatTTL:                60 * time.Second,
+		HostCPUThreshold:            cpuBackpressureThreshold,
+		HostMemoryThreshold:         memoryBackpressureThreshold,
+		Namespace:                   operatorNamespace,
+		HostNamespaces:              splitCSVList(hostNamespaces),
+		AllowSharedHosts:            allowSharedHosts,
 		DisablePrecompileController: disablePrecompileController,
-		PrecompileWorkerImage: precompileWorkerImage,
-		PrecompileArtifactBaseURL: precompileArtifactBaseURL,
-		PrecompileTarget: precompileTarget,
-		PrecompileWasmtimeVersion: precompileWasmtimeVersion
+		PrecompileWorkerImage:       precompileWorkerImage,
+		PrecompileArtifactBaseURL:   precompileArtifactBaseURL,
+		PrecompileTarget:            precompileTarget,
+		PrecompileWasmtimeVersion:   precompileWasmtimeVersion,
 	}
 
 	if natsCreds != "" {
