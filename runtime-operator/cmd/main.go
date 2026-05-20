@@ -18,6 +18,7 @@ package main
 
 import (
 	"crypto/tls"
+	"errors"
 	"flag"
 	"os"
 	"strings"
@@ -27,23 +28,25 @@ import (
 	// to ensure that exec-entrypoint and run can make use of them.
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
 
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/cache"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	"sigs.k8s.io/controller-runtime/pkg/metrics/filters"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
 
-	"go.wasmcloud.dev/runtime-operator/pkg/wasmbus"
+	"go.wasmcloud.dev/runtime-operator/v2/pkg/wasmbus"
 
 	"github.com/nats-io/nats.go"
-	runtime_operator "go.wasmcloud.dev/runtime-operator"
+	runtime_operator "go.wasmcloud.dev/runtime-operator/v2"
 
-	runtimev1alpha1 "go.wasmcloud.dev/runtime-operator/api/runtime/v1alpha1"
+	runtimev1alpha1 "go.wasmcloud.dev/runtime-operator/v2/api/runtime/v1alpha1"
 	// +kubebuilder:scaffold:imports
 )
 
@@ -76,6 +79,13 @@ func main() {
 		memoryBackpressureThreshold float64
 		disableArtifactController   bool
 		watchNamespaces             string
+		hostNamespaces              string
+		allowSharedHosts            bool
+		disablePrecompileController bool
+		precompileWorkerImage       string
+		precompileArtifactBaseURL   string
+		precompileTarget            string
+		precompileWasmtimeVersion   string
 	)
 
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8081", "The address the metrics endpoint binds to. "+
@@ -95,7 +105,7 @@ func main() {
 	flag.BoolVar(&enableHTTP2, "enable-http2", false,
 		"If set, HTTP/2 will be enabled for the metrics and webhook servers")
 	flag.BoolVar(&jsonLog, "json-log", false, "Output logs in JSON format")
-	flag.Float64Var(&cpuBackpressureThreshold, "cpu-backpressure-threshold", 80.0, "CPU backpressure threshold (%)")
+	flag.Float64Var(&cpuBackpressureThreshold, "cpu-backpressure-threshold", 80.0, "CPU back: pressure threshold (%)")
 	flag.Float64Var(
 		&memoryBackpressureThreshold,
 		"memory-backpressure-threshold",
@@ -107,11 +117,63 @@ func main() {
 		false,
 		"Delegates Artifact reconciliation to an external controller.",
 	)
+	flag.BoolVar(
+		&disablePrecompileController,
+		"disable-precompile-controller",
+		false,
+		"Disable the precompile controller (no Jobs will be emitted for Artifacts).",
+	)
+	flag.StringVar(
+		&precompileWorkerImage,
+		"precompile-worker-image",
+		"",
+		"Container image for the precompile Worker Job. Required when precompile controller is enabled.",
+	)
+	flag.StringVar(
+		&precompileArtifactBaseURL,
+		"precompile-artifact-base-url",
+		"",
+		"Scheme-qualified URL prefix where precompiled .cwasm bytes are written (e.g. nats://precompiled-artifacts). Required when precompile controller is enabled.",
+	)
+	flag.StringVar(
+		&precompileTarget,
+		"precompile-target",
+		"x86_64-unknown-linux-gnu",
+		"Target triple precompiled bytes are produced for.",
+	)
+	flag.StringVar(
+		&precompileWasmtimeVersion,
+		"precompile-wasmtime-version",
+		"",
+		"Wasmtime version the worker image links against. Required when precompile controller is enabled.",
+	)
 	flag.StringVar(
 		&watchNamespaces,
 		"watch-namespaces",
 		"",
-		"Comma-separated list of namespaces to watch. If empty, watches all namespaces.",
+		"Comma-separated list of namespaces to watch for WorkloadDeployment-side resources "+
+			"(artifacts, workloads, workloadreplicasets, workloaddeployments + the "+
+			"services/endpointslices/configmaps/secrets/events the workload reconcilers touch). "+
+			"If empty, watches all namespaces.",
+	)
+	flag.StringVar(
+		&hostNamespaces,
+		"host-namespaces",
+		"",
+		"Comma-separated list of namespaces where host Pods run. The operator's Pod informer "+
+			"cache and per-namespace Pod RBAC cover this set so HostPodReconciler can manage "+
+			"finalizers on host Pods. Does NOT affect where Host CRDs are created — every Host "+
+			"always lives in the operator's own namespace. If empty, host Pods are assumed to "+
+			"run only in the operator's own namespace.",
+	)
+	flag.BoolVar(
+		&allowSharedHosts,
+		"allow-shared-hosts",
+		true,
+		"If true (default), a WorkloadDeployment may schedule onto a Host whose Environment "+
+			"differs from the workload's own namespace via spec.template.spec.environment. "+
+			"If false, scheduling is locked to the workload's own namespace and any non-matching "+
+			"environment is rejected.",
 	)
 
 	opts := zap.Options{
@@ -130,12 +192,28 @@ func main() {
 		zapOpts...,
 	))
 
+	// OPERATOR_NAMESPACE is required: every Host CRD is created here, and
+	// the namespaced Role for Host CRUD binds to this namespace.
+	operatorNamespace := os.Getenv("OPERATOR_NAMESPACE")
+	if operatorNamespace == "" {
+		setupLog.Error(errors.New("OPERATOR_NAMESPACE is unset"), "missing required configuration")
+		os.Exit(1)
+	}
+
 	operatorCfg := runtime_operator.EmbeddedOperatorConfig{
-		DisableArtifactController: disableArtifactController,
-		NatsURL:                   natsUrl,
-		HeartbeatTTL:              60 * time.Second,
-		HostCPUThreshold:          cpuBackpressureThreshold,
-		HostMemoryThreshold:       memoryBackpressureThreshold,
+		DisableArtifactController:   disableArtifactController,
+		NatsURL:                     natsUrl,
+		HeartbeatTTL:                60 * time.Second,
+		HostCPUThreshold:            cpuBackpressureThreshold,
+		HostMemoryThreshold:         memoryBackpressureThreshold,
+		Namespace:                   operatorNamespace,
+		HostNamespaces:              splitCSVList(hostNamespaces),
+		AllowSharedHosts:            allowSharedHosts,
+		DisablePrecompileController: disablePrecompileController,
+		PrecompileWorkerImage:       precompileWorkerImage,
+		PrecompileArtifactBaseURL:   precompileArtifactBaseURL,
+		PrecompileTarget:            precompileTarget,
+		PrecompileWasmtimeVersion:   precompileWasmtimeVersion,
 	}
 
 	if natsCreds != "" {
@@ -197,17 +275,37 @@ func main() {
 	}
 	var cacheOpts cache.Options
 
-	// If watch namespaces is set, only watch the specified namespaces. Otherwise, watch all namespaces.
-	if watchNamespaces != "" {
-		namespaces := strings.Split(watchNamespaces, ",")
-		toWatchNamespaces := make(map[string]cache.Config, len(namespaces))
-		for _, ns := range namespaces {
-			ns = strings.TrimSpace(ns)
-			if ns != "" {
-				toWatchNamespaces[ns] = cache.Config{}
-			}
-		}
-		cacheOpts.DefaultNamespaces = toWatchNamespaces
+	// -watch-namespaces narrows the cache for workload-side resources
+	// (artifacts, workloads, workloaddeployments, etc.). Empty == all
+	// namespaces.
+	cacheOpts.DefaultNamespaces = parseNamespaceSet(watchNamespaces)
+
+	// Host objects always live in the operator's own namespace —
+	// hostStatusUpdater unconditionally creates them there, regardless of
+	// where the underlying host pod runs. The Host informer cache scopes
+	// to that single namespace.
+	hostCacheNamespaces := map[string]cache.Config{
+		operatorCfg.Namespace: {},
+	}
+
+	// The Pod informer cache covers the operator's own namespace plus
+	// `-host-namespaces` so HostPodReconciler can manage finalizers on
+	// host Pods regardless of which namespace the platform team deploys
+	// them into. The HostPodLabel predicate keeps the working set
+	// bounded to actual host Pods.
+	podCacheNamespaces := map[string]cache.Config{
+		operatorCfg.Namespace: {},
+	}
+	for _, ns := range operatorCfg.HostNamespaces {
+		podCacheNamespaces[ns] = cache.Config{}
+	}
+	if len(podCacheNamespaces) == 0 {
+		podCacheNamespaces[cache.AllNamespaces] = cache.Config{}
+	}
+
+	cacheOpts.ByObject = map[client.Object]cache.ByObject{
+		&runtimev1alpha1.Host{}: {Namespaces: hostCacheNamespaces},
+		&corev1.Pod{}:           {Namespaces: podCacheNamespaces},
 	}
 
 	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
@@ -259,4 +357,44 @@ func main() {
 		setupLog.Error(err, "problem running manager")
 		os.Exit(1)
 	}
+}
+
+// splitCSVList parses a comma-separated string into a trimmed, non-empty
+// slice of values. Returns nil for an empty input.
+func splitCSVList(raw string) []string {
+	if raw == "" {
+		return nil
+	}
+	parts := strings.Split(raw, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// parseNamespaceSet parses a comma-separated namespace list into a
+// controller-runtime cache namespace map. Returns nil for an empty input,
+// which controller-runtime interprets as "all namespaces".
+func parseNamespaceSet(raw string) map[string]cache.Config {
+	if raw == "" {
+		return nil
+	}
+	parts := strings.Split(raw, ",")
+	out := make(map[string]cache.Config, len(parts))
+	for _, ns := range parts {
+		ns = strings.TrimSpace(ns)
+		if ns != "" {
+			out[ns] = cache.Config{}
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }

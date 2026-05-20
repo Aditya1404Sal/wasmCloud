@@ -3,7 +3,7 @@
 use super::util::{
     ErrorCode, get_unicast_hop_limit, is_valid_address_family, is_valid_remote_address,
     receive_buffer_size, send_buffer_size, set_receive_buffer_size, set_send_buffer_size,
-    set_unicast_hop_limit, udp_bind, udp_disconnect, udp_socket,
+    set_unicast_hop_limit, udp_bind, udp_connect, udp_disconnect, udp_socket,
 };
 use super::{SocketAddrCheck, SocketAddressFamily, WasiSocketsCtx};
 
@@ -11,7 +11,6 @@ use cap_net_ext::AddressFamily;
 use io_lifetimes::AsSocketlike as _;
 use io_lifetimes::raw::{FromRawSocketlike as _, IntoRawSocketlike as _};
 use rustix::io::Errno;
-use rustix::net::connect;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tracing::debug;
@@ -112,7 +111,7 @@ impl NetworkUdpSocket {
         }
     }
 
-    fn is_connected(&self) -> bool {
+    pub(crate) fn is_connected(&self) -> bool {
         matches!(self.udp_state, UdpState::Connected(..))
     }
 
@@ -124,7 +123,7 @@ impl NetworkUdpSocket {
         if !self.is_connected() {
             return Err(ErrorCode::InvalidState);
         }
-        udp_disconnect(&self.socket)?;
+        udp_disconnect(&self.socket).map_err(ErrorCode::from)?;
         self.udp_state = UdpState::Bound;
         Ok(())
     }
@@ -139,28 +138,26 @@ impl NetworkUdpSocket {
             _ => return Err(ErrorCode::InvalidState),
         }
 
-        // We disconnect & (re)connect in two distinct steps for two reasons:
-        // - To leave our socket instance in a consistent state in case the
-        //   connect fails.
-        // - When reconnecting to a different address, Linux sometimes fails
-        //   if there isn't a disconnect in between.
-
-        // Step #1: Disconnect
-        if let UdpState::Connected(..) = self.udp_state {
-            udp_disconnect(&self.socket)?;
-            self.udp_state = UdpState::Bound;
-        }
-        // Step #2: (Re)connect
-        connect(&self.socket, &addr).map_err(|error| match error {
-            Errno::AFNOSUPPORT => ErrorCode::InvalidArgument, // See `udp_bind` implementation.
-            Errno::INPROGRESS => {
-                debug!("UDP connect returned EINPROGRESS, which should never happen");
-                ErrorCode::Unknown
+        match udp_connect(&self.socket, addr) {
+            Ok(()) => {
+                self.udp_state = UdpState::Connected(addr);
+                Ok(())
             }
-            err => err.into(),
-        })?;
-        self.udp_state = UdpState::Connected(addr);
-        Ok(())
+            Err(e) => {
+                // Revert to a consistent state:
+                _ = udp_disconnect(&self.socket);
+                self.udp_state = UdpState::Bound;
+
+                Err(match e {
+                    Errno::AFNOSUPPORT => ErrorCode::InvalidArgument, // See `udp_bind` implementation.
+                    Errno::INPROGRESS => {
+                        debug!("UDP connect returned EINPROGRESS, which should never happen");
+                        ErrorCode::Unknown
+                    }
+                    err => err.into(),
+                })
+            }
+        }
     }
 
     fn local_address(&self) -> Result<SocketAddr, ErrorCode> {
@@ -174,7 +171,7 @@ impl NetworkUdpSocket {
         Ok(addr)
     }
 
-    fn remote_address(&self) -> Result<SocketAddr, ErrorCode> {
+    pub(crate) fn remote_address(&self) -> Result<SocketAddr, ErrorCode> {
         if !matches!(self.udp_state, UdpState::Connected(..)) {
             return Err(ErrorCode::InvalidState);
         }
@@ -493,5 +490,193 @@ impl UdpSocket {
                 lo.drop(loopback)
             }
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use crate::sockets::WasiSocketsCtx;
+    use cap_net_ext::AddressFamily;
+
+    fn make_ipv4_socket() -> NetworkUdpSocket {
+        let ctx = WasiSocketsCtx::default();
+        NetworkUdpSocket::new(&ctx, AddressFamily::Ipv4).unwrap()
+    }
+
+    fn bind_socket(socket: &mut NetworkUdpSocket) {
+        let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+        socket.bind(addr).unwrap();
+        socket.finish_bind().unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_new_socket_default_state() {
+        let socket = make_ipv4_socket();
+        assert!(!socket.is_bound());
+        assert!(!socket.is_connected());
+    }
+
+    #[tokio::test]
+    async fn test_bind_and_finish_bind() {
+        let mut socket = make_ipv4_socket();
+        let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+
+        socket.bind(addr).unwrap();
+        // BindStarted is not yet Bound
+        assert!(!socket.is_bound());
+
+        socket.finish_bind().unwrap();
+        assert!(socket.is_bound());
+        assert!(!socket.is_connected());
+    }
+
+    #[tokio::test]
+    async fn test_finish_bind_without_bind_errors() {
+        let mut socket = make_ipv4_socket();
+        let result = socket.finish_bind();
+        assert!(matches!(result, Err(ErrorCode::NotInProgress)));
+    }
+
+    #[tokio::test]
+    async fn test_connect_from_bound() {
+        let mut socket = make_ipv4_socket();
+        bind_socket(&mut socket);
+
+        let remote: std::net::SocketAddr = "127.0.0.1:9999".parse().unwrap();
+        let result = socket.connect(remote);
+        assert!(result.is_ok());
+        assert!(socket.is_connected());
+    }
+
+    #[tokio::test]
+    async fn test_connect_from_default_errors() {
+        let mut socket = make_ipv4_socket();
+        let remote: std::net::SocketAddr = "127.0.0.1:9999".parse().unwrap();
+        let result = socket.connect(remote);
+        assert!(matches!(result, Err(ErrorCode::InvalidState)));
+    }
+
+    #[tokio::test]
+    async fn test_connect_rejects_unspecified_addr() {
+        let mut socket = make_ipv4_socket();
+        bind_socket(&mut socket);
+
+        let remote: std::net::SocketAddr = "0.0.0.0:9999".parse().unwrap();
+        let result = socket.connect(remote);
+        assert!(matches!(result, Err(ErrorCode::InvalidArgument)));
+    }
+
+    #[tokio::test]
+    async fn test_connect_rejects_port_zero() {
+        let mut socket = make_ipv4_socket();
+        bind_socket(&mut socket);
+
+        let remote: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let result = socket.connect(remote);
+        assert!(matches!(result, Err(ErrorCode::InvalidArgument)));
+    }
+
+    #[tokio::test]
+    async fn test_connect_rejects_wrong_family() {
+        let mut socket = make_ipv4_socket();
+        bind_socket(&mut socket);
+
+        let remote: std::net::SocketAddr = "[::1]:9999".parse().unwrap();
+        let result = socket.connect(remote);
+        assert!(matches!(result, Err(ErrorCode::InvalidArgument)));
+    }
+
+    #[tokio::test]
+    async fn test_reconnect_from_connected() {
+        // Key wasmtime 43 change: connect-first, disconnect-on-failure
+        let mut socket = make_ipv4_socket();
+        bind_socket(&mut socket);
+
+        let remote1: std::net::SocketAddr = "127.0.0.1:9999".parse().unwrap();
+        socket.connect(remote1).unwrap();
+
+        let remote2: std::net::SocketAddr = "127.0.0.1:8888".parse().unwrap();
+        let result = socket.connect(remote2);
+        assert!(result.is_ok());
+        assert!(socket.is_connected());
+    }
+
+    #[tokio::test]
+    async fn test_disconnect_from_connected() {
+        let mut socket = make_ipv4_socket();
+        bind_socket(&mut socket);
+
+        let remote: std::net::SocketAddr = "127.0.0.1:9999".parse().unwrap();
+        socket.connect(remote).unwrap();
+
+        let result = socket.disconnect();
+        assert!(result.is_ok());
+        assert!(!socket.is_connected());
+        assert!(socket.is_bound());
+    }
+
+    #[tokio::test]
+    async fn test_disconnect_from_bound_errors() {
+        let mut socket = make_ipv4_socket();
+        bind_socket(&mut socket);
+
+        let result = socket.disconnect();
+        assert!(matches!(result, Err(ErrorCode::InvalidState)));
+    }
+
+    #[tokio::test]
+    async fn test_local_address_after_bind() {
+        let mut socket = make_ipv4_socket();
+        bind_socket(&mut socket);
+
+        let addr = socket.local_address();
+        assert!(addr.is_ok());
+        let addr = addr.unwrap();
+        assert_ne!(addr.port(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_local_address_before_bind_errors() {
+        let socket = make_ipv4_socket();
+        let result = socket.local_address();
+        assert!(matches!(result, Err(ErrorCode::InvalidState)));
+    }
+
+    #[tokio::test]
+    async fn test_remote_address_when_connected() {
+        let mut socket = make_ipv4_socket();
+        bind_socket(&mut socket);
+
+        let remote: std::net::SocketAddr = "127.0.0.1:9999".parse().unwrap();
+        socket.connect(remote).unwrap();
+
+        let addr = socket.remote_address().unwrap();
+        assert_eq!(addr, remote);
+    }
+
+    #[tokio::test]
+    async fn test_remote_address_when_not_connected_errors() {
+        let mut socket = make_ipv4_socket();
+        bind_socket(&mut socket);
+
+        let result = socket.remote_address();
+        assert!(matches!(result, Err(ErrorCode::InvalidState)));
+    }
+
+    #[tokio::test]
+    async fn test_hop_limit_roundtrip() {
+        let socket = make_ipv4_socket();
+        socket.set_unicast_hop_limit(64).unwrap();
+        let hop = socket.unicast_hop_limit().unwrap();
+        assert_eq!(hop, 64);
+    }
+
+    #[tokio::test]
+    async fn test_hop_limit_zero_errors() {
+        let socket = make_ipv4_socket();
+        let result = socket.set_unicast_hop_limit(0);
+        assert!(matches!(result, Err(ErrorCode::InvalidArgument)));
     }
 }

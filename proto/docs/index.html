@@ -592,6 +592,19 @@ store::open(name) for keyvalue, create-container(name) for blobstore). </p></td>
                   <td><p>HTTP port the host is listening on </p></td>
                 </tr>
               
+                <tr>
+                  <td>environment</td>
+                  <td><a href="#string">string</a></td>
+                  <td></td>
+                  <td><p>Environment the host advertises itself as running in. For Kubernetes
+host pods this is the pod&#39;s namespace (sourced from the downward API).
+For out-of-cluster hosts registered over NATS it is whatever the
+operator passes via `--environment` to `wash host`. The
+runtime-operator records this verbatim on the resulting Host CRD&#39;s
+`spec.environment` field, and the scheduler uses it to enforce
+per-tenant isolation. </p></td>
+                </tr>
+              
             </tbody>
           </table>
 
@@ -759,6 +772,16 @@ This information is used by the Runtime Operator to monitor the health of the Wa
                   <td><a href="#wasmcloud.runtime.v2.ImagePullPolicy">ImagePullPolicy</a></td>
                   <td></td>
                   <td><p> </p></td>
+                </tr>
+              
+                <tr>
+                  <td>precompiled_url</td>
+                  <td><a href="#string">string</a></td>
+                  <td></td>
+                  <td><p>Optional URL where a precompiled .cwasm for this component lives.
+When set, the host fetches and deserializes from this URL instead
+of pulling the OCI image and compiling fresh. Empty string means
+no precompiled variant is available — host falls back to OCI. </p></td>
                 </tr>
               
             </tbody>

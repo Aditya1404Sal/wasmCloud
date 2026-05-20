@@ -16,7 +16,7 @@ use wash_runtime::{
     types::{Component, Service, Workload, WorkloadStartRequest},
 };
 
-const CRON_SERVICE_WASM: &[u8] = include_bytes!("wasm/cron-service.wasm");
+const CRON_SERVICE_WASM: &[u8] = include_bytes!("wasm/cron_service.wasm");
 
 const CRON_COMPONENT_WASM: &[u8] = include_bytes!("wasm/cron_component.wasm");
 
@@ -59,6 +59,7 @@ async fn test_cron_service_integration() -> Result<()> {
                 local_resources: Default::default(),
                 max_invocations: 1,
                 pool_size: 0,
+                is_precompiled: false,
             }],
             host_interfaces: vec![],
             volumes: vec![],

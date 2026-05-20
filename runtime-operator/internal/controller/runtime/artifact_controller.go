@@ -9,13 +9,14 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
-	"go.wasmcloud.dev/runtime-operator/api/condition"
+	"go.wasmcloud.dev/runtime-operator/v2/api/condition"
 
-	runtimev1alpha1 "go.wasmcloud.dev/runtime-operator/api/runtime/v1alpha1"
+	runtimev1alpha1 "go.wasmcloud.dev/runtime-operator/v2/api/runtime/v1alpha1"
 )
 
 const (
 	artifactReconcileInterval = 5 * time.Minute
+	artifactFinalizerName     = "runtime.wasmcloud.dev/artifact-finalizer"
 )
 
 // ArtifactReconciler reconciles a Workload object
@@ -60,6 +61,33 @@ func (r *ArtifactReconciler) reconcileReady(_ context.Context, artifact *runtime
 	return nil
 }
 
+// finalize blocks deletion of an Artifact while any WorkloadDeployment in the
+// same namespace still references it. This prevents deployments from being
+func (r *ArtifactReconciler) finalize(ctx context.Context, artifact *runtimev1alpha1.Artifact) error {
+	log := ctrl.LoggerFrom(ctx)
+
+	deploymentList := &runtimev1alpha1.WorkloadDeploymentList{}
+	if err := r.List(ctx, deploymentList, client.InNamespace(artifact.Namespace)); err != nil {
+		return err
+	}
+
+	for _, deployment := range deploymentList.Items {
+		if deployment.DeletionTimestamp != nil {
+			continue
+		}
+		for _, configArtifact := range deployment.Spec.Artifacts {
+			if configArtifact.ArtifactFrom.Name == artifact.Name {
+				log.Info("artifact deletion blocked: still referenced by WorkloadDeployment",
+					"deployment", fmt.Sprintf("%s/%s", deployment.Namespace, deployment.Name))
+				return fmt.Errorf("artifact is still referenced by WorkloadDeployment %s/%s",
+					deployment.Namespace, deployment.Name)
+			}
+		}
+	}
+
+	return nil
+}
+
 // SetupWithManager sets up the controller with the Manager.
 // +kubebuilder:rbac:groups=runtime.wasmcloud.dev,resources=artifacts,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=runtime.wasmcloud.dev,resources=artifacts/status,verbs=get;update;patch
@@ -72,6 +100,7 @@ func (r *ArtifactReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		&runtimev1alpha1.Artifact{},
 		artifactReconcileInterval)
 
+	reconciler.SetFinalizer(artifactFinalizerName, r.finalize)
 	reconciler.SetCondition(runtimev1alpha1.ArtifactConditionSync, r.reconcileSync)
 	reconciler.SetCondition(runtimev1alpha1.ArtifactConditionPublished, r.reconcilePublished)
 	reconciler.SetCondition(condition.TypeReady, r.reconcileReady)

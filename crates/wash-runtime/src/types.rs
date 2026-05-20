@@ -66,6 +66,7 @@ pub struct Component {
     pub local_resources: LocalResources,
     pub pool_size: i32,
     pub max_invocations: i32,
+    pub is_precompiled: bool,
 }
 
 /// Resource limits and configuration for a component or service.
@@ -153,6 +154,12 @@ pub struct HostHeartbeat {
     pub workload_count: u64,
     pub imports: Vec<WitInterface>,
     pub exports: Vec<WitInterface>,
+    /// Environment the host advertises itself as running in. For
+    /// Kubernetes host pods this is the pod's namespace; for
+    /// out-of-cluster hosts it is whatever the operator passed via
+    /// `wash host --environment`. Empty when no environment was
+    /// configured.
+    pub environment: String,
 }
 
 /// Status information about a workload including its ID, state, and any messages.

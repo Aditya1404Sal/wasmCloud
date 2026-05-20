@@ -59,7 +59,11 @@ use wasmtime_wasi::WasiView;
 
 /// Add all WASI@0.2 interfaces to the linker, using upstream for non-socket interfaces
 /// and our custom socket implementation (with loopback support) for socket interfaces.
-fn add_wasi_to_linker(linker: &mut Linker<SharedCtx>) -> anyhow::Result<()> {
+/// When `wasip3` is true (and the feature is compiled in), P3 bindings are also registered.
+fn add_wasi_to_linker(
+    linker: &mut Linker<SharedCtx>,
+    #[cfg(feature = "wasip3")] wasip3: bool,
+) -> anyhow::Result<()> {
     use wasmtime_wasi::p2::bindings::{cli, clocks, filesystem, random, sockets};
 
     // IO interfaces (error, poll, streams)
@@ -173,7 +177,48 @@ fn add_wasi_to_linker(linker: &mut Linker<SharedCtx>) -> anyhow::Result<()> {
         ctx::extract_sockets,
     )?;
 
+    #[cfg(feature = "wasip3")]
+    if wasip3 {
+        // CLI, clocks, filesystem, random — upstream P3 add_to_linker
+        wasmtime_wasi::p3::cli::add_to_linker(linker)?;
+        wasmtime_wasi::p3::clocks::add_to_linker(linker)?;
+        wasmtime_wasi::p3::filesystem::add_to_linker(linker)?;
+        wasmtime_wasi::p3::random::add_to_linker(linker)?;
+
+        // Sockets with our custom P3 implementation (with loopback)
+        crate::sockets::add_p3_to_linker(linker)?;
+    }
+
     Ok(())
+}
+
+/// Detect whether a component targets WASIP3 by checking for `@0.3` in WASI imports/exports.
+/// This is a pure detection function — the caller is responsible for checking whether
+/// WASIP3 support is enabled on the engine.
+#[cfg(feature = "wasip3")]
+pub fn targets_wasip3(component: &Component) -> bool {
+    let ty = component.component_type();
+    let engine = component.engine();
+    ty.imports(engine)
+        .any(|(import, _)| import.starts_with("wasi:") && import.contains("@0.3"))
+        || ty
+            .exports(engine)
+            .any(|(export, _)| export.starts_with("wasi:") && export.contains("@0.3"))
+}
+
+/// Detect whether a component targets WASIP3 HTTP specifically by checking for
+/// `wasi:http` imports/exports with `@0.3`. Used for HTTP dispatch to avoid
+/// routing a component that imports `wasi:cli@0.3` but exports `wasi:http@0.2`
+/// through the P3 HTTP handler.
+#[cfg(feature = "wasip3")]
+pub fn targets_wasip3_http(component: &Component) -> bool {
+    let ty = component.component_type();
+    let engine = component.engine();
+    ty.imports(engine)
+        .any(|(name, _)| name.starts_with("wasi:http") && name.contains("@0.3"))
+        || ty
+            .exports(engine)
+            .any(|(name, _)| name.starts_with("wasi:http") && name.contains("@0.3"))
 }
 
 pub mod ctx;
@@ -194,6 +239,9 @@ pub struct Engine {
     /// When set, compiled components are serialized to disk and loaded via file-backed
     /// mmap, allowing the OS to page compiled code in/out instead of pinning it in RAM.
     pub(crate) compiled_cache_dir: Option<PathBuf>,
+    /// Whether WASIP3 support is enabled for this engine.
+    #[cfg(feature = "wasip3")]
+    wasip3: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
@@ -218,13 +266,14 @@ impl Engine {
     }
 
     /// Gets a reference to the inner wasmtime engine.
-    ///
-    /// This provides access to the underlying wasmtime engine for advanced use cases.
-    ///
-    /// # Returns
-    /// A reference to the internal `wasmtime::Engine`.
     pub fn inner(&self) -> &wasmtime::Engine {
         &self.inner
+    }
+
+    /// Returns whether WASIP3 support is enabled for this engine.
+    #[cfg(feature = "wasip3")]
+    pub fn wasip3(&self) -> bool {
+        self.wasip3
     }
 
     /// Initializes a workload by validating and preparing all its components.
@@ -365,13 +414,24 @@ impl Engine {
         let mut linker: Linker<SharedCtx> = Linker::new(&self.inner);
 
         // Add WASI@0.2 interfaces to the linker (with custom socket implementation)
-        add_wasi_to_linker(&mut linker).context("failed to add WASI to linker")?;
+        add_wasi_to_linker(
+            &mut linker,
+            #[cfg(feature = "wasip3")]
+            self.wasip3(),
+        )
+        .context("failed to add WASI to linker")?;
 
         // Add HTTP interfaces to the linker if feature is enabled and component uses them
         if uses_wasi_http(&wasmtime_component) {
-            wasmtime_wasi_http::add_only_http_to_linker_async(&mut linker)
+            wasmtime_wasi_http::p2::add_only_http_to_linker_async(&mut linker)
                 .map_err(anyhow::Error::from)
                 .context("failed to add wasi:http/types to linker")?;
+            #[cfg(feature = "wasip3")]
+            if self.wasip3() {
+                wasmtime_wasi_http::p3::add_to_linker(&mut linker).map_err(|e| {
+                    anyhow::anyhow!(e).context("failed to add wasi:http p3 to linker")
+                })?;
+            }
         }
 
         // Build volume mounts for this component by looking up validated volumes
@@ -397,6 +457,8 @@ impl Engine {
             service.local_resources,
             service.max_restarts,
             loopback,
+            #[cfg(feature = "wasip3")]
+            self.wasip3(),
         );
 
         let world = service.world();
@@ -454,6 +516,14 @@ impl Engine {
                     .map(|v| v.0)
             }
         }
+    }
+
+    #[allow(unsafe_code)]
+    #[instrument(name = "load_precompiled_bytes", skip_all)]
+    fn load_precompiled_bytes(&self, bytes: impl AsRef<[u8]>) -> anyhow::Result<Component> {
+        unsafe { Component::deserialize(&self.inner, bytes.as_ref()) }
+            .map_err(anyhow::Error::from)
+            .context("failed to deserialize precompiled component bytes")
     }
 
     fn load_or_compile(
@@ -570,22 +640,36 @@ impl Engine {
         validated_volumes: &std::collections::HashMap<String, PathBuf>,
         loopback: Arc<std::sync::Mutex<loopback::Network>>,
     ) -> anyhow::Result<WorkloadComponent> {
-        // Create a wasmtime component from the bytes
-        let wasmtime_component = self
-            .load_component_bytes(component.bytes, component.digest)
-            .context("failed to create component from bytes")?;
+        // Create a wasmtime component — deserialize if precompiled, else compile from wasm.
+        let wasmtime_component = if component.is_precompiled {
+            self.load_precompiled_bytes(component.bytes)?
+        } else {
+            self.load_component_bytes(component.bytes, component.digest)
+                .context("failed to create component from bytes")?
+        };
 
         // Create a linker for this component
         let mut linker: Linker<SharedCtx> = Linker::new(&self.inner);
 
         // Add WASI@0.2 interfaces to the linker (with custom socket implementation)
-        add_wasi_to_linker(&mut linker).context("failed to add WASI to linker")?;
+        add_wasi_to_linker(
+            &mut linker,
+            #[cfg(feature = "wasip3")]
+            self.wasip3(),
+        )
+        .context("failed to add WASI to linker")?;
 
         // Add HTTP interfaces to the linker
         if uses_wasi_http(&wasmtime_component) {
-            wasmtime_wasi_http::add_only_http_to_linker_async(&mut linker)
+            wasmtime_wasi_http::p2::add_only_http_to_linker_async(&mut linker)
                 .map_err(anyhow::Error::from)
                 .context("failed to add wasi:http/types to linker")?;
+            #[cfg(feature = "wasip3")]
+            if self.wasip3() {
+                wasmtime_wasi_http::p3::add_to_linker(&mut linker).map_err(|e| {
+                    anyhow::anyhow!(e).context("failed to add wasi:http p3 to linker")
+                })?;
+            }
         }
 
         // Build volume mounts for this component by looking up validated volumes
@@ -612,6 +696,8 @@ impl Engine {
             component_volume_mounts,
             component.local_resources,
             loopback,
+            #[cfg(feature = "wasip3")]
+            self.wasip3(),
             // TODO: implement pooling and instance limits
             // component.pool_size,
             // component.max_invocations,
@@ -633,6 +719,8 @@ pub struct EngineBuilder {
     compilation_cache_ttl: Option<Duration>,
     fuel_consumption: bool,
     compiled_cache_dir: Option<PathBuf>,
+    #[cfg(feature = "wasip3")]
+    wasip3: bool,
 }
 
 impl EngineBuilder {
@@ -697,6 +785,15 @@ impl EngineBuilder {
         self.compiled_cache_dir = Some(dir.into());
         self
     }
+
+    /// Enables or disables WASIP3 support.
+    /// When enabled (and compiled with the `wasip3` feature), both P2 and P3
+    /// bindings are registered in component linkers.
+    #[cfg(feature = "wasip3")]
+    pub fn with_wasip3(mut self, enable: bool) -> Self {
+        self.wasip3 = enable;
+        self
+    }
 }
 
 impl EngineBuilder {
@@ -722,15 +819,29 @@ impl EngineBuilder {
             cfg
         } else {
             let mut cfg = wasmtime::Config::default();
+
+            let use_pooling_allocator = getenv::<bool>("WASMTIME_POOLING");
+            let use_pooling_allocator = self
+                .use_pooling_allocator
+                .or(use_pooling_allocator)
+                .unwrap_or(true);
+
             // The pooling allocator can be more efficient for workloads with many short-lived instances
-            if let Ok(true) = use_pooling_allocator_by_default(self.use_pooling_allocator) {
+            if use_pooling_allocator && let Ok(true) = is_pooling_allocator_supported() {
                 tracing::debug!("using pooling allocator by default");
                 cfg.allocation_strategy(wasmtime::InstanceAllocationStrategy::Pooling(
                     new_pooling_config(self.max_instances.unwrap_or(1000)),
                 ));
+            } else if use_pooling_allocator {
+                tracing::warn!("pooling allocator requested but not supported");
             }
 
             cfg.consume_fuel(self.fuel_consumption);
+
+            #[cfg(feature = "wasip3")]
+            if self.wasip3 {
+                cfg.wasm_component_model_async(true);
+            }
 
             cfg
         };
@@ -757,6 +868,8 @@ impl EngineBuilder {
             inner,
             cache,
             compiled_cache_dir: self.compiled_cache_dir,
+            #[cfg(feature = "wasip3")]
+            wasip3: self.wasip3,
         })
     }
 }
@@ -784,15 +897,7 @@ pub fn imports_wasi_http(component: &Component) -> bool {
 
 // TL;DR this is likely best for machines that can handle the large virtual memory requirement of the pooling allocator
 // https://github.com/bytecodealliance/wasmtime/blob/b943666650696f1eb7ff8b217762b58d5ef5779d/src/commands/serve.rs#L641-L656
-fn use_pooling_allocator_by_default(runtime_preference: Option<bool>) -> anyhow::Result<bool> {
-    if let Some(v) = runtime_preference {
-        return Ok(v);
-    }
-
-    if let Some(v) = getenv("WASMTIME_POOLING") {
-        return Ok(v);
-    }
-
+fn is_pooling_allocator_supported() -> anyhow::Result<bool> {
     const BITS_TO_TEST: u32 = 42;
     let mut config = wasmtime::Config::new();
     config.wasm_memory64(true);

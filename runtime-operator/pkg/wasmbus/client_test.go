@@ -4,8 +4,9 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
-	"go.wasmcloud.dev/runtime-operator/pkg/wasmbus/wasmbustest"
+	"go.wasmcloud.dev/runtime-operator/v2/pkg/wasmbus/wasmbustest"
 )
 
 type testMessage struct {
@@ -121,7 +122,7 @@ func TestLatticeRequest(t *testing.T) {
 		defer func() { _ = sub.Drain() }()
 
 		errCh := make(chan error, 1)
-		go sub.Handle(func(msg *Message) {
+		sub.Handle(func(msg *Message) {
 			resp := &testMessage{}
 			if err := Decode(msg, resp); err != nil {
 				errCh <- err
@@ -138,9 +139,14 @@ func TestLatticeRequest(t *testing.T) {
 				return
 			}
 		})
+		if err := nc.Flush(); err != nil {
+			t.Fatal(err)
+		}
 
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
 		req := NewLatticeRequest(bus, "test", &testMessage{Name: "request"}, testMessage{})
-		resp, err := req.Execute(context.TODO())
+		resp, err := req.Execute(ctx)
 		if err != nil {
 			t.Errorf("Execute failed: %s", err)
 		}
@@ -156,8 +162,10 @@ func TestLatticeRequest(t *testing.T) {
 		}
 	})
 	t.Run("encode error", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
 		req := NewLatticeRequest(bus, "test", &testMessageErr{Name: "request"}, testMessage{})
-		_, err := req.Execute(context.TODO())
+		_, err := req.Execute(ctx)
 		if err == nil {
 			t.Errorf("expected error for invalid payload")
 		}
@@ -170,14 +178,20 @@ func TestLatticeRequest(t *testing.T) {
 		}
 		defer func() { _ = sub.Drain() }()
 
-		go sub.Handle(func(msg *Message) {
+		sub.Handle(func(msg *Message) {
 			respMsg := NewMessage(msg.Reply)
 			respMsg.Header.Set("Content-Type", "bricks")
 			respMsg.Data = []byte("boom")
 			_ = bus.Publish(respMsg)
 		})
+		if err := nc.Flush(); err != nil {
+			t.Fatal(err)
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
 		req := NewLatticeRequest(bus, "test", &testMessage{Name: "request"}, testMessage{})
-		_, err = req.Execute(context.TODO())
+		_, err = req.Execute(ctx)
 		if err == nil {
 			t.Errorf("expected error for invalid payload")
 		}
@@ -201,7 +215,7 @@ func TestLatticeRequest(t *testing.T) {
 		defer func() { _ = sub.Drain() }()
 
 		errCh := make(chan error, 1)
-		go sub.Handle(func(msg *Message) {
+		sub.Handle(func(msg *Message) {
 			resp := &testMessage{}
 			if err := Decode(msg, resp); err != nil {
 				errCh <- err
@@ -213,13 +227,18 @@ func TestLatticeRequest(t *testing.T) {
 			respMsg := NewMessage(msg.Reply)
 			_ = bus.Publish(respMsg)
 		})
+		if err := nc.Flush(); err != nil {
+			t.Fatal(err)
+		}
 
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
 		req := NewLatticeRequest(bus, "test", &testMessage{Name: "request"}, testMessage{})
 		req.PreRequest = func(ctx context.Context, t *testMessage, m *Message) error {
 			m.Data = []byte(`{"name":"pre-request"}`)
 			return nil
 		}
-		_, err = req.Execute(context.TODO())
+		_, err = req.Execute(ctx)
 		if err != nil {
 			t.Errorf("Execute failed: %s", err)
 		}
@@ -233,7 +252,9 @@ func TestLatticeRequest(t *testing.T) {
 		req.PreRequest = func(ctx context.Context, t *testMessage, m *Message) error {
 			return errors.New("boom")
 		}
-		_, err = req.Execute(context.TODO())
+		ctx2, cancel2 := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel2()
+		_, err = req.Execute(ctx2)
 		if err == nil {
 			t.Errorf("expected error for pre-request")
 		}
@@ -247,7 +268,7 @@ func TestLatticeRequest(t *testing.T) {
 		defer func() { _ = sub.Drain() }()
 
 		errCh := make(chan error, 1)
-		go sub.Handle(func(msg *Message) {
+		sub.Handle(func(msg *Message) {
 			resp := &testMessage{}
 			if err := Decode(msg, resp); err != nil {
 				errCh <- err
@@ -264,13 +285,18 @@ func TestLatticeRequest(t *testing.T) {
 				return
 			}
 		})
+		if err := nc.Flush(); err != nil {
+			t.Fatal(err)
+		}
 
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
 		req := NewLatticeRequest(bus, "test", &testMessage{Name: "request"}, testMessage{})
 		req.PostRequest = func(ctx context.Context, t *testMessage, m *Message) error {
 			t.Name = "post-request"
 			return nil
 		}
-		resp, err := req.Execute(context.TODO())
+		resp, err := req.Execute(ctx)
 		if err != nil {
 			t.Errorf("Execute failed: %s", err)
 		}
@@ -282,7 +308,9 @@ func TestLatticeRequest(t *testing.T) {
 		req.PostRequest = func(ctx context.Context, t *testMessage, m *Message) error {
 			return errors.New("boom")
 		}
-		_, err = req.Execute(context.TODO())
+		ctx2, cancel2 := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel2()
+		_, err = req.Execute(ctx2)
 		if err == nil {
 			t.Errorf("expected error for post-request")
 		}

@@ -43,18 +43,79 @@ use tracing::{Instrument, debug, error, info, instrument, warn};
 use wasmtime::Store;
 use wasmtime::component::InstancePre;
 use wasmtime_wasi_http::{
-    WasiHttpView,
-    bindings::{ProxyPre, http::types::Scheme},
-    body::HyperOutgoingBody,
-    hyper_request_error,
     io::TokioIo,
-    types::{HostFutureIncomingResponse, IncomingResponse, OutgoingRequestConfig},
+    p2::{
+        WasiHttpView,
+        bindings::{ProxyPre, http::types::Scheme},
+        body::HyperOutgoingBody,
+        hyper_request_error,
+        types::{HostFutureIncomingResponse, IncomingResponse, OutgoingRequestConfig},
+    },
 };
 
-use rustls::{ServerConfig, pki_types::CertificateDer};
-use rustls_pemfile::{certs, private_key};
+use rustls::ServerConfig;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
 use tokio::sync::{RwLock, mpsc};
 use tokio_rustls::TlsAcceptor;
+
+/// Validates a hostname according to RFC 1123.
+fn is_valid_hostname(host: &str) -> bool {
+    !host.is_empty()
+        && host.len() <= 253
+        && host.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && label
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+        })
+}
+
+/// Why a request could not be routed to a workload.
+#[derive(Debug)]
+pub enum RouteError {
+    /// Request had no `Host` header a
+    /// genuinely malformed client request. Maps to 400.
+    MissingHost,
+    /// No workload is currently bound to the host.
+    /// `DynamicRouter` passes the offending host header; `DevRouter` is
+    /// host-agnostic and passes an empty string. Maps to 404.
+    NoWorkloadForHost(String),
+    /// Router is momentarily unable to read its routing table (lock
+    /// contention under heavy load). Retrying should succeed. Maps to 503.
+    Unavailable,
+}
+
+impl RouteError {
+    /// HTTP status code for this routing failure.
+    pub fn status(&self) -> u16 {
+        match self {
+            Self::MissingHost => 400,
+            Self::NoWorkloadForHost(_) => 404,
+            Self::Unavailable => 503,
+        }
+    }
+}
+
+impl std::fmt::Display for RouteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MissingHost => write!(f, "request has no Host header or :authority"),
+            // Empty host means the router is DevRouter and
+            // simply has no workload registered so the host header is
+            // irrelevant to the failure.
+            Self::NoWorkloadForHost(host) if host.is_empty() => {
+                write!(f, "no workload registered")
+            }
+            Self::NoWorkloadForHost(host) => write!(f, "no workload bound to host {host:?}"),
+            Self::Unavailable => write!(f, "router is temporarily unavailable"),
+        }
+    }
+}
+
+impl std::error::Error for RouteError {}
 
 /// Trait defining the routing behavior for HTTP requests
 /// Allows for custom routing logic based on workload IDs and requests
@@ -76,23 +137,28 @@ pub trait Router: Send + Sync + 'static {
     fn allow_outgoing_request(
         &self,
         workload_id: &str,
-        request: &hyper::Request<wasmtime_wasi_http::body::HyperOutgoingBody>,
-        config: &wasmtime_wasi_http::types::OutgoingRequestConfig,
+        request: &hyper::Request<wasmtime_wasi_http::p2::body::HyperOutgoingBody>,
+        config: &wasmtime_wasi_http::p2::types::OutgoingRequestConfig,
         _allowed_hosts: &[String],
     ) -> anyhow::Result<()>;
 
-    /// Pick a workload ID based on the incoming request
+    /// Pick a workload ID based on the incoming request.
+    ///
+    /// On failure, the returned [`RouteError`] determines the HTTP status
+    /// code surfaced to the client (see [`RouteError::status`]).
     fn route_incoming_request(
         &self,
         req: &hyper::Request<hyper::body::Incoming>,
-    ) -> anyhow::Result<String>;
+    ) -> Result<String, RouteError>;
 }
 
 /// Router that routes requests by 'Host' header, configured via WitInterface config
 #[derive(Default)]
 pub struct DynamicRouter {
     host_to_workload: tokio::sync::RwLock<HashMap<String, HashSet<String>>>,
-    workload_to_host: tokio::sync::RwLock<HashMap<String, String>>,
+    /// Maps workload_id -> all hostnames (primary + aliases) registered for it.
+    /// Used by on_workload_unbind to remove all entries cleanly.
+    workload_to_host: tokio::sync::RwLock<HashMap<String, Vec<String>>>,
 }
 
 /// Implementation of Router that maps Host headers to workload IDs
@@ -113,34 +179,62 @@ impl Router for DynamicRouter {
             anyhow::bail!("workload did not request wasi:http/incoming-handler interface");
         };
 
-        let host_header = http_iface
+        let primary_host = http_iface
             .config
             .get("host")
             .cloned()
             .context("No host header found")?;
 
+        anyhow::ensure!(
+            is_valid_hostname(&primary_host),
+            "primary host {primary_host:?} is not a valid RFC 1123 hostname"
+        );
+
+        // Collect primary hostname plus any DNS aliases injected by the operator.
+        // Aliases are a comma-separated list of Service DNS names (e.g.
+        // "my-svc,my-svc.default,my-svc.default.svc,my-svc.default.svc.cluster.local")
+        // that allow cluster-internal callers to reach this workload via Service DNS.
+        let mut all_hosts = vec![primary_host];
+        if let Some(aliases) = http_iface.config.get("host-aliases") {
+            all_hosts.extend(
+                aliases
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty() && is_valid_hostname(s)),
+            );
+        }
+
+        let workload_id = resolved_handle.id().to_string();
+
         {
             let mut lock = self.workload_to_host.write().await;
-            lock.insert(resolved_handle.id().to_string(), host_header.clone());
+            lock.insert(workload_id.clone(), all_hosts.clone());
         }
 
         {
             let mut lock = self.host_to_workload.write().await;
-            let entry = lock.entry(host_header.clone()).or_insert_with(HashSet::new);
-            entry.insert(resolved_handle.id().to_string());
+            for host in &all_hosts {
+                let entry = lock.entry(host.clone()).or_insert_with(HashSet::new);
+                entry.insert(workload_id.clone());
+            }
         }
 
         Ok(())
     }
 
     async fn on_workload_unbind(&self, workload_id: &str) -> anyhow::Result<()> {
-        let mut lock = self.workload_to_host.write().await;
-        if let Some(host_header) = lock.remove(workload_id) {
-            let mut host_lock = self.host_to_workload.write().await;
-            if let Some(workload_set) = host_lock.get_mut(&host_header) {
-                workload_set.remove(workload_id);
-                if workload_set.is_empty() {
-                    host_lock.remove(&host_header);
+        let hostnames = {
+            let mut wth_lock = self.workload_to_host.write().await;
+            wth_lock.remove(workload_id)
+        };
+        if let Some(hostnames) = hostnames {
+            let mut htw_lock = self.host_to_workload.write().await;
+            for hostname in &hostnames {
+                if let Some(workload_set) = htw_lock.get_mut(hostname) {
+                    workload_set.remove(workload_id);
+                    if workload_set.is_empty() {
+                        htw_lock.remove(hostname);
+                    }
                 }
             }
         }
@@ -150,8 +244,8 @@ impl Router for DynamicRouter {
     fn allow_outgoing_request(
         &self,
         _workload_id: &str,
-        request: &hyper::Request<wasmtime_wasi_http::body::HyperOutgoingBody>,
-        _config: &wasmtime_wasi_http::types::OutgoingRequestConfig,
+        request: &hyper::Request<wasmtime_wasi_http::p2::body::HyperOutgoingBody>,
+        _config: &wasmtime_wasi_http::p2::types::OutgoingRequestConfig,
         allowed_hosts: &[String],
     ) -> anyhow::Result<()> {
         check_allowed_hosts(request, allowed_hosts)
@@ -161,23 +255,28 @@ impl Router for DynamicRouter {
     fn route_incoming_request(
         &self,
         req: &hyper::Request<hyper::body::Incoming>,
-    ) -> anyhow::Result<String> {
+    ) -> Result<String, RouteError> {
         tokio::task::block_in_place(move || {
-            let lock = self.host_to_workload.try_read()?;
+            let lock = self
+                .host_to_workload
+                .try_read()
+                .map_err(|_| RouteError::Unavailable)?;
             let workload_host = req
                 .headers()
                 .get(hyper::header::HOST)
                 .and_then(|h| h.to_str().ok())
                 .or_else(|| req.uri().authority().map(|a| a.as_str()))
-                .context("no Host header or :authority in request")?;
+                .ok_or(RouteError::MissingHost)?;
             let Some(workload_set) = lock.get(workload_host) else {
-                anyhow::bail!("no workload bound to host header: {}", workload_host);
+                return Err(RouteError::NoWorkloadForHost(workload_host.to_string()));
             };
 
+            // Entry exists but is empty so treat it as "no workload bound" from the
+            // caller's perspective; same 404 status
             let workload_id = workload_set
                 .iter()
                 .next()
-                .context("no workload IDs found for host header")?;
+                .ok_or_else(|| RouteError::NoWorkloadForHost(workload_host.to_string()))?;
 
             Ok(workload_id.clone())
         })
@@ -187,7 +286,7 @@ impl Router for DynamicRouter {
 /// Development router that routes all requests to the last resolved workload
 #[derive(Default)]
 pub struct DevRouter {
-    last_workload_id: tokio::sync::Mutex<Option<String>>,
+    last_workload_id: std::sync::RwLock<Option<String>>,
 }
 
 #[async_trait::async_trait]
@@ -197,13 +296,19 @@ impl Router for DevRouter {
         resolved_handle: &ResolvedWorkload,
         _component_id: &str,
     ) -> anyhow::Result<()> {
-        let mut lock = self.last_workload_id.lock().await;
+        let mut lock = self
+            .last_workload_id
+            .write()
+            .map_err(|e| anyhow::anyhow!("DevRouter write lock poisoned: {e}"))?;
         lock.replace(resolved_handle.id().to_string());
         Ok(())
     }
 
     async fn on_workload_unbind(&self, workload_id: &str) -> anyhow::Result<()> {
-        let mut lock = self.last_workload_id.lock().await;
+        let mut lock = self
+            .last_workload_id
+            .write()
+            .map_err(|e| anyhow::anyhow!("DevRouter write lock poisoned: {e}"))?;
         if let Some(current_id) = &*lock
             && current_id == workload_id
         {
@@ -215,8 +320,8 @@ impl Router for DevRouter {
     fn allow_outgoing_request(
         &self,
         _workload_id: &str,
-        _request: &hyper::Request<wasmtime_wasi_http::body::HyperOutgoingBody>,
-        _config: &wasmtime_wasi_http::types::OutgoingRequestConfig,
+        _request: &hyper::Request<wasmtime_wasi_http::p2::body::HyperOutgoingBody>,
+        _config: &wasmtime_wasi_http::p2::types::OutgoingRequestConfig,
         _allowed_hosts: &[String],
     ) -> anyhow::Result<()> {
         Ok(())
@@ -226,11 +331,16 @@ impl Router for DevRouter {
     fn route_incoming_request(
         &self,
         _req: &hyper::Request<hyper::body::Incoming>,
-    ) -> anyhow::Result<String> {
-        let lock = self.last_workload_id.try_lock()?;
+    ) -> Result<String, RouteError> {
+        let lock = self
+            .last_workload_id
+            .try_read()
+            .map_err(|_| RouteError::Unavailable)?;
         match &*lock {
             Some(id) => Ok(id.clone()),
-            None => anyhow::bail!("no workload available to route request"),
+            // DevRouter is host-agnostic; signal "nothing registered" via an
+            // empty host string (see RouteError::NoWorkloadForHost docs).
+            None => Err(RouteError::NoWorkloadForHost(String::new())),
         }
     }
 }
@@ -262,10 +372,10 @@ pub trait HostHandler: Send + Sync + 'static {
     fn outgoing_request(
         &self,
         workload_id: &str,
-        request: hyper::Request<wasmtime_wasi_http::body::HyperOutgoingBody>,
-        config: wasmtime_wasi_http::types::OutgoingRequestConfig,
+        request: hyper::Request<wasmtime_wasi_http::p2::body::HyperOutgoingBody>,
+        config: wasmtime_wasi_http::p2::types::OutgoingRequestConfig,
         allowed_hosts: &[String],
-    ) -> wasmtime_wasi_http::HttpResult<wasmtime_wasi_http::types::HostFutureIncomingResponse>;
+    ) -> wasmtime_wasi_http::p2::HttpResult<wasmtime_wasi_http::p2::types::HostFutureIncomingResponse>;
 }
 
 impl std::fmt::Debug for dyn HostHandler {
@@ -306,13 +416,14 @@ impl HostHandler for NullServer {
     fn outgoing_request(
         &self,
         _workload_id: &str,
-        _request: hyper::Request<wasmtime_wasi_http::body::HyperOutgoingBody>,
-        _config: wasmtime_wasi_http::types::OutgoingRequestConfig,
+        _request: hyper::Request<wasmtime_wasi_http::p2::body::HyperOutgoingBody>,
+        _config: wasmtime_wasi_http::p2::types::OutgoingRequestConfig,
         _allowed_hosts: &[String],
-    ) -> wasmtime_wasi_http::HttpResult<wasmtime_wasi_http::types::HostFutureIncomingResponse> {
-        Err(wasmtime_wasi_http::HttpError::trap(wasmtime::format_err!(
-            "http client not available"
-        )))
+    ) -> wasmtime_wasi_http::p2::HttpResult<wasmtime_wasi_http::p2::types::HostFutureIncomingResponse>
+    {
+        Err(wasmtime_wasi_http::p2::HttpError::trap(
+            wasmtime::format_err!("http client not available"),
+        ))
     }
 }
 
@@ -350,10 +461,14 @@ impl<T: Router> HttpServer<T> {
     /// to let the OS pick a free port, then call [`addr()`](Self::addr) to
     /// discover the actual address.
     ///
+    /// Side effect: installs the process-level rustls crypto provider via
+    /// [`crate::init_crypto`] (idempotent).
+    ///
     /// # Arguments
     /// * `router` - The router implementation for handling requests
     /// * `addr` - The socket address to bind to
     pub async fn new(router: T, addr: SocketAddr) -> anyhow::Result<Self> {
+        crate::init_crypto();
         let listener = TcpListener::bind(addr).await?;
         let addr = listener.local_addr()?;
         Ok(Self {
@@ -374,6 +489,9 @@ impl<T: Router> HttpServer<T> {
 
     /// Creates a new HTTPS server with TLS support.
     ///
+    /// Side effect: installs the process-level rustls crypto provider via
+    /// [`crate::init_crypto`] (idempotent).
+    ///
     /// # Arguments
     /// * `router` - The router implementation for handling requests
     /// * `addr` - The socket address to bind to
@@ -393,6 +511,7 @@ impl<T: Router> HttpServer<T> {
         key_path: &Path,
         ca_path: Option<&Path>,
     ) -> anyhow::Result<Self> {
+        crate::init_crypto();
         let tls_config = load_tls_config(cert_path, key_path, ca_path).await?;
         let tls_acceptor = TlsAcceptor::from(Arc::new(tls_config));
 
@@ -432,7 +551,12 @@ impl<T: Router> HostHandler for HttpServer<T> {
             .await
             .take()
             .context("HTTP server listener already consumed")?;
-        info!(addr = ?addr, "HTTP server listening");
+        let protocol = if self.tls_acceptor.is_some() {
+            "HTTPS"
+        } else {
+            "HTTP"
+        };
+        info!(addr = ?addr, protocol = protocol, "{protocol} server listening");
         // Start the HTTP server, any incoming requests call Host::handle and then it's routed
         // to the workload based on host header.
         let handler = self.router.clone();
@@ -451,13 +575,6 @@ impl<T: Router> HostHandler for HttpServer<T> {
                 error!(err = ?e, addr = ?addr, "HTTP server error");
             }
         });
-
-        let protocol = if self.tls_acceptor.is_some() {
-            "HTTPS"
-        } else {
-            "HTTP"
-        };
-        debug!(addr = ?addr, protocol = protocol, "HTTP server starting");
         Ok(())
     }
 
@@ -507,24 +624,25 @@ impl<T: Router> HostHandler for HttpServer<T> {
     fn outgoing_request(
         &self,
         workload_id: &str,
-        request: hyper::Request<wasmtime_wasi_http::body::HyperOutgoingBody>,
-        config: wasmtime_wasi_http::types::OutgoingRequestConfig,
+        request: hyper::Request<wasmtime_wasi_http::p2::body::HyperOutgoingBody>,
+        config: wasmtime_wasi_http::p2::types::OutgoingRequestConfig,
         allowed_hosts: &[String],
-    ) -> wasmtime_wasi_http::HttpResult<wasmtime_wasi_http::types::HostFutureIncomingResponse> {
+    ) -> wasmtime_wasi_http::p2::HttpResult<wasmtime_wasi_http::p2::types::HostFutureIncomingResponse>
+    {
         if let Err(e) =
             self.router
                 .allow_outgoing_request(workload_id, &request, &config, allowed_hosts)
         {
             warn!(workload_id = %workload_id, err = %e, "outgoing request denied by allowed_hosts policy");
-            return Err(wasmtime_wasi_http::HttpError::trap(
-                wasmtime_wasi_http::bindings::http::types::ErrorCode::HttpRequestDenied,
+            return Err(wasmtime_wasi_http::p2::HttpError::trap(
+                wasmtime_wasi_http::p2::bindings::http::types::ErrorCode::HttpRequestDenied,
             ));
         }
 
         if is_grpc_request(&request) {
             Ok(send_grpc_request(request, config))
         } else {
-            Ok(wasmtime_wasi_http::types::default_send_request(
+            Ok(wasmtime_wasi_http::p2::default_send_request(
                 request, config,
             ))
         }
@@ -616,18 +734,61 @@ async fn run_http_server<T: Router>(
     Ok(())
 }
 
+pub const TRACE_ID_HEADER: &str = "x-wash-trace-id";
+
+fn new_trace_id() -> String {
+    let uuid = uuid::Uuid::new_v4().simple().to_string();
+    uuid[..12].to_string()
+}
+
 /// Build an error response with the given status code.
 /// Building HTTP responses with valid status codes is infallible.
 #[allow(clippy::expect_used)]
-fn error_response(status: u16) -> hyper::Response<HyperOutgoingBody> {
+fn error_response(status: u16, trace_id: &str) -> hyper::Response<HyperOutgoingBody> {
     hyper::Response::builder()
         .status(status)
+        .header(TRACE_ID_HEADER, trace_id)
         .body(HyperOutgoingBody::default())
         .expect("building HTTP response with valid status code should never fail")
 }
 
+#[derive(Debug)]
+enum ComponentErrorKind {
+    Trap,
+    NoResponse,
+    Other,
+}
+
+fn classify_error(e: &anyhow::Error) -> ComponentErrorKind {
+    for cause in e.chain() {
+        if cause.is::<wasmtime::Trap>() {
+            return ComponentErrorKind::Trap;
+        }
+        if cause.is::<tokio::sync::oneshot::error::RecvError>() {
+            return ComponentErrorKind::NoResponse;
+        }
+    }
+    ComponentErrorKind::Other
+}
+
+/// Panic payloads are `Box<dyn Any>`; `&str` and `String` cover the common cases.
+fn describe_join_error(join_err: tokio::task::JoinError) -> String {
+    if !join_err.is_panic() {
+        return format!("{join_err}");
+    }
+    let payload = join_err.into_panic();
+    if let Some(s) = payload.downcast_ref::<&'static str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "<non-string panic payload>".to_string()
+    }
+}
+
 /// Handle individual HTTP requests by looking up workload and invoking component
 #[instrument(skip_all, fields(
+    trace_id = tracing::field::Empty,
     http.method = %req.method(),
     http.uri = %req.uri(),
     http.host = %req.headers().get(hyper::header::HOST).and_then(|h| h.to_str().ok()).unwrap_or("unknown"),
@@ -638,14 +799,28 @@ async fn handle_http_request<T: Router>(
     workload_handles: WorkloadHandles,
     fuel_meter: FuelConsumptionMeter,
 ) -> Result<hyper::Response<HyperOutgoingBody>, hyper::Error> {
+    let trace_id = new_trace_id();
+    tracing::Span::current().record("trace_id", tracing::field::display(&trace_id));
+
     let method = req.method().clone();
     let uri = req.uri().clone();
 
-    let Ok(workload_id) = handler.route_incoming_request(&req) else {
-        return Ok(error_response(400));
+    let workload_id = match handler.route_incoming_request(&req) {
+        Ok(id) => id,
+        Err(reason) => {
+            warn!(
+                trace_id = %trace_id,
+                method = %method,
+                uri = %uri,
+                reason = ?reason,
+                "no route matched incoming request",
+            );
+            return Ok(error_response(400, &trace_id));
+        }
     };
 
     debug!(
+        trace_id = %trace_id,
         method = %method,
         uri = %uri,
         host = %workload_id,
@@ -666,24 +841,47 @@ async fn handle_http_request<T: Router>(
             let req_span = tracing::span!(
                 tracing::Level::INFO,
                 "invoke_component_handler",
+                trace_id = %trace_id,
                 workload.name = handle.name(),
                 workload.namespace = handle.namespace(),
                 workload.id = handle.id(),
             );
-            match invoke_component_handler(handle, instance_pre, &component_id, req, fuel_meter)
+            match invoke_component_handler(&handle, instance_pre, &component_id, req, fuel_meter)
                 .instrument(req_span)
                 .await
             {
-                Ok(resp) => resp,
+                Ok(mut resp) => {
+                    resp.headers_mut().insert(
+                        TRACE_ID_HEADER,
+                        hyper::header::HeaderValue::from_str(&trace_id)
+                            .expect("uuid hex is always a valid header value"),
+                    );
+                    resp
+                }
                 Err(e) => {
-                    error!(err = ?e, "failed to invoke component");
-                    error_response(500)
+                    let kind = classify_error(&e);
+                    error!(
+                        trace_id = %trace_id,
+                        workload.id = handle.id(),
+                        workload.name = handle.name(),
+                        workload.namespace = handle.namespace(),
+                        component.id = %component_id,
+                        error.kind = ?kind,
+                        error.chain = ?e,
+                        error.display = %format!("{e:#}"),
+                        "component HTTP handler failed",
+                    );
+                    error_response(500, &trace_id)
                 }
             }
         }
         None => {
-            warn!(host = %workload_id, "No workload bound to host header or wildcard '*'");
-            error_response(404)
+            warn!(
+                trace_id = %trace_id,
+                host = %workload_id,
+                "no workload bound to host header or wildcard '*'",
+            );
+            error_response(404, &trace_id)
         }
     };
 
@@ -692,7 +890,7 @@ async fn handle_http_request<T: Router>(
 
 /// Invoke the component handler for the given workload
 async fn invoke_component_handler(
-    workload_handle: ResolvedWorkload,
+    workload_handle: &ResolvedWorkload,
     instance_pre: InstancePre<SharedCtx>,
     component_id: &str,
     req: hyper::Request<hyper::body::Incoming>,
@@ -700,6 +898,25 @@ async fn invoke_component_handler(
 ) -> anyhow::Result<hyper::Response<HyperOutgoingBody>> {
     // Create a new store for this request with plugin contexts
     let store = workload_handle.new_store(component_id).await?;
+
+    // Check if this component targets WASIP3 and dispatch accordingly
+    #[cfg(feature = "wasip3")]
+    if crate::engine::targets_wasip3_http(instance_pre.component()) {
+        let resp =
+            crate::host::http_p3::handle_component_request_p3(store, instance_pre, req, fuel_meter)
+                .await?;
+        // Convert P3 response to a compatible HyperOutgoingBody response
+        let (parts, body) = resp.into_parts();
+        let body = HyperOutgoingBody::new(
+            body.map_err(|e| {
+                wasmtime_wasi_http::p2::bindings::http::types::ErrorCode::InternalError(Some(
+                    format!("failed to convert P3 http body: {e:?}"),
+                ))
+            })
+            .boxed_unsync(),
+        );
+        return Ok(hyper::Response::from_parts(parts, body));
+    }
 
     handle_component_request(store, instance_pre, req, fuel_meter).await
 }
@@ -729,8 +946,8 @@ pub async fn handle_component_request(
         .unwrap_or_default();
     let uri = req.uri().to_string();
 
-    let req = store.data_mut().new_incoming_request(scheme, req)?;
-    let out = store.data_mut().new_response_outparam(sender)?;
+    let req = store.data_mut().http().new_incoming_request(scheme, req)?;
+    let out = store.data_mut().http().new_response_outparam(sender)?;
     let pre = ProxyPre::new(pre)
         .map_err(anyhow::Error::from)
         .context("failed to instantiate proxy pre")?;
@@ -768,27 +985,22 @@ pub async fn handle_component_request(
         .in_current_span(),
     );
 
+    // receiver drops when the task ends without setting the outparam;
+    // join the task to recover the real cause (trap, panic, or clean exit).
     match receiver.await {
-        // If the client calls `response-outparam::set` then one of these
-        // methods will be called.
         Ok(Ok(resp)) => Ok(resp),
-        Ok(Err(e)) => Err(e.into()),
-
-        // Otherwise the `sender` will get dropped along with the `Store`
-        // meaning that the oneshot will get disconnected
-        Err(e) => {
-            if let Err(task_error) = task.await {
-                error!(err = ?task_error, "error receiving http response");
-                Err(anyhow::anyhow!(
-                    "error receiving http response: {task_error}"
-                ))
-            } else {
-                error!(err = ?e, "error receiving http response");
-                Err(anyhow::anyhow!(
-                    "oneshot channel closed but no response was sent"
-                ))
+        Ok(Err(e)) => Err(anyhow::Error::from(e).context("component returned HTTP error")),
+        Err(recv_err) => match task.await {
+            Ok(Err(task_err)) => {
+                Err(task_err.context("component task failed before calling response-outparam::set"))
             }
-        }
+            Ok(Ok(())) => Err(anyhow::Error::from(recv_err)
+                .context("component returned without calling response-outparam::set")),
+            Err(join_err) => Err(anyhow::anyhow!(
+                "component task panicked: {}",
+                describe_join_error(join_err)
+            )),
+        },
     }
 }
 
@@ -804,8 +1016,7 @@ async fn load_tls_config(
         "Failed to read certificate file: {}",
         cert_path.display()
     ))?;
-    let mut cert_reader = std::io::Cursor::new(cert_data);
-    let cert_chain: Vec<CertificateDer<'static>> = certs(&mut cert_reader)
+    let cert_chain: Vec<CertificateDer<'static>> = CertificateDer::pem_slice_iter(&cert_data)
         .collect::<Result<Vec<_>, _>>()
         .context(format!(
             "Failed to parse certificate file: {}",
@@ -823,13 +1034,10 @@ async fn load_tls_config(
         "Failed to read private key file: {}",
         key_path.display()
     ))?;
-    let mut key_reader = std::io::Cursor::new(key_data);
-    let key = private_key(&mut key_reader)
-        .context(format!(
-            "Failed to parse private key file: {}",
-            key_path.display()
-        ))?
-        .ok_or_else(|| anyhow::anyhow!("No private key found in file: {}", key_path.display()))?;
+    let key = PrivateKeyDer::from_pem_slice(&key_data).context(format!(
+        "Failed to parse private key file: {}",
+        key_path.display()
+    ))?;
 
     // Create rustls server config
     let mut config = ServerConfig::builder()
@@ -845,8 +1053,7 @@ async fn load_tls_config(
         let ca_data = tokio::fs::read(ca_path)
             .await
             .context(format!("Failed to read CA file: {}", ca_path.display()))?;
-        let mut ca_reader = std::io::Cursor::new(ca_data);
-        let ca_certs: Vec<CertificateDer<'static>> = certs(&mut ca_reader)
+        let ca_certs: Vec<CertificateDer<'static>> = CertificateDer::pem_slice_iter(&ca_data)
             .collect::<Result<Vec<_>, _>>()
             .context(format!("Failed to parse CA file: {}", ca_path.display()))?;
 
@@ -868,8 +1075,8 @@ async fn load_tls_config(
 ///
 /// If `allowed_hosts` is empty, all requests are allowed.
 /// Supports wildcard patterns like `*.example.com` which match any subdomain.
-pub fn check_allowed_hosts(
-    request: &hyper::Request<wasmtime_wasi_http::body::HyperOutgoingBody>,
+pub fn check_allowed_hosts<B>(
+    request: &hyper::Request<B>,
     allowed_hosts: &[String],
 ) -> anyhow::Result<()> {
     if allowed_hosts.is_empty() {
@@ -930,10 +1137,10 @@ async fn send_grpc_request_handler(
         first_byte_timeout,
         between_bytes_timeout,
     }: OutgoingRequestConfig,
-) -> Result<IncomingResponse, wasmtime_wasi_http::bindings::http::types::ErrorCode> {
+) -> Result<IncomingResponse, wasmtime_wasi_http::p2::bindings::http::types::ErrorCode> {
     use tokio::net::TcpStream;
     use tokio::time::timeout;
-    use wasmtime_wasi_http::bindings::http::types::ErrorCode;
+    use wasmtime_wasi_http::p2::bindings::http::types::ErrorCode;
 
     let authority = if let Some(authority) = request.uri().authority() {
         if authority.port().is_some() {
@@ -1046,7 +1253,7 @@ async fn send_grpc_request_handler(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wasmtime_wasi_http::body::HyperOutgoingBody;
+    use wasmtime_wasi_http::p2::body::HyperOutgoingBody;
 
     fn build_request(uri: &str) -> hyper::Request<HyperOutgoingBody> {
         hyper::Request::builder()
@@ -1118,7 +1325,45 @@ mod tests {
 
     #[test]
     fn error_response_returns_correct_status() {
-        assert_eq!(error_response(404).status(), 404);
-        assert_eq!(error_response(500).status(), 500);
+        let resp = error_response(404, "abc123");
+        assert_eq!(resp.status(), 404);
+        assert_eq!(
+            resp.headers()
+                .get(TRACE_ID_HEADER)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "abc123"
+        );
+        assert_eq!(error_response(500, "").status(), 500);
+    }
+
+    #[test]
+    fn classify_error_identifies_trap() {
+        let bare: anyhow::Error = anyhow::Error::from(wasmtime::Trap::UnreachableCodeReached);
+        assert!(matches!(classify_error(&bare), ComponentErrorKind::Trap));
+
+        // In practice traps reach classify_error wrapped via .context() in
+        // handle_component_request — make sure the chain walk still finds them.
+        let wrapped: anyhow::Error = anyhow::Error::from(wasmtime::Trap::UnreachableCodeReached)
+            .context("component task failed");
+        assert!(matches!(classify_error(&wrapped), ComponentErrorKind::Trap));
+    }
+
+    #[tokio::test]
+    async fn classify_error_identifies_recv_error() {
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        drop(tx);
+        let err: anyhow::Error = anyhow::Error::from(rx.await.unwrap_err());
+        assert!(matches!(
+            classify_error(&err),
+            ComponentErrorKind::NoResponse
+        ));
+    }
+
+    #[test]
+    fn classify_error_defaults_to_other() {
+        let err = anyhow::anyhow!("something unrelated");
+        assert!(matches!(classify_error(&err), ComponentErrorKind::Other));
     }
 }

@@ -22,11 +22,14 @@ use crate::{
     wit::WitConfig,
 };
 
+/// Start a development server for a Wasm component
 #[derive(Debug, Clone, Args)]
 pub struct DevCommand {}
 
 impl CliCommand for DevCommand {
     async fn handle(&self, ctx: &CliContext) -> anyhow::Result<CommandOutput> {
+        wash_runtime::init_crypto();
+
         let project_dir = ctx.project_dir();
         info!(path = ?project_dir, "starting development session for project");
 
@@ -53,10 +56,15 @@ impl CliCommand for DevCommand {
             .clone()
             .unwrap_or_else(|| "0.0.0.0:8000".to_string());
 
-        let engine = Engine::builder()
+        #[allow(unused_mut)]
+        let mut engine_builder = Engine::builder()
             .with_pooling_allocator(true)
-            .with_fuel_consumption(ctx.enable_meters())
-            .build()?;
+            .with_fuel_consumption(ctx.enable_meters());
+        #[cfg(feature = "wasip3")]
+        {
+            engine_builder = engine_builder.with_wasip3(dev_config.wasip3);
+        }
+        let engine = engine_builder.build()?;
 
         let mut host_builder = Host::builder()
             .with_engine(engine)
@@ -70,6 +78,9 @@ impl CliCommand for DevCommand {
         host_builder = host_builder.with_plugin(Arc::new(
             plugin::wasmcloud_messaging::InMemoryMessaging::default(),
         ))?;
+
+        // Enable Betty SMTP
+        host_builder = host_builder.with_plugin(Arc::new(plugin::smtp::BettySmtp::new()))?;
 
         // Add blobstore plugin
         if let Some(blobstore_path) = &dev_config.wasi_blobstore_path {
@@ -227,7 +238,9 @@ impl CliCommand for DevCommand {
         // Running workload ID for reloads
         let workload_id = reload_component(host.clone(), &workload, None).await?;
 
-        info!(address = %format!("{}://{}", protocol, http_addr), "listening for HTTP requests");
+        // Display 127.0.0.1 instead of 0.0.0.0 for user-friendly clickable URL
+        let display_addr = http_addr.replace("0.0.0.0", "127.0.0.1");
+        info!(address = %format!("{}://{}", protocol, display_addr), "listening for HTTP requests");
 
         select! {
             // Process a stop
@@ -293,6 +306,21 @@ async fn create_workload(host: &Host, config: &Config, bytes: Bytes) -> anyhow::
     let mut service: Option<Service> = None;
     let mut components = Vec::new();
     if dev_config.service {
+        let service_interfaces = host
+            .intersect_interfaces(&bytes)
+            .context("failed to extract service interfaces")?;
+
+        // Merge service interfaces into host_interfaces
+        for interface in service_interfaces {
+            match host_interfaces
+                .iter()
+                .find(|i| i.namespace == interface.namespace && i.package == interface.package)
+            {
+                Some(_) => {}
+                None => host_interfaces.push(interface),
+            }
+        }
+
         service = Some(Service {
             bytes,
             digest: None,
@@ -328,12 +356,28 @@ async fn create_workload(host: &Host, config: &Config, bytes: Bytes) -> anyhow::
             },
             pool_size: -1,
             max_invocations: -1,
+            ..Default::default()
         });
 
         if let Some(service_path) = &dev_config.service_file {
             let service_bytes = tokio::fs::read(service_path).await.with_context(|| {
                 format!("failed to read service file at {}", service_path.display())
             })?;
+
+            let service_interfaces = host
+                .intersect_interfaces(&service_bytes)
+                .context("failed to extract service interfaces")?;
+
+            // Merge component interfaces into host_interfaces
+            for interface in service_interfaces {
+                match host_interfaces
+                    .iter()
+                    .find(|i| i.namespace == interface.namespace && i.package == interface.package)
+                {
+                    Some(_) => {}
+                    None => host_interfaces.push(interface),
+                }
+            }
 
             service = Some(Service {
                 bytes: Bytes::from(service_bytes),
@@ -382,6 +426,7 @@ async fn create_workload(host: &Host, config: &Config, bytes: Bytes) -> anyhow::
             },
             pool_size: -1,
             max_invocations: -1,
+            ..Default::default()
         });
     }
 

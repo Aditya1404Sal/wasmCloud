@@ -14,77 +14,98 @@ use crate::cli::{CliCommand, CliContext, CommandOutput};
 #[derive(Debug, Clone, Args)]
 pub struct HostCommand {
     /// The host group label to assign to the host
-    #[clap(long = "host-group", default_value = "default")]
+    #[arg(long = "host-group", default_value = "default")]
     pub host_group: String,
 
     /// NATS URL for Control Plane communications
-    #[clap(long = "scheduler-nats-url", default_value = "nats://localhost:4222")]
+    #[arg(long = "scheduler-nats-url", default_value = "nats://localhost:4222")]
     pub scheduler_nats_url: String,
 
     /// Path to TLS CA certificate file for NATS Scheduler connection
-    #[clap(long = "scheduler-nats-tls-ca")]
+    #[arg(long = "scheduler-nats-tls-ca")]
     pub scheduler_nats_tls_ca: Option<PathBuf>,
 
     /// Enable TLS handshake first mode for NATS Scheduler connection
-    #[clap(long = "scheduler-nats-tls-first", default_value_t = false)]
+    #[arg(long = "scheduler-nats-tls-first", default_value_t = false)]
     pub scheduler_nats_tls_first: bool,
 
     /// Path to NATS TLS certificate file for NATS Scheduler connection
-    #[clap(long = "scheduler-nats-tls-cert")]
+    #[arg(long = "scheduler-nats-tls-cert")]
     pub scheduler_nats_tls_cert: Option<PathBuf>,
 
     /// Path to NATS TLS private key file for NATS Scheduler connection
-    #[clap(long = "scheduler-nats-tls-key")]
+    #[arg(long = "scheduler-nats-tls-key")]
     pub scheduler_nats_tls_key: Option<PathBuf>,
 
     /// NATS URL for Data Plane communications
-    #[clap(long = "data-nats-url", default_value = "nats://localhost:4222")]
+    #[arg(long = "data-nats-url", default_value = "nats://localhost:4222")]
     pub data_nats_url: String,
 
     /// The path to TLS CA certificate file for NATS Data connection
-    #[clap(long = "data-nats-tls-ca")]
+    #[arg(long = "data-nats-tls-ca")]
     pub data_nats_tls_ca: Option<PathBuf>,
 
     /// Enable TLS handshake first mode for NATS Data connection
-    #[clap(long = "data-nats-tls-first", default_value_t = false)]
+    #[arg(long = "data-nats-tls-first", default_value_t = false)]
     pub data_nats_tls_first: bool,
 
     /// Path to NATS TLS certificate file for NATS Data connection
-    #[clap(long = "data-nats-tls-cert")]
+    #[arg(long = "data-nats-tls-cert")]
     pub data_nats_tls_cert: Option<PathBuf>,
 
     /// Path to NATS TLS private key file for NATS Data connection
-    #[clap(long = "data-nats-tls-key")]
+    #[arg(long = "data-nats-tls-key")]
     pub data_nats_tls_key: Option<PathBuf>,
 
     /// The host name to assign to the host
-    #[clap(long = "host-name")]
+    #[arg(long = "host-name")]
     pub host_name: Option<String>,
 
+    /// Environment the host advertises in its heartbeat. For Kubernetes
+    /// host pods this is typically the pod's namespace (passed by the
+    /// runtime-operator chart via the downward API). The runtime-operator
+    /// records this verbatim on the resulting Host CRD's
+    /// `spec.environment` field; scheduling uses it to enforce per-tenant
+    /// isolation.
+    #[arg(long = "environment", env = "WASMCLOUD_HOST_ENVIRONMENT")]
+    pub environment: Option<String>,
+
     /// The address on which the HTTP server will listen
-    #[clap(long = "http-addr")]
+    #[arg(long = "http-addr")]
     pub http_addr: Option<SocketAddr>,
+
+    /// Path to TLS certificate file for the HTTP server
+    #[arg(long = "tls-cert-path", requires = "tls_key_path")]
+    pub tls_cert_path: Option<PathBuf>,
+
+    /// Path to TLS private key file for the HTTP server
+    #[arg(long = "tls-key-path", requires = "tls_cert_path")]
+    pub tls_key_path: Option<PathBuf>,
+
+    /// Path to CA certificate file for mutual TLS on the HTTP server
+    #[arg(long = "tls-ca-path")]
+    pub tls_ca_path: Option<PathBuf>,
 
     /// Enable WASI WebGPU support
     #[cfg(not(target_os = "windows"))]
-    #[clap(long = "wasi-webgpu", default_value_t = false)]
+    #[arg(long = "wasi-webgpu", default_value_t = false)]
     pub wasi_webgpu: bool,
 
     /// PostgreSQL connection URL for the wasmcloud:postgres plugin
     /// (e.g. postgres://user:pass@bouncer:6432?sslmode=require&pool_size=10)
-    #[clap(long = "postgres-url", env = "WASH_POSTGRES_URL")]
+    #[arg(long = "postgres-url", env = "WASH_POSTGRES_URL")]
     pub postgres_url: Option<String>,
 
     /// Allow insecure OCI Registries
-    #[clap(long = "allow-insecure-registries", default_value_t = false)]
+    #[arg(long = "allow-insecure-registries", default_value_t = false)]
     pub allow_insecure_registries: bool,
 
     /// Timeout for pulling artifacts from OCI registries
-    #[clap(long = "registry-pull-timeout", value_parser = humantime::parse_duration, default_value = "30s")]
+    #[arg(long = "registry-pull-timeout", value_parser = humantime::parse_duration, default_value = "30s")]
     pub registry_pull_timeout: Duration,
 
     /// The directory to use for caching OCI artifacts
-    #[clap(long = "oci-cache-dir")]
+    #[arg(long = "oci-cache-dir")]
     pub oci_cache_dir: Option<PathBuf>,
 
     /// Directory for caching compiled component artifacts (.cwasm files).
@@ -101,15 +122,20 @@ pub struct HostCommand {
     pub oci_cleanup_age: Option<Duration>,
 
     /// Enable WASI OpenTelemetry plugin
-    #[clap(long = "wasi-otel", default_value_t = false)]
+    #[arg(long = "wasi-otel", default_value_t = false)]
     pub wasi_otel: bool,
+
+    /// Enable WASIP3 support for components that target wasi@0.3 interfaces
+    #[cfg(feature = "wasip3")]
+    #[arg(long = "wasip3", env = "WASH_WASIP3", default_value_t = false)]
+    pub wasip3: bool,
 }
 
 impl CliCommand for HostCommand {
     async fn handle(&self, ctx: &CliContext) -> anyhow::Result<CommandOutput> {
-        rustls::crypto::aws_lc_rs::default_provider()
-            .install_default()
-            .map_err(|e| anyhow::anyhow!(format!("failed to install crypto provider: {e:?}")))?;
+        // Installed before connect_nats so TLS-enabled NATS clusters have a
+        // crypto provider available. Idempotent; also called by HttpServer::new.
+        wash_runtime::init_crypto();
 
         let scheduler_nats_client = wash_runtime::washlet::connect_nats(
             self.scheduler_nats_url.clone(),
@@ -148,8 +174,13 @@ impl CliCommand for HostCommand {
         let mut engine_builder = Engine::builder()
             .with_pooling_allocator(true)
             .with_fuel_consumption(ctx.enable_meters());
+
         if let Some(ref dir) = self.compiled_cache_dir {
             engine_builder = engine_builder.with_compiled_cache_dir(dir);
+        }
+        #[cfg(feature = "wasip3")]
+        {
+            engine_builder = engine_builder.with_wasip3(self.wasip3);
         }
         let engine = engine_builder.build()?;
 
@@ -169,6 +200,7 @@ impl CliCommand for HostCommand {
             .with_plugin(Arc::new(plugin::wasi_keyvalue::NatsKeyValue::new(
                 &data_nats_client,
             )))?
+            .with_plugin(Arc::new(plugin::smtp::BettySmtp::new()))?
             .with_meters(Meters::new(ctx.enable_meters()));
 
         if let Some(postgres_url) = &self.postgres_url {
@@ -190,11 +222,27 @@ impl CliCommand for HostCommand {
             cluster_host_builder = cluster_host_builder.with_host_name(host_name);
         }
 
+        if let Some(environment) = &self.environment {
+            cluster_host_builder = cluster_host_builder.with_environment(environment);
+        }
+
         if let Some(addr) = self.http_addr {
             let http_router = wash_runtime::host::http::DynamicRouter::default();
-            cluster_host_builder = cluster_host_builder.with_http_handler(Arc::new(
-                wash_runtime::host::http::HttpServer::new(http_router, addr).await?,
-            ));
+            let http_server = if let (Some(cert_path), Some(key_path)) =
+                (&self.tls_cert_path, &self.tls_key_path)
+            {
+                wash_runtime::host::http::HttpServer::new_with_tls(
+                    http_router,
+                    addr,
+                    cert_path,
+                    key_path,
+                    self.tls_ca_path.as_deref(),
+                )
+                .await?
+            } else {
+                wash_runtime::host::http::HttpServer::new(http_router, addr).await?
+            };
+            cluster_host_builder = cluster_host_builder.with_http_handler(Arc::new(http_server));
         }
 
         // Enable otel plugin

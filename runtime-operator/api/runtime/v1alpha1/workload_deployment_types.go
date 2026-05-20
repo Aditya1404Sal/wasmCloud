@@ -1,7 +1,7 @@
 package v1alpha1
 
 import (
-	"go.wasmcloud.dev/runtime-operator/api/condition"
+	"go.wasmcloud.dev/runtime-operator/v2/api/condition"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
@@ -37,6 +37,11 @@ type WorkloadDeploymentSpec struct {
 
 	// +kubebuilder:validation:Optional
 	Artifacts []WorkloadDeploymentArtifact `json:"artifacts,omitempty"`
+
+	// Kubernetes groups Kubernetes-specific configuration such as Service
+	// references and endpoint management.
+	// +kubebuilder:validation:Optional
+	Kubernetes *KubernetesSpec `json:"kubernetes,omitempty"`
 }
 
 // WorkloadDeploymentStatus defines the observed state of WorkloadDeployment.

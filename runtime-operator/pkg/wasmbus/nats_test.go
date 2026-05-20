@@ -4,7 +4,7 @@ import (
 	"testing"
 	"time"
 
-	"go.wasmcloud.dev/runtime-operator/pkg/wasmbus/wasmbustest"
+	"go.wasmcloud.dev/runtime-operator/v2/pkg/wasmbus/wasmbustest"
 )
 
 func TestNatsConnect(t *testing.T) {
@@ -40,9 +40,9 @@ func TestNatsPublish(t *testing.T) {
 			t.Fatal(err)
 		}
 		defer func() { _ = sub.Drain() }()
-		received := make(chan bool)
+		received := make(chan bool, 1)
 
-		go sub.Handle(func(msg *Message) {
+		sub.Handle(func(msg *Message) {
 			if msg.Subject == testSubject {
 				received <- true
 			}
@@ -96,8 +96,8 @@ func TestNatsSubscribe(t *testing.T) {
 		}
 		defer func() { _ = sub.Drain() }()
 
-		received := make(chan bool)
-		go sub.Handle(func(msg *Message) {
+		received := make(chan bool, 1)
+		sub.Handle(func(msg *Message) {
 			if msg.Subject == testSubject {
 				received <- true
 			}
@@ -148,8 +148,8 @@ func TestNatsQueueSubscribe(t *testing.T) {
 			t.Fatal(err)
 		}
 		defer func() { _ = sub.Drain() }()
-		received := make(chan bool)
-		go sub.Handle(func(msg *Message) {
+		received := make(chan bool, 1)
+		sub.Handle(func(msg *Message) {
 			if msg.Subject == "success" {
 				received <- true
 			}

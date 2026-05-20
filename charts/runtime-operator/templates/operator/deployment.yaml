@@ -1,5 +1,6 @@
 {{- if .Values.operator.enabled }}
-{{- $registry := .Values.operator.image.registry | default .Values.global.image.registry | default "docker.io" -}}
+{{- $registry := .Values.operator.image.registry | default .Values.global.image.registry -}}
+{{- $precompileRegistry := .Values.operator.precompile.image.registry | default .Values.global.image.registry -}}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -17,30 +18,57 @@ spec:
     metadata:
       labels:
         wasmcloud.com/name: runtime-operator
-        {{- include "runtime-operator.labels" . | nindent 8 }}
+        {{- include "operator.podLabels" . | nindent 8 }}
+      {{- with .Values.operator.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
     spec:
+      {{- if $.Values.global.tls.enabled }}
       volumes:
         - name: operator-cert
           secret:
             secretName: {{ .Values.global.certificates.operatorCertSecretName }}
+      {{- end }}
       serviceAccountName: {{ include "operator.serviceAccountName" . }}
       {{- include "runtime-operator.imagePullSecrets" . | nindent 6 }}
       containers:
         - name: runtime-operator
-          image: {{ printf "%s/%s" $registry .Values.operator.image.repository }}:{{ .Values.operator.image.tag | default .Chart.AppVersion }}
+          image: {{ if $registry }}{{ printf "%s/%s" $registry .Values.operator.image.repository }}{{ else }}{{ .Values.operator.image.repository }}{{ end }}:{{ .Values.operator.image.tag | default .Chart.AppVersion }}
           args:
-            - "-nats-url=nats://nats:4222"
+            - "-nats-url=nats://nats.{{ .Release.Namespace }}.svc.cluster.local:4222"
+            {{- if $.Values.global.tls.enabled }}
             - "-nats-ca=/operator-cert/ca.crt"
             - "-nats-client-cert=/operator-cert/tls.crt"
             - "-nats-client-key=/operator-cert/tls.key"
+            {{- end }}
             {{- if .Values.operator.watchNamespaces }}
             - "-watch-namespaces={{ .Values.operator.watchNamespaces | join "," }}"
             {{- end }}
+            {{- with include "runtime-operator.hostNamespaces" . }}
+            - "-host-namespaces={{ . }}"
+            {{- end }}
+            - "-allow-shared-hosts={{ .Values.operator.allowSharedHosts }}"
+            {{- if .Values.operator.precompile.enabled }}
+            - "-precompile-worker-image={{ if $precompileRegistry }}{{ printf "%s/%s" $precompileRegistry .Values.operator.precompile.image.repository }}{{ else }}{{ .Values.operator.precompile.image.repository }}{{ end }}:{{ .Values.operator.precompile.image.tag | default .Chart.AppVersion }}"
+            - "-precompile-artifact-base-url={{ .Values.operator.precompile.artifactBaseURL }}"
+            - "-precompile-target={{ .Values.operator.precompile.target }}"
+            - "-precompile-wasmtime-version={{ required "operator.precompile.wasmtimeVersion is required when operator.precompile.enabled is true" .Values.operator.precompile.wasmtimeVersion }}"
+            {{- else }}
+            - "-disable-precompile-controller"
+            {{- end }}
+          env:
+            - name: OPERATOR_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
           imagePullPolicy: {{ .Values.operator.image.pull_policy }}
+          {{- if $.Values.global.tls.enabled }}
           volumeMounts:
             - name: operator-cert
               mountPath: /operator-cert
               readOnly: true
+          {{- end }}
           securityContext:
             capabilities:
               drop:

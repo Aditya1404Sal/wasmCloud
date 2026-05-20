@@ -4,17 +4,20 @@ import (
 	"context"
 	"fmt"
 	"math/rand/v2"
+	"strings"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/tools/events"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
-	"go.wasmcloud.dev/runtime-operator/api/condition"
-	"go.wasmcloud.dev/runtime-operator/pkg/wasmbus"
+	"go.wasmcloud.dev/runtime-operator/v2/api/condition"
+	"go.wasmcloud.dev/runtime-operator/v2/pkg/wasmbus"
 
-	runtimev1alpha1 "go.wasmcloud.dev/runtime-operator/api/runtime/v1alpha1"
-	runtimev2 "go.wasmcloud.dev/runtime-operator/pkg/rpc/wasmcloud/runtime/v2"
+	runtimev1alpha1 "go.wasmcloud.dev/runtime-operator/v2/api/runtime/v1alpha1"
+	runtimev2 "go.wasmcloud.dev/runtime-operator/v2/pkg/rpc/wasmcloud/runtime/v2"
 )
 
 const (
@@ -24,15 +27,30 @@ const (
 	workloadStopTimeout           = 30 * time.Second
 	workloadFinalizerName         = "runtime.wasmcloud.dev/workload-finalizer"
 	workloadSchedulableHostsIndex = "spec.isSchedulable"
+	// hostEnvironmentIndex indexes Hosts by their Environment field for
+	// O(1) lookup when scheduling enforces tenant isolation. The
+	// Environment value is whatever the host self-reported in its
+	// heartbeat (typically a namespace); the Host object itself always
+	// lives in the operator's namespace.
+	hostEnvironmentIndex = "spec.environment"
 )
 
 // WorkloadReconciler reconciles a Workload object
 type WorkloadReconciler struct {
 	client.Client
-	Scheme *runtime.Scheme
-	Bus    wasmbus.Bus
-
-	reconciler condition.AnyConditionedReconciler
+	Scheme   *runtime.Scheme
+	Bus      wasmbus.Bus
+	Recorder events.EventRecorder
+	// OperatorNamespace is the namespace every Host CRD lives in. The
+	// scheduler always lists Hosts in this namespace; tenant boundaries
+	// are enforced via the Host.Environment field, not via Host.Namespace.
+	OperatorNamespace string
+	// AllowSharedHosts controls whether a Workload may schedule onto a Host
+	// whose Environment differs from the Workload's own namespace (via
+	// Spec.Environment). When false, cross-tenant scheduling is rejected
+	// and a Warning Event is recorded on the Workload.
+	AllowSharedHosts bool
+	reconciler       condition.AnyConditionedReconciler
 }
 
 func (r *WorkloadReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -82,6 +100,13 @@ func (r *WorkloadReconciler) reconcileHostSelection(ctx context.Context, workloa
 	condition.ForceStatusUpdate(ctx)
 	if workload.Spec.HostID != "" {
 		workload.Status.HostID = workload.Spec.HostID
+		// Best-effort lookup of the pinned host's Environment so the
+		// ENVIRONMENT status column reflects the host's tenant. A miss
+		// here just leaves the field empty; placement will surface the
+		// real failure if the HostID is invalid.
+		if host, err := r.lookupHostByID(ctx, workload.Spec.HostID); err == nil && host != nil {
+			workload.Status.Environment = host.Environment
+		}
 		return condition.ErrSkipReconciliation()
 	}
 
@@ -90,32 +115,154 @@ func (r *WorkloadReconciler) reconcileHostSelection(ctx context.Context, workloa
 		return err
 	}
 
-	workload.Status.HostID = selectedHost
+	workload.Status.HostID = selectedHost.HostID
+	workload.Status.Environment = selectedHost.Environment
 	return condition.ErrSkipReconciliation()
 }
 
-func (r *WorkloadReconciler) findFreeHost(ctx context.Context, workload *runtimev1alpha1.Workload) (string, error) {
+func (r *WorkloadReconciler) findFreeHost(ctx context.Context, workload *runtimev1alpha1.Workload) (*runtimev1alpha1.Host, error) {
 	hostList := runtimev1alpha1.HostList{}
 
-	if err := r.List(ctx, &hostList,
+	// Every Host object lives in the operator's namespace. Tenant
+	// isolation is enforced by an indexed match on Host.Environment, not by
+	// Host.Namespace.
+	listOpts := []client.ListOption{
+		client.InNamespace(r.OperatorNamespace),
 		client.MatchingLabels(workload.Spec.HostSelector),
 		client.MatchingFields{
 			workloadSchedulableHostsIndex: string(condition.ConditionTrue),
-		}); err != nil {
-		return "", err
+		},
+	}
+
+	// Resolve which Environment value the scheduler accepts per the
+	// AllowSharedHosts × Spec.Environment matrix in namespace-host.md.
+	// Default mode (AllowSharedHosts=true, Environment unset) imposes no
+	// Environment filter — every matching host is fair game, exactly
+	// preserving the legacy Cluster-scope scheduling behavior.
+	var environmentFilter string
+	switch {
+	case workload.Spec.Environment != "" && workload.Spec.Environment != workload.Namespace:
+		// Explicit cross-tenant target.
+		if !r.AllowSharedHosts {
+			if r.Recorder != nil {
+				r.Recorder.Eventf(workload, nil, corev1.EventTypeWarning,
+					"CrossEnvironmentSchedulingDenied", "Reject",
+					"Environment %q is outside %q and operator has allowSharedHosts=false",
+					workload.Spec.Environment, workload.Namespace,
+				)
+			}
+			return nil, fmt.Errorf(
+				"workload targets Environment %q but operator has allowSharedHosts=false",
+				workload.Spec.Environment,
+			)
+		}
+		environmentFilter = workload.Spec.Environment
+	case workload.Spec.Environment != "":
+		// Environment explicitly set to the workload's own namespace.
+		environmentFilter = workload.Namespace
+	case !r.AllowSharedHosts:
+		// No Environment, sharing disabled — lock to the workload's namespace.
+		environmentFilter = workload.Namespace
+	}
+
+	if environmentFilter != "" {
+		listOpts = append(listOpts, client.MatchingFields{
+			hostEnvironmentIndex: environmentFilter,
+		})
+	}
+
+	if err := r.List(ctx, &hostList, listOpts...); err != nil {
+		return nil, err
 	}
 
 	// Shuffle the host list
 	rand.Shuffle(len(hostList.Items), func(i, j int) {
 		hostList.Items[i], hostList.Items[j] = hostList.Items[j], hostList.Items[i]
 	})
-	for _, host := range hostList.Items {
+	for i := range hostList.Items {
+		host := &hostList.Items[i]
 		if host.Status.IsAvailable() {
-			return host.HostID, nil
+			return host, nil
 		}
 	}
 
-	return "", fmt.Errorf("no suitable host found")
+	return nil, fmt.Errorf("no suitable host found")
+}
+
+// lookupHostByID finds a Host CRD by HostID. Hosts always live in the
+// operator's namespace, so the lookup is namespace-scoped and indexed.
+// Returns (nil, nil) when no host matches; an error only on List failure.
+func (r *WorkloadReconciler) lookupHostByID(ctx context.Context, hostID string) (*runtimev1alpha1.Host, error) {
+	var hosts runtimev1alpha1.HostList
+	if err := r.List(ctx, &hosts,
+		client.InNamespace(r.OperatorNamespace),
+		client.MatchingFields{hostIDIndex: hostID},
+	); err != nil {
+		return nil, err
+	}
+	if len(hosts.Items) == 0 {
+		return nil, nil
+	}
+	return &hosts.Items[0], nil
+}
+
+// materializeLocalResources converts a spec-level LocalResources into the
+// runtimev2 equivalent, materializing config layers and volume mounts.
+func materializeLocalResources(ctx context.Context, c client.Client, namespace string, spec *runtimev1alpha1.LocalResources, label string) (*runtimev2.LocalResources, error) {
+	lr := &runtimev2.LocalResources{}
+	if spec == nil {
+		return lr, nil
+	}
+
+	lr.AllowedHosts = spec.AllowedHosts
+	lr.Config = spec.Config
+
+	if spec.Environment != nil {
+		env, err := MaterializeConfigLayer(ctx, c, namespace, spec.Environment)
+		if err != nil {
+			return nil, fmt.Errorf("materializing local resources config for %s: %w", label, err)
+		}
+		lr.Environment = env
+	}
+
+	if spec.VolumeMounts != nil {
+		lr.VolumeMounts = make([]*runtimev2.VolumeMount, 0, len(spec.VolumeMounts))
+		for _, vm := range spec.VolumeMounts {
+			lr.VolumeMounts = append(lr.VolumeMounts, &runtimev2.VolumeMount{
+				Name:      vm.Name,
+				MountPath: vm.MountPath,
+				ReadOnly:  vm.ReadOnly,
+			})
+		}
+	}
+
+	return lr, nil
+}
+
+// injectServiceDNSAliases adds host-aliases to wasi:http/incoming-handler
+// HostInterfaces so the wash-runtime DynamicRouter accepts requests arriving
+// via Kubernetes Service DNS.
+func injectServiceDNSAliases(hostInterfaces []*runtimev2.WitInterface, svcName, namespace string) {
+	aliases := strings.Join([]string{
+		fmt.Sprintf("%s.%s", svcName, namespace),
+		fmt.Sprintf("%s.%s.svc", svcName, namespace),
+	}, ",")
+
+	for i, hi := range hostInterfaces {
+		if hi.Namespace != "wasi" || hi.Package != "http" {
+			continue
+		}
+
+		for _, iface := range hi.Interfaces {
+			if iface == "incoming-handler" {
+				if hi.Config == nil {
+					hi.Config = make(map[string]string)
+				}
+				hi.Config["host-aliases"] = aliases
+				hostInterfaces[i] = hi
+			}
+		}
+	}
 }
 
 func (r *WorkloadReconciler) reconcilePlacement(ctx context.Context, workload *runtimev1alpha1.Workload) error {
@@ -166,38 +313,13 @@ func (r *WorkloadReconciler) reconcilePlacement(ctx context.Context, workload *r
 	}
 
 	for _, c := range workload.Spec.Components {
-		localResources := &runtimev2.LocalResources{}
-
-		if c.LocalResources != nil {
-			localResources.AllowedHosts = c.LocalResources.AllowedHosts
-			localResources.Config = c.LocalResources.Config
-
-			if c.LocalResources.Environment != nil {
-				localEnvironment, err := MaterializeConfigLayer(ctx, r.Client, workload.Namespace, c.LocalResources.Environment)
-				if err != nil {
-					return fmt.Errorf("materializing local resources config for component %q: %w", c.Name, err)
-				}
-				localResources.Environment = localEnvironment
-			}
-
-			if c.LocalResources.VolumeMounts != nil {
-				localResources.VolumeMounts = make([]*runtimev2.VolumeMount, 0, len(c.LocalResources.VolumeMounts))
-				for _, vm := range c.LocalResources.VolumeMounts {
-					volumeMount := &runtimev2.VolumeMount{
-						Name:      vm.Name,
-						MountPath: vm.MountPath,
-					}
-					if vm.ReadOnly {
-						volumeMount.ReadOnly = true
-					}
-					localResources.VolumeMounts = append(localResources.VolumeMounts, volumeMount)
-				}
-			}
+		localResources, err := materializeLocalResources(ctx, r.Client, workload.Namespace, c.LocalResources, fmt.Sprintf("component %q", c.Name))
+		if err != nil {
+			return err
 		}
 
-		var imagePullSecret *runtimev2.ImagePullSecret = nil
+		var imagePullSecret *runtimev2.ImagePullSecret
 		if c.ImagePullSecret != nil {
-			var err error
 			imagePullSecret, err = MaterializeImagePullSecret(ctx, r.Client, workload.Namespace, c.ImagePullSecret.Name, c.Image)
 			if err != nil {
 				return fmt.Errorf("materializing image pull secret for component %q: %w", c.Name, err)
@@ -212,43 +334,23 @@ func (r *WorkloadReconciler) reconcilePlacement(ctx context.Context, workload *r
 			PoolSize:        c.PoolSize,
 			MaxInvocations:  c.MaxInvocations,
 			LocalResources:  localResources,
+			PrecompiledUrl:  c.PrecompiledURL,
 		})
+	}
+
+	if workload.Spec.Kubernetes != nil && workload.Spec.Kubernetes.Service != nil {
+		injectServiceDNSAliases(witWorld.HostInterfaces, workload.Spec.Kubernetes.Service.Name, workload.Namespace)
 	}
 
 	var service *runtimev2.Service
 	if s := workload.Spec.Service; s != nil {
-		localResources := &runtimev2.LocalResources{}
-
-		if s.LocalResources != nil {
-			localResources.AllowedHosts = s.LocalResources.AllowedHosts
-			localResources.Config = s.LocalResources.Config
-
-			if s.LocalResources.Environment != nil {
-				localEnvironment, err := MaterializeConfigLayer(ctx, r.Client, workload.Namespace, s.LocalResources.Environment)
-				if err != nil {
-					return fmt.Errorf("materializing local resources config for service: %w", err)
-				}
-				localResources.Environment = localEnvironment
-			}
-
-			if s.LocalResources.VolumeMounts != nil {
-				localResources.VolumeMounts = make([]*runtimev2.VolumeMount, 0, len(s.LocalResources.VolumeMounts))
-				for _, vm := range s.LocalResources.VolumeMounts {
-					volumeMount := &runtimev2.VolumeMount{
-						Name:      vm.Name,
-						MountPath: vm.MountPath,
-					}
-					if vm.ReadOnly {
-						volumeMount.ReadOnly = true
-					}
-					localResources.VolumeMounts = append(localResources.VolumeMounts, volumeMount)
-				}
-			}
+		localResources, err := materializeLocalResources(ctx, r.Client, workload.Namespace, s.LocalResources, "service")
+		if err != nil {
+			return err
 		}
 
-		var imagePullSecret *runtimev2.ImagePullSecret = nil
+		var imagePullSecret *runtimev2.ImagePullSecret
 		if s.ImagePullSecret != nil {
-			var err error
 			imagePullSecret, err = MaterializeImagePullSecret(ctx, r.Client, workload.Namespace, s.ImagePullSecret.Name, s.Image)
 			if err != nil {
 				return fmt.Errorf("materializing image pull secret for service: %w", err)
@@ -382,8 +484,26 @@ func (r *WorkloadReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		return err
 	}
 
+	// Index Hosts by their Environment field so findFreeHost can do an
+	// O(matching) indexed list when AllowSharedHosts=false or
+	// Spec.Environment pins scheduling to a specific tenant.
+	if err := mgr.GetFieldIndexer().IndexField(
+		context.Background(),
+		&runtimev1alpha1.Host{},
+		hostEnvironmentIndex,
+		func(rawObj client.Object) []string {
+			host, ok := rawObj.(*runtimev1alpha1.Host)
+			if !ok || host.Environment == "" {
+				return nil
+			}
+			return []string{host.Environment}
+		},
+	); err != nil {
+		return err
+	}
+
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&runtimev1alpha1.Workload{}).
-		Named("workload-Replica").
+		Named("workload-replica").
 		Complete(r)
 }

@@ -7,11 +7,13 @@ metadata:
     {{- include "runtime-operator.labels" . | nindent 4 }}
   annotations: {}
 rules:
+  # Host CRD rules are NOT in this ClusterRole. Every Host object lives in
+  # the operator's own namespace, so Host CRUD is granted via the namespaced
+  # Role in role.yaml.
   - apiGroups:
     - runtime.wasmcloud.dev
     resources:
     - artifacts
-    - hosts
     - workloads
     - workloadreplicasets
     - workloaddeployments
@@ -27,7 +29,6 @@ rules:
     - runtime.wasmcloud.dev
     resources:
     - artifacts/status
-    - hosts/status
     - workloads/status
     - workloadreplicasets/status
     - workloaddeployments/status
@@ -40,7 +41,6 @@ rules:
     resources:
     - configmaps
     - secrets
-    - namespaces
     verbs:
     - get
     - list
@@ -56,4 +56,48 @@ rules:
     - patch
     - update
     - watch
+  - apiGroups:
+    - ""
+    resources:
+    - services
+    verbs:
+    - get
+    - list
+    - watch
+  - apiGroups:
+    - batch
+    resources:
+    - jobs
+    verbs:
+    - create
+    - delete
+    - get
+    - list
+    - patch
+    - update
+    - watch
+  - apiGroups:
+    - batch
+    resources:
+    - jobs/status
+    verbs:
+    - get
+  {{- if not .Values.operator.watchNamespaces }}
+  # If the operator is watching all namespaces, it needs permissions to manage EndpointSlices across the cluster. If it's only watching specific
+  # namespaces, a more limited Role and RoleBinding will be created in each namespace instead, and this ClusterRole will not include permissions
+  # for EndpointSlices. See https://wasmcloud.com/docs/kubernetes-operator/operator-manual/roles-and-rolebindings/#restricting-access-of-the-operator-to-namespaces
+  # for more details.
+  - apiGroups:
+    - discovery.k8s.io
+    resources:
+    - endpointslices
+    verbs:
+    - create
+    - delete
+    - get
+    - list
+    - patch
+    - update
+    - watch
+  {{- end }}
 {{- end }}

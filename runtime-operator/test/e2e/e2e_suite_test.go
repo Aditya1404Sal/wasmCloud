@@ -25,31 +25,63 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
-	"go.wasmcloud.dev/runtime-operator/test/utils"
+	"go.wasmcloud.dev/runtime-operator/v2/test/utils"
 )
+
+const envBoolTrue = "true"
 
 var (
 	// Optional Environment Variables:
-	// - PROMETHEUS_INSTALL_SKIP=true: Skips Prometheus Operator installation during test setup.
-	// - CERT_MANAGER_INSTALL_SKIP=true: Skips CertManager installation during test setup.
-	// These variables are useful if Prometheus or CertManager is already installed, avoiding
-	// re-installation and conflicts.
-	skipPrometheusInstall  = os.Getenv("PROMETHEUS_INSTALL_SKIP") == "true"
-	skipCertManagerInstall = os.Getenv("CERT_MANAGER_INSTALL_SKIP") == "true"
+	// - PROMETHEUS_INSTALL_SKIP=true: Skips Prometheus Operator installation during test setup (default: true).
+	// - CERT_MANAGER_INSTALL_SKIP=true: Skips CertManager installation during test setup (default: true).
+	skipPrometheusInstall  = os.Getenv("PROMETHEUS_INSTALL_SKIP") != "false"
+	skipCertManagerInstall = os.Getenv("CERT_MANAGER_INSTALL_SKIP") != "false"
 	// isPrometheusOperatorAlreadyInstalled will be set true when prometheus CRDs be found on the cluster
 	isPrometheusOperatorAlreadyInstalled = false
 	// isCertManagerAlreadyInstalled will be set true when CertManager CRDs be found on the cluster
 	isCertManagerAlreadyInstalled = false
 
-	// projectImage is the name of the image which will be build and loaded
-	// with the code source changes to be tested.
-	projectImage = "example.com/operator:v0.0.1"
+	// skipImageBuild skips the docker build step (set SKIP_IMAGE_BUILD=true when image is pre-built)
+	skipImageBuild = os.Getenv("SKIP_IMAGE_BUILD") == envBoolTrue
+
+	// operatorImageRepo and operatorImageTag are used for Helm --set overrides
+	operatorImageRepo = "localhost/runtime-operator"
+	operatorImageTag  = "e2e"
+	// projectImage is the full image name built and loaded into Kind
+	projectImage = fmt.Sprintf("%s:%s", operatorImageRepo, operatorImageTag)
+
+	// runtimeImageRepo / runtimeImageTag identify the wash-runtime (host)
+	// image. Set BUILD_RUNTIME_IMAGE=true to build from the local tree (the
+	// only way the host pod actually exercises the code under test); leave
+	// unset to use the published canary tag, which is faster but means the
+	// e2e is testing whatever upstream shipped, not your branch. Set
+	// SKIP_RUNTIME_BUILD=true alongside BUILD_RUNTIME_IMAGE=true to reuse a
+	// previously-built local image (so iteration on test code doesn't
+	// trigger a full cargo build per run).
+	runtimeImageRepo  = "localhost/wasmcloud-wash"
+	buildRuntimeImage = os.Getenv("BUILD_RUNTIME_IMAGE") == envBoolTrue
+	skipRuntimeBuild  = os.Getenv("SKIP_RUNTIME_BUILD") == envBoolTrue
+	// RUNTIME_LOG_LEVEL optionally sets the wash host's `--log-level`. When
+	// unset (the default), the chart leaves the flag off and the host runs
+	// at its built-in INFO level — matching production. Set to e.g. "debug"
+	// when iterating on a failing run that needs the NatsMessaging plugin's
+	// instrumentation in the diagnostic dump.
+	runtimeLogLevel = os.Getenv("RUNTIME_LOG_LEVEL")
+
+	// helmChartPath points to the runtime-operator Helm chart relative to the project dir (runtime-operator/)
+	helmChartPath = "../charts/runtime-operator"
+
+	// canary is published on every merge to main
+	runtimeImageTag = "canary"
+	// runtimeSupportsHostAliases indicates whether the runtime supports HostAliases,
+	// which is required for testing with EndpointSlices.
+	runtimeSupportsHostAliases = false
 )
 
 // TestE2E runs the end-to-end (e2e) test suite for the project. These tests execute in an isolated,
 // temporary environment to validate project changes with the the purposed to be used in CI jobs.
-// The default setup requires Kind, builds/loads the Manager Docker image locally, and installs
-// CertManager and Prometheus.
+// The default setup requires Kind, builds/loads the Manager Docker image locally, and deploys
+// the full stack via Helm.
 func TestE2E(t *testing.T) {
 	RegisterFailHandler(Fail)
 	_, _ = fmt.Fprintf(GinkgoWriter, "Starting operator integration test suite\n")
@@ -57,33 +89,46 @@ func TestE2E(t *testing.T) {
 }
 
 var _ = BeforeSuite(func() {
-	By("Ensure that Prometheus is enabled")
-	_ = utils.UncommentCode("config/default/kustomization.yaml", "#- ../prometheus", "#")
+	if !skipImageBuild {
+		By("building the operator image")
+		cmd := exec.Command("make", "docker-build", fmt.Sprintf("IMG=%s", projectImage))
+		_, err := utils.Run(cmd)
+		ExpectWithOffset(1, err).NotTo(HaveOccurred(), "Failed to build the operator image")
+	}
 
-	By("generating files")
-	cmd := exec.Command("make", "generate")
-	_, err := utils.Run(cmd)
-	ExpectWithOffset(1, err).NotTo(HaveOccurred(), "Failed to run make generate")
+	By("loading the operator image into Kind")
+	err := utils.LoadImageToKindClusterWithName(projectImage)
+	ExpectWithOffset(1, err).NotTo(HaveOccurred(), "Failed to load the operator image into Kind")
 
-	By("generating manifests")
-	cmd = exec.Command("make", "manifests")
+	if buildRuntimeImage {
+		runtimeImageRef := fmt.Sprintf("%s:%s", runtimeImageRepo, operatorImageTag)
+		if !skipRuntimeBuild {
+			By("building the wash-runtime image from the local tree")
+			// Repo root sits one level above runtime-operator/.
+			cmd := exec.Command("docker", "build", "-t", runtimeImageRef, "..")
+			_, err := utils.Run(cmd)
+			ExpectWithOffset(1, err).NotTo(HaveOccurred(), "Failed to build the wash-runtime image")
+		}
+
+		By("loading the wash-runtime image into Kind")
+		err := utils.LoadImageToKindClusterWithName(runtimeImageRef)
+		ExpectWithOffset(1, err).NotTo(HaveOccurred(), "Failed to load the wash-runtime image into Kind")
+	}
+
+	By("installing the runtime-operator via Helm")
+	sets := buildBaseHelmSets()
+
+	helmArgs := make([]string, 0, 5+2*len(sets)+4)
+	helmArgs = append(helmArgs, "upgrade", "--install", "--create-namespace", "-n", namespace)
+	for _, s := range sets {
+		helmArgs = append(helmArgs, "--set", s)
+	}
+	helmArgs = append(helmArgs, "--wait", "--timeout=5m", "operator-e2e", helmChartPath)
+
+	cmd := exec.Command("helm", helmArgs...)
 	_, err = utils.Run(cmd)
-	ExpectWithOffset(1, err).NotTo(HaveOccurred(), "Failed to run make manifests")
+	ExpectWithOffset(1, err).NotTo(HaveOccurred(), "Failed to install the runtime-operator via Helm")
 
-	By("building the manager(Operator) image")
-	cmd = exec.Command("make", "docker-build", fmt.Sprintf("IMG=%s", projectImage))
-	_, err = utils.Run(cmd)
-	ExpectWithOffset(1, err).NotTo(HaveOccurred(), "Failed to build the manager(Operator) image")
-
-	// TODO(user): If you want to change the e2e test vendor from Kind, ensure the image is
-	// built and available before running the tests. Also, remove the following block.
-	By("loading the manager(Operator) image on Kind")
-	err = utils.LoadImageToKindClusterWithName(projectImage)
-	ExpectWithOffset(1, err).NotTo(HaveOccurred(), "Failed to load the manager(Operator) image into Kind")
-
-	// The tests-e2e are intended to run on a temporary cluster that is created and destroyed for testing.
-	// To prevent errors when tests run in environments with Prometheus or CertManager already installed,
-	// we check for their presence before execution.
 	// Setup Prometheus and CertManager before the suite if not skipped and if not already installed
 	if !skipPrometheusInstall {
 		By("checking if prometheus is installed already")
@@ -107,7 +152,63 @@ var _ = BeforeSuite(func() {
 	}
 })
 
+// buildBaseHelmSets returns the `--set` values used to install the
+// runtime-operator chart for the e2e suite. The list intentionally
+// targets `runtime.hostGroups[0]` (the default hostGroup that the
+// existing tests exercise) and is shared by both the initial install
+// in BeforeSuite and the helm upgrade scenarios that append additional
+// hostGroups (e.g. a tenant-namespace group at `runtime.hostGroups[1]`).
+func buildBaseHelmSets() []string {
+	sets := []string{
+		"operator.image.registry=",
+		fmt.Sprintf("operator.image.repository=%s", operatorImageRepo),
+		fmt.Sprintf("operator.image.tag=%s", operatorImageTag),
+		"operator.image.pull_policy=Never",
+		"gateway.image.tag=canary",
+		"gateway.service.type=NodePort",
+		"gateway.service.nodePort=30950",
+		"runtime.hostGroups[0].name=default",
+		"runtime.hostGroups[0].replicas=1",
+		"runtime.hostGroups[0].service.type=ClusterIP",
+		"runtime.hostGroups[0].http.enabled=true",
+		"runtime.hostGroups[0].http.port=80",
+		"runtime.hostGroups[0].webgpu.enabled=false",
+		"runtime.hostGroups[0].resources.requests.memory=64Mi",
+		"runtime.hostGroups[0].resources.requests.cpu=250m",
+		"runtime.hostGroups[0].resources.limits.memory=512Mi",
+		"runtime.hostGroups[0].resources.limits.cpu=500m",
+		// Driven by RUNTIME_LOG_LEVEL env var; empty value leaves the
+		// chart's `{{- if .logLevel }}` guard off, so wash uses INFO.
+		fmt.Sprintf("runtime.hostGroups[0].logLevel=%s", runtimeLogLevel),
+	}
+	if buildRuntimeImage {
+		// Point at the locally-built image and disable pull so kubelet
+		// uses the kind-loaded copy.
+		sets = append(sets,
+			"runtime.image.registry=",
+			fmt.Sprintf("runtime.image.repository=%s", runtimeImageRepo),
+			fmt.Sprintf("runtime.image.tag=%s", operatorImageTag),
+			"runtime.image.pull_policy=Never",
+		)
+	} else {
+		// Use IfNotPresent so kubelet prefers a locally-loaded image
+		// (e.g. one built and `kind load`ed by the developer) over pulling
+		// the canary tag, which is published on every merge to main but
+		// may not be available — or may lag the local tree — in offline
+		// or pre-merge runs.
+		sets = append(sets,
+			fmt.Sprintf("runtime.image.tag=%s", runtimeImageTag),
+			"runtime.image.pull_policy=IfNotPresent",
+		)
+	}
+	return sets
+}
+
 var _ = AfterSuite(func() {
+	By("uninstalling the Helm release")
+	cmd := exec.Command("helm", "delete", "-n", namespace, "operator-e2e")
+	_, _ = utils.Run(cmd)
+
 	// Teardown Prometheus and CertManager after the suite if not skipped and if they were not already installed
 	if !skipPrometheusInstall && !isPrometheusOperatorAlreadyInstalled {
 		_, _ = fmt.Fprintf(GinkgoWriter, "Uninstalling Prometheus Operator...\n")

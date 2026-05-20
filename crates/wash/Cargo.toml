@@ -11,6 +11,9 @@ edition.workspace = true
 rust-version.workspace = true
 version.workspace = true
 
+[features]
+wasip3 = ["wash-runtime/wasip3"]
+
 [lints]
 workspace = true
 
@@ -40,7 +43,6 @@ figment = { workspace = true, features = ["json", "env", "yaml", "toml"] }
 flate2 = { workspace = true, features = ["rust_backend"] }
 humantime = { workspace = true }
 reqwest = { workspace = true, features = ["json", "rustls-tls"] }
-rustls = { workspace = true }
 semver = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true, features = ["std"] }
@@ -54,7 +56,7 @@ uuid = { workspace = true }
 wasm-metadata = { workspace = true }
 wasm-pkg-client = { workspace = true }
 wasm-pkg-core = { workspace = true }
-wash-runtime = { workspace = true, features = ["washlet", "oci", "wasi-config", "wasi-logging", "wasi-blobstore", "wasi-keyvalue", "wasmcloud-postgres", "wasi-otel"] }
+wash-runtime = { workspace = true, features = ["washlet", "oci", "wasi-config", "wasi-logging", "wasi-blobstore", "wasi-keyvalue", "wasmcloud-postgres", "wasi-otel", "wasmcloud-smtp"] }
 wit-component = { workspace = true }
 
 # Enable WebGPU support on non-Windows platforms
@@ -72,12 +74,13 @@ pbjson-build = { workspace = true, default-features = true }
 bytes = { version = "1", default-features = false }
 http = { version = "1.3.1", default-features = false }
 http-body-util = { version = "0.1.3", default-features = false }
-rcgen = { version = "0.13", default-features = false, features = ["crypto", "ring", "pem"] }
+rcgen = { version = "0.14.7", default-features = false, features = ["crypto", "aws_lc_rs", "pem"] }
 scopeguard = { version = "1.2", default-features = false }
 tempfile = { version = "3.0", default-features = false }
 tokio = { version = "1.45.1", default-features = false, features = ["full"] }
 reqwest = { workspace = true, features = ["json"] }
 wash-runtime = { workspace = true, features = ["wasi-keyvalue", "wasi-blobstore"] }
+testcontainers = { workspace = true }
 wat = { workspace = true }
 
 [package.metadata.binstall]

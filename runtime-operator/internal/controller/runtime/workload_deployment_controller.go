@@ -13,9 +13,12 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
-	"go.wasmcloud.dev/runtime-operator/api/condition"
+	"go.wasmcloud.dev/runtime-operator/v2/api/condition"
 
-	runtimev1alpha1 "go.wasmcloud.dev/runtime-operator/api/runtime/v1alpha1"
+	runtimev1alpha1 "go.wasmcloud.dev/runtime-operator/v2/api/runtime/v1alpha1"
+	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
 
 const (
@@ -26,12 +29,37 @@ const (
 // WorkloadDeploymentReconciler reconciles a WorkloadReplicaSet object
 type WorkloadDeploymentReconciler struct {
 	client.Client
-	Scheme     *runtime.Scheme
+	Scheme *runtime.Scheme
+
+	// Precompile configuration. When both fields are non-empty, the
+	// reconciler treats artifact:// references as a contract for
+	// precompilation: workloads gate on the Artifact having a matching
+	// Status.Precompiled variant, and that variant's URL is stamped on
+	// the resolved Component. When either is empty, precompile gating
+	// is off — artifact:// references resolve to OCI URLs directly.
+	PrecompileTarget          string
+	PrecompileWasmtimeVersion string
+
 	reconciler condition.AnyConditionedReconciler
+}
+
+type precompileMatch struct {
+	Target          string
+	WasmtimeVersion string
 }
 
 func (r *WorkloadDeploymentReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	return r.reconciler.Reconcile(ctx, req)
+}
+
+func (r *WorkloadDeploymentReconciler) precompileMatch() *precompileMatch {
+	if r.PrecompileTarget == "" || r.PrecompileWasmtimeVersion == "" {
+		return nil
+	}
+	return &precompileMatch{
+		Target:          r.PrecompileTarget,
+		WasmtimeVersion: r.PrecompileWasmtimeVersion,
+	}
 }
 
 func (r *WorkloadDeploymentReconciler) reconcileArtifacts(ctx context.Context, deployment *runtimev1alpha1.WorkloadDeployment) error {
@@ -70,8 +98,11 @@ func (r *WorkloadDeploymentReconciler) reconcileSync(ctx context.Context, deploy
 	}
 
 	templateCopy := deployment.Spec.Template.DeepCopy()
-	if err := resolveArtifacts(ctx, r.Client, deployment.Namespace, templateCopy, deployment.Spec.Artifacts); err != nil {
+	if err := resolveArtifacts(ctx, r.Client, deployment.Namespace, templateCopy, deployment.Spec.Artifacts, r.precompileMatch()); err != nil {
 		return err
+	}
+	if deployment.Spec.Kubernetes != nil {
+		templateCopy.Spec.Kubernetes = deployment.Spec.Kubernetes.DeepCopy()
 	}
 
 	if want, got := currentReplica.Spec.Template.Hash(), templateCopy.Hash(); want != got {
@@ -95,8 +126,14 @@ func (r *WorkloadDeploymentReconciler) reconcileDeploy(ctx context.Context, depl
 	}
 
 	replicaSetTemplate := deployment.Spec.WorkloadReplicaSetSpec.DeepCopy()
-	if err := resolveArtifacts(ctx, r.Client, deployment.Namespace, &replicaSetTemplate.Template, deployment.Spec.Artifacts); err != nil {
+	if err := resolveArtifacts(ctx, r.Client, deployment.Namespace, &replicaSetTemplate.Template, deployment.Spec.Artifacts, r.precompileMatch()); err != nil {
 		return err
+	}
+
+	// Propagate deployment-level service reference into each workload's spec
+	// so the WorkloadRouteReconciler can find it via the field index.
+	if deployment.Spec.Kubernetes != nil {
+		replicaSetTemplate.Template.Spec.Kubernetes = deployment.Spec.Kubernetes.DeepCopy()
 	}
 
 	replicaSetName := fmt.Sprintf("%s-%s", deployment.Name, randHash())
@@ -195,17 +232,17 @@ func (r *WorkloadDeploymentReconciler) reconcileScale(ctx context.Context, deplo
 	}
 	deployment.Status.Replicas = deploymentStatus
 
-	if prevSetName != "" {
-		switch deployment.Spec.DeployPolicy {
-		case runtimev1alpha1.WorkloadDeployPolicyRecreate:
-			// For Policy=Recreate, delete previous replica set too
-		default:
-			// For Policy=RollingUpdate, only delete previous replica set when current replica set is ready
-			if !currentReplica.Status.IsAvailable() {
-				return fmt.Errorf("current ReplicaSet is not available yet")
-			}
-		}
+	// Gate Scale on the active ReplicaSet actually being available, so
+	// WorkloadDeployment.Ready==True implies the underlying Workload is
+	// running on a host. Without this, fresh deploys flip Ready=True the
+	// moment the RS exists, before any workload has been placed.
+	if !currentReplica.Status.IsAvailable() {
+		return condition.ErrStatusUnknown(fmt.Errorf(
+			"current ReplicaSet not available yet: ready=%d unavailable=%d expected=%d",
+			readyReplicas, unavailableReplicas, expectedReplicas))
+	}
 
+	if prevSetName != "" {
 		if err := r.Delete(ctx, &runtimev1alpha1.WorkloadReplicaSet{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      prevSetName,
@@ -275,11 +312,45 @@ func (r *WorkloadDeploymentReconciler) SetupWithManager(mgr ctrl.Manager) error 
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&runtimev1alpha1.WorkloadDeployment{}).
 		Owns(&runtimev1alpha1.WorkloadReplicaSet{}).
-		Named("workload-WorkloadDeployment").
+		Watches(&runtimev1alpha1.Artifact{}, handler.EnqueueRequestsFromMapFunc(r.getAffectedWorkloads)).
+		Named("workload-deployment").
 		Complete(r)
 }
 
-func resolveArtifacts(ctx context.Context, kubeClient client.Client, namespace string, tpl *runtimev1alpha1.WorkloadReplicaTemplate, artifactsFrom []runtimev1alpha1.WorkloadDeploymentArtifact) error {
+func (r *WorkloadDeploymentReconciler) workloadDeploymentsReferencing(ctx context.Context, art *runtimev1alpha1.Artifact) ([]runtimev1alpha1.WorkloadDeployment, error) {
+	var wds runtimev1alpha1.WorkloadDeploymentList
+	if err := r.List(ctx, &wds, client.InNamespace(art.Namespace)); err != nil {
+		return nil, err
+	}
+	var out []runtimev1alpha1.WorkloadDeployment
+	for _, wd := range wds.Items {
+		for _, a := range wd.Spec.Artifacts {
+			if a.ArtifactFrom.Name == art.Name {
+				out = append(out, wd)
+				break
+			}
+		}
+	}
+	return out, nil
+}
+
+func (r *WorkloadDeploymentReconciler) getAffectedWorkloads(ctx context.Context, obj client.Object) []reconcile.Request {
+	art := obj.(*runtimev1alpha1.Artifact)
+	wds, err := r.workloadDeploymentsReferencing(ctx, art)
+	if err != nil {
+		ctrl.LoggerFrom(ctx).Error(err, "failed to list WorkloadDeployments for Artifact watch", "artifact", art.Name, "namespace", art.Namespace)
+		return nil
+	}
+	var reqs []reconcile.Request
+	for _, wd := range wds {
+		reqs = append(reqs, reconcile.Request{
+			NamespacedName: types.NamespacedName{Namespace: wd.Namespace, Name: wd.Name},
+		})
+	}
+	return reqs
+}
+
+func resolveArtifacts(ctx context.Context, kubeClient client.Client, namespace string, tpl *runtimev1alpha1.WorkloadReplicaTemplate, artifactsFrom []runtimev1alpha1.WorkloadDeploymentArtifact, pc *precompileMatch) error {
 	artifactMap := make(map[string]runtimev1alpha1.Artifact)
 	for _, a := range artifactsFrom {
 		artifact := &runtimev1alpha1.Artifact{}
@@ -302,6 +373,19 @@ func resolveArtifacts(ctx context.Context, kubeClient client.Client, namespace s
 			return fmt.Errorf("artifact %s not found in deployment spec", artifactName)
 		}
 		comp.Image = artifact.Status.ArtifactURL
+
+		if pc != nil {
+			variant := findMatchingVariant(
+				artifact.Status.Precompiled,
+				pc.Target,
+				pc.WasmtimeVersion,
+				artifact.Spec.Image)
+			if variant == nil {
+				return condition.ErrStatusUnknown(fmt.Errorf("artifact %s has no precompiled variant matching %s/%s", artifactName, pc.Target, pc.WasmtimeVersion))
+			}
+			comp.PrecompiledURL = variant.ArtifactURL
+		}
+
 		tpl.Spec.Components[i] = comp
 	}
 
@@ -316,5 +400,15 @@ func resolveArtifacts(ctx context.Context, kubeClient client.Client, namespace s
 		}
 	}
 
+	return nil
+}
+
+func findMatchingVariant(precompiled []runtimev1alpha1.PrecompiledVariant, target, wasmtimeVersion string, image string) *runtimev1alpha1.PrecompiledVariant {
+	for i := range precompiled {
+		v := &precompiled[i]
+		if v.Target == target && v.WasmtimeVersion == wasmtimeVersion && v.ImageRef == image {
+			return &precompiled[i]
+		}
+	}
 	return nil
 }
