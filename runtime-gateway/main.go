@@ -2,6 +2,7 @@ package main
 
 import (
 	"flag"
+	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
@@ -118,6 +119,14 @@ func main() {
 		Resolver: tracker,
 		Proxy: &httputil.ReverseProxy{
 			Transport: &http.Transport{
+				// Ready=Unknown keeps a host registered on the assumption
+				// that NATS, not the host, is the cause. When that's wrong,
+				// cap the doomed dial at 3s instead of the kernel's ~75s
+				// SYN retry default.
+				DialContext: (&net.Dialer{
+					Timeout:   3 * time.Second,
+					KeepAlive: 30 * time.Second,
+				}).DialContext,
 				MaxIdleConns:        0,
 				MaxIdleConnsPerHost: 100,
 				IdleConnTimeout:     90 * time.Second,
