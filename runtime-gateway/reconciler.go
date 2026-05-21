@@ -8,6 +8,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
+	"go.wasmcloud.dev/runtime-operator/v2/api/condition"
 	runtimev1alpha1 "go.wasmcloud.dev/runtime-operator/v2/api/runtime/v1alpha1"
 )
 
@@ -146,12 +147,23 @@ func (a *HostReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 
 	log.Info("Reconciling Host")
 
-	if host.Status.IsAvailable() {
+	switch {
+	case host.Status.AllTrue(condition.TypeReady):
 		if err := a.Registry.RegisterHost(ctx, host.HostID, host.Hostname, int(host.HTTPPort)); err != nil {
 			log.Error(err, "failed to register host")
 			return ctrl.Result{}, err
 		}
-	} else {
+	case host.Status.AnyUnknown(condition.TypeReady):
+		// Ready=Unknown does not mean the host is unreachable. The operator
+		// sets it when its NATS heartbeat RPC times out — which can happen
+		// because NATS itself is overloaded, even though the host's HTTP
+		// endpoint is still serving traffic fine. Keep the endpoint
+		// registered so requests can still flow; if the data plane really
+		// is down, the proxy's ErrorHandler returns 502 on dial failure.
+	default:
+		// Ready=False: operator is confident the host is unreachable. Drop
+		// the endpoint so requests fail fast with the gateway's 503
+		// fallback instead of waiting on doomed dials.
 		if err := a.Registry.DeregisterHost(ctx, host.HostID); err != nil {
 			log.Error(err, "failed to deregister host")
 			return ctrl.Result{}, err
