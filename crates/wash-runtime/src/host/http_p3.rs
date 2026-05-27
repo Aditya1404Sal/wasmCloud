@@ -9,9 +9,14 @@
 //! outgoing-request egress policy itself lives on the unified
 //! [`crate::host::http::OutgoingHandler`] trait via its `send_request_p3` method.
 
+use std::pin::Pin;
+use std::task::{Context, Poll};
+
 use crate::engine::ctx::SharedCtx;
 use crate::observability::FuelConsumptionMeter;
 use http_body_util::BodyExt;
+use hyper::body::{Body, Frame, SizeHint};
+use tokio::sync::oneshot;
 use wasmtime::Store;
 use wasmtime::component::InstancePre;
 use wasmtime_wasi_http::p3::bindings::ServicePre;
@@ -31,25 +36,98 @@ pub type P3SendResult = Result<
     wasmtime_wasi::TrappableError<ErrorCode>,
 >;
 
+/// Called after the P3 `run_concurrent` task exits. For streaming responses
+/// this happens after Hyper has drained or dropped the returned body.
+pub type P3CompletionHook = Box<dyn FnOnce() + Send + 'static>;
+
 /// Future returned by [`crate::host::http::OutgoingHandler::send_request_p3`].
 pub type P3SendFuture = Box<dyn std::future::Future<Output = P3SendResult> + Send>;
 
-/// Handle an HTTP request using the WASIP3 `wasi:http/handler` interface.
+/// Streaming body wrapper that signals when hyper is done reading
+/// (drained or dropped) so the owning `Store::run_concurrent` can exit.
+struct StreamingBody {
+    inner: P3Body,
+    done: Option<oneshot::Sender<()>>,
+}
+
+impl StreamingBody {
+    fn new(inner: P3Body) -> (Self, oneshot::Receiver<()>) {
+        let (tx, rx) = oneshot::channel();
+        (
+            Self {
+                inner,
+                done: Some(tx),
+            },
+            rx,
+        )
+    }
+
+    fn signal_done(&mut self) {
+        if let Some(tx) = self.done.take() {
+            let _ = tx.send(());
+        }
+    }
+}
+
+impl Body for StreamingBody {
+    type Data = bytes::Bytes;
+    type Error = ErrorCode;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        match Pin::new(&mut self.inner).poll_frame(cx) {
+            Poll::Ready(None) => {
+                self.signal_done();
+                Poll::Ready(None)
+            }
+            other => other,
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.inner.size_hint()
+    }
+}
+
+impl Drop for StreamingBody {
+    fn drop(&mut self) {
+        self.signal_done();
+    }
+}
+
+/// Handle an HTTP request via the WASIP3 `wasi:http/handler` interface.
 ///
-/// P3 uses `ServicePre`/`Service` with `Store::run_concurrent` to get an
-/// `Accessor` for concurrent component-model async operations.
+/// Spawns the request future so `Store::run_concurrent` stays alive for
+/// the body's lifetime and chunks stream straight through to hyper.
 pub async fn handle_component_request_p3(
     mut store: Store<SharedCtx>,
     pre: InstancePre<SharedCtx>,
     req: hyper::Request<hyper::body::Incoming>,
     fuel_meter: FuelConsumptionMeter,
+    on_complete: P3CompletionHook,
 ) -> anyhow::Result<hyper::Response<P3Body>> {
-    let _ = &fuel_meter; // fuel metering integration deferred to match P2's observe() pattern
+    let _ = &fuel_meter; // fuel metering: see P2's observe() pattern
 
-    let service_pre = ServicePre::new(pre)
-        .map_err(|e| anyhow::anyhow!(e).context("failed to create P3 ServicePre"))?;
+    let mut on_complete = Some(on_complete);
 
-    // Convert the hyper request body — map error type since hyper::Error doesn't impl Into<ErrorCode>
+    let service_pre = match ServicePre::new(pre)
+        .map_err(|e| anyhow::anyhow!(e).context("failed to create P3 ServicePre"))
+    {
+        Ok(service_pre) => service_pre,
+        Err(err) => {
+            if let Some(on_complete) = on_complete.take() {
+                on_complete();
+            }
+            return Err(err);
+        }
+    };
+
     let (parts, body) = req.into_parts();
     let body = body
         .map_err(|e| ErrorCode::InternalError(Some(e.to_string())))
@@ -57,72 +135,83 @@ pub async fn handle_component_request_p3(
     let req = hyper::Request::from_parts(parts, body);
     let (wasi_req, req_io) = wasmtime_wasi_http::p3::Request::from_http(req);
 
-    // Instantiate the service
-    let service = service_pre
+    let service = match service_pre
         .instantiate_async(&mut store)
         .await
-        .map_err(|e| anyhow::anyhow!(e).context("failed to instantiate P3 service"))?;
-
-    // Use run_concurrent to get an Accessor for the P3 async component model.
-    // The handler invocation, response conversion, AND body collection must all
-    // happen inside run_concurrent since the body stream requires the concurrent
-    // runtime to pump data from the component.
-    let run_result = store
-        .run_concurrent(async move |store| {
-            let handler_fut = async {
-                let result = service.handle(store, wasi_req).await;
-                match result {
-                    Ok(Ok(response)) => {
-                        let http_response =
-                            store.with(|s| response.into_http(s, async { Ok(()) }))?;
-                        let (parts, body) = http_response.into_parts();
-                        let body = body.collect().await.map_err(|e| {
-                            anyhow::anyhow!("failed to collect P3 response body: {e:?}")
-                        })?;
-                        Ok(hyper::Response::from_parts(parts, body))
-                    }
-                    Ok(Err(error_code)) => {
-                        tracing::error!(
-                            error_code = ?error_code,
-                            "P3 HTTP handler returned ErrorCode",
-                        );
-                        let body = http_body_util::Empty::new()
-                            .map_err(|never| match never {})
-                            .boxed_unsync()
-                            .collect()
-                            .await
-                            .map_err(|e| anyhow::anyhow!("failed to collect error body: {e:?}"))?;
-                        Ok(hyper::Response::builder()
-                            .status(500)
-                            .body(body)
-                            .map_err(anyhow::Error::from)?)
-                    }
-                    Err(e) => Err(anyhow::anyhow!(e).context("P3 handler trap")),
-                }
-            };
-            let io_fut = async {
-                if let Err(e) = req_io.await {
-                    tracing::error!(err = ?e, "P3 request I/O error");
-                }
-            };
-            let (handler_result, _) = tokio::join!(handler_fut, io_fut);
-            handler_result
-        })
-        .await;
-
-    let result = match run_result {
-        Ok(inner) => inner,
-        Err(e) => Err(anyhow::Error::from(e).context("P3 run_concurrent failed")),
+        .map_err(|e| anyhow::anyhow!(e).context("failed to instantiate P3 service"))
+    {
+        Ok(service) => service,
+        Err(err) => {
+            if let Some(on_complete) = on_complete.take() {
+                on_complete();
+            }
+            return Err(err);
+        }
     };
 
-    match result {
-        Ok(response) => {
-            let (parts, collected) = response.into_parts();
-            let body: P3Body = http_body_util::Full::new(collected.to_bytes())
-                .map_err(|never| match never {})
-                .boxed_unsync();
-            Ok(hyper::Response::from_parts(parts, body))
+    let (resp_tx, resp_rx) = oneshot::channel::<anyhow::Result<hyper::Response<P3Body>>>();
+
+    tokio::spawn(async move {
+        let result = store
+            .run_concurrent(async move |store| {
+                let io_fut = async {
+                    if let Err(e) = req_io.await {
+                        tracing::error!(err = ?e, "P3 request I/O error");
+                    }
+                };
+
+                let handler_fut = async {
+                    match service.handle(store, wasi_req).await {
+                        Ok(Ok(response)) => {
+                            let http_response =
+                                store.with(|s| response.into_http(s, async { Ok(()) }))?;
+                            let (parts, body) = http_response.into_parts();
+                            let (wrapped, done_rx) = StreamingBody::new(body);
+                            let body: P3Body = wrapped.boxed_unsync();
+                            let hyper_resp = hyper::Response::from_parts(parts, body);
+
+                            if resp_tx.send(Ok(hyper_resp)).is_err() {
+                                return Ok::<_, anyhow::Error>(());
+                            }
+                            // Keep run_concurrent alive while hyper drains.
+                            let _ = done_rx.await;
+                            Ok(())
+                        }
+                        Ok(Err(error_code)) => {
+                            tracing::error!(?error_code, "P3 HTTP handler returned error");
+                            let body: P3Body = http_body_util::Empty::new()
+                                .map_err(|never| match never {})
+                                .boxed_unsync();
+                            let resp = hyper::Response::builder()
+                                .status(500)
+                                .body(body)
+                                .map_err(anyhow::Error::from)?;
+                            let _ = resp_tx.send(Ok(resp));
+                            Ok(())
+                        }
+                        Err(e) => {
+                            let _ =
+                                resp_tx.send(Err(anyhow::anyhow!(e).context("P3 handler trap")));
+                            Ok(())
+                        }
+                    }
+                };
+
+                let (handler_result, _) = tokio::join!(handler_fut, io_fut);
+                handler_result
+            })
+            .await;
+
+        if let Err(e) = result {
+            tracing::error!(err = ?e, "P3 run_concurrent failed");
         }
-        Err(e) => Err(e),
-    }
+
+        if let Some(on_complete) = on_complete.take() {
+            on_complete();
+        }
+    });
+
+    resp_rx
+        .await
+        .map_err(|_| anyhow::anyhow!("P3 handler task panicked or store was dropped"))?
 }

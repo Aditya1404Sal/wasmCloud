@@ -48,3 +48,11 @@ world otel {
 world smtp {
     import betty-blocks:smtp/client;
 }
+
+world stream-broker {
+    import betty-blocks:stream-broker/broker@0.1.0;
+}
+
+world websocket {
+    export betty-blocks:websockets/handler@0.1.0;
+}

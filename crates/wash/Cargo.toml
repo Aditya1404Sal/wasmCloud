@@ -14,6 +14,7 @@ version.workspace = true
 [features]
 wasip3 = ["wash-runtime/wasip3"]
 wasi-tls = ["wash-runtime/wasi-tls"]
+wasi-webgpu = ["wash-runtime/wasi-webgpu"]
 
 [lints]
 workspace = true
@@ -72,7 +73,6 @@ wash-runtime = { workspace = true, features = ["wasi-webgpu"] }
 # Unix-only. Windows has no portable equivalent.
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
-
 
 [build-dependencies]
 anyhow = { workspace = true, default-features = true }

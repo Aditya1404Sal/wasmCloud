@@ -557,9 +557,33 @@ impl HostHandler for NullServer {
     }
 }
 
-/// A map from host header to resolved workload handles and their associated component id
-pub type WorkloadHandles =
-    Arc<RwLock<HashMap<String, (ResolvedWorkload, InstancePre<SharedCtx>, String)>>>;
+/// One incoming component entrypoint within a workload.
+#[derive(Clone)]
+pub struct WorkloadEntrypoint {
+    instance_pre: InstancePre<SharedCtx>,
+    component_id: String,
+}
+
+/// Incoming HTTP/WebSocket entrypoints registered for a workload.
+#[derive(Clone)]
+pub struct WorkloadIncomingHandles {
+    resolved_handle: ResolvedWorkload,
+    http: Option<WorkloadEntrypoint>,
+    websocket: Option<WorkloadEntrypoint>,
+}
+
+impl WorkloadIncomingHandles {
+    fn new(resolved_handle: ResolvedWorkload) -> Self {
+        Self {
+            resolved_handle,
+            http: None,
+            websocket: None,
+        }
+    }
+}
+
+/// A map from routed workload id to resolved workload and incoming component entrypoints.
+pub type WorkloadHandles = Arc<RwLock<HashMap<String, WorkloadIncomingHandles>>>;
 
 /// HTTP server plugin that handles incoming HTTP requests for WebAssembly components.
 ///
@@ -803,15 +827,29 @@ impl<T: Router, O: OutgoingHandler> HostHandler for HttpServer<T, O> {
             .on_workload_resolved(resolved_handle, component_id)
             .await?;
         let instance_pre = resolved_handle.instantiate_pre(component_id).await?;
+        let exports_http = crate::engine::exports_wasi_http(instance_pre.component());
+        #[cfg(feature = "wasip3")]
+        let exports_websocket = crate::engine::targets_websocket(instance_pre.component());
+        #[cfg(not(feature = "wasip3"))]
+        let exports_websocket = false;
 
-        self.workload_handles.write().await.insert(
-            resolved_handle.id().to_string(),
-            (
-                resolved_handle.clone(),
-                instance_pre,
-                component_id.to_string(),
-            ),
-        );
+        let entrypoint = WorkloadEntrypoint {
+            instance_pre,
+            component_id: component_id.to_string(),
+        };
+
+        let mut handles = self.workload_handles.write().await;
+        let workload_handles = handles
+            .entry(resolved_handle.id().to_string())
+            .or_insert_with(|| WorkloadIncomingHandles::new(resolved_handle.clone()));
+        workload_handles.resolved_handle = resolved_handle.clone();
+
+        if exports_http {
+            workload_handles.http = Some(entrypoint.clone());
+        }
+        if exports_websocket {
+            workload_handles.websocket = Some(entrypoint);
+        }
 
         Ok(())
     }
@@ -969,6 +1007,43 @@ fn new_trace_id() -> String {
     uuid[..12].to_string()
 }
 
+/// True iff this request is a syntactically valid RFC 6455 WebSocket
+/// upgrade. We check `Upgrade`, `Connection`, and `Sec-WebSocket-Version`
+/// here — `Sec-WebSocket-Key` is validated later by the WS handler when
+/// it computes the accept hash. Method must be GET per the spec.
+#[cfg(feature = "wasip3")]
+fn is_websocket_upgrade(req: &hyper::Request<hyper::body::Incoming>) -> bool {
+    if req.method() != hyper::Method::GET {
+        return false;
+    }
+    let upgrade_ws = req
+        .headers()
+        .get(hyper::header::UPGRADE)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.eq_ignore_ascii_case("websocket"))
+        .unwrap_or(false);
+    if !upgrade_ws {
+        return false;
+    }
+    let conn_upgrade = req
+        .headers()
+        .get(hyper::header::CONNECTION)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| {
+            s.split(',')
+                .any(|t| t.trim().eq_ignore_ascii_case("upgrade"))
+        })
+        .unwrap_or(false);
+    if !conn_upgrade {
+        return false;
+    }
+    req.headers()
+        .get(hyper::header::SEC_WEBSOCKET_VERSION)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.trim() == "13")
+        .unwrap_or(false)
+}
+
 /// Build an error response with the given status code.
 /// Building HTTP responses with valid status codes is infallible.
 #[allow(clippy::expect_used)]
@@ -1048,6 +1123,10 @@ async fn handle_http_request<T: Router>(
 
     let method = req.method().clone();
     let uri = req.uri().clone();
+    #[cfg(feature = "wasip3")]
+    let is_ws_upgrade = is_websocket_upgrade(&req);
+    #[cfg(not(feature = "wasip3"))]
+    let is_ws_upgrade = false;
 
     // server.port is recorded separately from server.address per the OTel HTTP
     // semconv; only set it when the Host header actually carries a port.
@@ -1083,18 +1162,40 @@ async fn handle_http_request<T: Router>(
     };
 
     let response = match workload_handle {
-        Some((handle, instance_pre, component_id)) => {
+        Some(handles) => {
+            let entrypoint = if is_ws_upgrade {
+                handles.websocket.as_ref()
+            } else {
+                handles.http.as_ref()
+            }
+            .cloned();
+            let Some(entrypoint) = entrypoint else {
+                warn!(
+                    trace_id = %trace_id,
+                    host = %workload_id,
+                    websocket = is_ws_upgrade,
+                    "workload is bound to host but has no matching incoming component"
+                );
+                return Ok(error_response(404, &trace_id));
+            };
+
             let req_span = tracing::span!(
                 tracing::Level::INFO,
                 "invoke_component_handler",
                 trace_id = %trace_id,
-                workload.name = handle.name(),
-                workload.namespace = handle.namespace(),
-                workload.id = handle.id(),
+                workload.name = handles.resolved_handle.name(),
+                workload.namespace = handles.resolved_handle.namespace(),
+                workload.id = handles.resolved_handle.id(),
             );
-            match invoke_component_handler(&handle, instance_pre, &component_id, req, fuel_meter)
-                .instrument(req_span)
-                .await
+            match invoke_component_handler(
+                &handles.resolved_handle,
+                entrypoint.instance_pre,
+                &entrypoint.component_id,
+                req,
+                fuel_meter,
+            )
+            .instrument(req_span)
+            .await
             {
                 Ok(mut resp) => {
                     resp.headers_mut().insert(
@@ -1108,10 +1209,10 @@ async fn handle_http_request<T: Router>(
                     let kind = classify_error(&e);
                     error!(
                         trace_id = %trace_id,
-                        workload.id = handle.id(),
-                        workload.name = handle.name(),
-                        workload.namespace = handle.namespace(),
-                        component.id = %component_id,
+                        workload.id = handles.resolved_handle.id(),
+                        workload.name = handles.resolved_handle.name(),
+                        workload.namespace = handles.resolved_handle.namespace(),
+                        component.id = %entrypoint.component_id,
                         error.kind = ?kind,
                         error.chain = ?e,
                         error.display = %format!("{e:#}"),
@@ -1183,14 +1284,47 @@ async fn invoke_component_handler(
     fuel_meter: FuelConsumptionMeter,
 ) -> anyhow::Result<hyper::Response<HyperOutgoingBody>> {
     // Create a new store for this request with plugin contexts
-    let store = workload_handle.new_store(component_id).await?;
+    #[allow(unused_mut)]
+    let mut store = workload_handle.new_store(component_id).await?;
+
+    // WebSocket upgrade requests bypass the wasi:http handler entirely:
+    // the host completes the 101 handshake and bridges decoded frames to
+    // the component's `betty-blocks:websockets/handler` export.
+    #[cfg(feature = "wasip3")]
+    if is_websocket_upgrade(&req) && crate::engine::targets_websocket(instance_pre.component()) {
+        workload_handle
+            .pre_instantiate_linked_components_for_component(&mut store, component_id)
+            .await?;
+        return crate::host::websocket::handle_websocket_request(
+            workload_handle.clone(),
+            store,
+            instance_pre,
+            req,
+            fuel_meter,
+        )
+        .await;
+    }
 
     // Check if this component targets WASIP3 and dispatch accordingly
     #[cfg(feature = "wasip3")]
     if crate::engine::targets_wasip3_http(instance_pre.component()) {
-        let resp =
-            crate::host::http_p3::handle_component_request_p3(store, instance_pre, req, fuel_meter)
-                .await?;
+        workload_handle
+            .pre_instantiate_linked_components_for_component(&mut store, component_id)
+            .await?;
+        let store_id = store.data().active_ctx.store_id.clone();
+        let cleanup_workload = workload_handle.clone();
+        let cleanup_store_id = store_id.clone();
+        let resp = crate::host::http_p3::handle_component_request_p3(
+            store,
+            instance_pre,
+            req,
+            fuel_meter,
+            Box::new(move || {
+                cleanup_workload.clear_exporter_instances_for_store(&cleanup_store_id);
+            }),
+        )
+        .await;
+        let resp = resp?;
         // Convert P3 response to a compatible HyperOutgoingBody response
         let (parts, body) = resp.into_parts();
         let body = HyperOutgoingBody::new(

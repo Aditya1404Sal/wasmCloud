@@ -95,6 +95,12 @@ impl CliCommand for DevCommand {
         // Enable Betty SMTP
         host_builder = host_builder.with_plugin(Arc::new(plugin::smtp::BettySmtp::new()))?;
 
+        // Enable betty-blocks:stream-broker/broker for local multi-entrypoint
+        // stream fan-out and cancellation.
+        host_builder = host_builder.with_plugin(Arc::new(
+            plugin::betty_blocks_stream_broker::StreamBroker::default(),
+        ))?;
+
         // Add blobstore plugin
         if let Some(blobstore_path) = &dev_config.wasi_blobstore_path {
             host_builder = host_builder.with_plugin(Arc::new(
@@ -210,7 +216,7 @@ impl CliCommand for DevCommand {
         }
 
         // Enable WASI WebGPU if requested
-        #[cfg(not(target_os = "windows"))]
+        #[cfg(all(feature = "wasi-webgpu", not(target_os = "windows")))]
         if dev_config.wasi_webgpu {
             host_builder =
                 host_builder.with_plugin(Arc::new(plugin::wasi_webgpu::WebGpu::default()))?;

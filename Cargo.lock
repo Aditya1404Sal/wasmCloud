@@ -1306,7 +1306,15 @@ version = "0.132.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8c80cf55a351448317210f26c434be761bcb25e7b36116ec92f89540b73e2833"
 dependencies = [
- "cranelift-assembler-x64-meta",
+ "cranelift-assembler-x64-meta 0.132.0",
+]
+
+[[package]]
+name = "cranelift-assembler-x64"
+version = "0.133.0"
+source = "git+https://github.com/Aditya1404Sal/wasmtime?branch=fix-cross-component-stream-copy#49f1010ad5ec2ac5ac6f9fa3a6fbb308ab610bd5"
+dependencies = [
+ "cranelift-assembler-x64-meta 0.133.0",
 ]
 
 [[package]]
@@ -1315,7 +1323,15 @@ version = "0.132.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "07937ca8617b340162fe3a4716be885b5847e9b56d6c7a89abbe4d42340fdc91"
 dependencies = [
- "cranelift-srcgen",
+ "cranelift-srcgen 0.132.0",
+]
+
+[[package]]
+name = "cranelift-assembler-x64-meta"
+version = "0.133.0"
+source = "git+https://github.com/Aditya1404Sal/wasmtime?branch=fix-cross-component-stream-copy#49f1010ad5ec2ac5ac6f9fa3a6fbb308ab610bd5"
+dependencies = [
+ "cranelift-srcgen 0.133.0",
 ]
 
 [[package]]
@@ -1324,8 +1340,17 @@ version = "0.132.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "88217b08180882436d54c0133274885c590698ae854e352bede1cda041230800"
 dependencies = [
- "cranelift-entity",
- "wasmtime-internal-core",
+ "cranelift-entity 0.132.0",
+ "wasmtime-internal-core 45.0.0",
+]
+
+[[package]]
+name = "cranelift-bforest"
+version = "0.133.0"
+source = "git+https://github.com/Aditya1404Sal/wasmtime?branch=fix-cross-component-stream-copy#49f1010ad5ec2ac5ac6f9fa3a6fbb308ab610bd5"
+dependencies = [
+ "cranelift-entity 0.133.0",
+ "wasmtime-internal-core 46.0.0",
 ]
 
 [[package]]
@@ -1336,7 +1361,17 @@ checksum = "d5c3cf7ba29fa56e56040848e34835d4e45988b2760ef212413409af95ffd8c1"
 dependencies = [
  "serde",
  "serde_derive",
- "wasmtime-internal-core",
+ "wasmtime-internal-core 45.0.0",
+]
+
+[[package]]
+name = "cranelift-bitset"
+version = "0.133.0"
+source = "git+https://github.com/Aditya1404Sal/wasmtime?branch=fix-cross-component-stream-copy#49f1010ad5ec2ac5ac6f9fa3a6fbb308ab610bd5"
+dependencies = [
+ "serde",
+ "serde_derive",
+ "wasmtime-internal-core 46.0.0",
 ]
 
 [[package]]
@@ -1346,25 +1381,52 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ebe1aac2efd4cba2047845fce38a68519935a30e20c8a6294ba7e2f448fe722d"
 dependencies = [
  "bumpalo",
- "cranelift-assembler-x64",
- "cranelift-bforest",
- "cranelift-bitset",
- "cranelift-codegen-meta",
- "cranelift-codegen-shared",
- "cranelift-control",
- "cranelift-entity",
- "cranelift-isle",
+ "cranelift-assembler-x64 0.132.0",
+ "cranelift-bforest 0.132.0",
+ "cranelift-bitset 0.132.0",
+ "cranelift-codegen-meta 0.132.0",
+ "cranelift-codegen-shared 0.132.0",
+ "cranelift-control 0.132.0",
+ "cranelift-entity 0.132.0",
+ "cranelift-isle 0.132.0",
  "gimli",
  "hashbrown 0.17.0",
  "libm",
  "log",
- "pulley-interpreter",
+ "pulley-interpreter 45.0.0",
  "regalloc2",
  "rustc-hash 2.1.2",
  "serde",
  "smallvec",
  "target-lexicon",
- "wasmtime-internal-core",
+ "wasmtime-internal-core 45.0.0",
+]
+
+[[package]]
+name = "cranelift-codegen"
+version = "0.133.0"
+source = "git+https://github.com/Aditya1404Sal/wasmtime?branch=fix-cross-component-stream-copy#49f1010ad5ec2ac5ac6f9fa3a6fbb308ab610bd5"
+dependencies = [
+ "bumpalo",
+ "cranelift-assembler-x64 0.133.0",
+ "cranelift-bforest 0.133.0",
+ "cranelift-bitset 0.133.0",
+ "cranelift-codegen-meta 0.133.0",
+ "cranelift-codegen-shared 0.133.0",
+ "cranelift-control 0.133.0",
+ "cranelift-entity 0.133.0",
+ "cranelift-isle 0.133.0",
+ "gimli",
+ "hashbrown 0.17.0",
+ "libm",
+ "log",
+ "pulley-interpreter 46.0.0",
+ "regalloc2",
+ "rustc-hash 2.1.2",
+ "serde",
+ "smallvec",
+ "target-lexicon",
+ "wasmtime-internal-core 46.0.0",
 ]
 
 [[package]]
@@ -1373,11 +1435,23 @@ version = "0.132.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0909eaf9d6f18f5bf802d50608cb4368ac340fbd03cc44f2888d1cfcc3faa64e"
 dependencies = [
- "cranelift-assembler-x64-meta",
- "cranelift-codegen-shared",
- "cranelift-srcgen",
+ "cranelift-assembler-x64-meta 0.132.0",
+ "cranelift-codegen-shared 0.132.0",
+ "cranelift-srcgen 0.132.0",
  "heck 0.5.0",
- "pulley-interpreter",
+ "pulley-interpreter 45.0.0",
+]
+
+[[package]]
+name = "cranelift-codegen-meta"
+version = "0.133.0"
+source = "git+https://github.com/Aditya1404Sal/wasmtime?branch=fix-cross-component-stream-copy#49f1010ad5ec2ac5ac6f9fa3a6fbb308ab610bd5"
+dependencies = [
+ "cranelift-assembler-x64-meta 0.133.0",
+ "cranelift-codegen-shared 0.133.0",
+ "cranelift-srcgen 0.133.0",
+ "heck 0.5.0",
+ "pulley-interpreter 46.0.0",
 ]
 
 [[package]]
@@ -1385,6 +1459,11 @@ name = "cranelift-codegen-shared"
 version = "0.132.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c95a8da8be283f49cda7d0ef228c94f10d791e517b27b0c7e282dadd2e79ce45"
+
+[[package]]
+name = "cranelift-codegen-shared"
+version = "0.133.0"
+source = "git+https://github.com/Aditya1404Sal/wasmtime?branch=fix-cross-component-stream-copy#49f1010ad5ec2ac5ac6f9fa3a6fbb308ab610bd5"
 
 [[package]]
 name = "cranelift-control"
@@ -1396,15 +1475,34 @@ dependencies = [
 ]
 
 [[package]]
+name = "cranelift-control"
+version = "0.133.0"
+source = "git+https://github.com/Aditya1404Sal/wasmtime?branch=fix-cross-component-stream-copy#49f1010ad5ec2ac5ac6f9fa3a6fbb308ab610bd5"
+dependencies = [
+ "arbitrary",
+]
+
+[[package]]
 name = "cranelift-entity"
 version = "0.132.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4a55309b47e6633ab05821304206cb1e92952e845b1224985562bb7ac1e92323"
 dependencies = [
- "cranelift-bitset",
+ "cranelift-bitset 0.132.0",
  "serde",
  "serde_derive",
- "wasmtime-internal-core",
+ "wasmtime-internal-core 45.0.0",
+]
+
+[[package]]
+name = "cranelift-entity"
+version = "0.133.0"
+source = "git+https://github.com/Aditya1404Sal/wasmtime?branch=fix-cross-component-stream-copy#49f1010ad5ec2ac5ac6f9fa3a6fbb308ab610bd5"
+dependencies = [
+ "cranelift-bitset 0.133.0",
+ "serde",
+ "serde_derive",
+ "wasmtime-internal-core 46.0.0",
 ]
 
 [[package]]
@@ -1413,7 +1511,19 @@ version = "0.132.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "064d2d3533d9608f1cf44c8899cf2f7f33feb70300b0fb83e687b0d9e7b91147"
 dependencies = [
- "cranelift-codegen",
+ "cranelift-codegen 0.132.0",
+ "log",
+ "smallvec",
+ "target-lexicon",
+]
+
+[[package]]
+name = "cranelift-frontend"
+version = "0.133.0"
+source = "git+https://github.com/Aditya1404Sal/wasmtime?branch=fix-cross-component-stream-copy#49f1010ad5ec2ac5ac6f9fa3a6fbb308ab610bd5"
+dependencies = [
+ "cranelift-codegen 0.133.0",
+ "hashbrown 0.17.0",
  "log",
  "smallvec",
  "target-lexicon",
@@ -1426,12 +1536,27 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1ac4e0bc095b2dab2212d1e99d7a74b62afc1485db023f1c0cb34a68758f7bd1"
 
 [[package]]
+name = "cranelift-isle"
+version = "0.133.0"
+source = "git+https://github.com/Aditya1404Sal/wasmtime?branch=fix-cross-component-stream-copy#49f1010ad5ec2ac5ac6f9fa3a6fbb308ab610bd5"
+
+[[package]]
 name = "cranelift-native"
 version = "0.132.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "09a40053f5cb925451dd1d57393d14ad3145c8e0786701c27b5415ebb9a3ba4f"
 dependencies = [
- "cranelift-codegen",
+ "cranelift-codegen 0.132.0",
+ "libc",
+ "target-lexicon",
+]
+
+[[package]]
+name = "cranelift-native"
+version = "0.133.0"
+source = "git+https://github.com/Aditya1404Sal/wasmtime?branch=fix-cross-component-stream-copy#49f1010ad5ec2ac5ac6f9fa3a6fbb308ab610bd5"
+dependencies = [
+ "cranelift-codegen 0.133.0",
  "libc",
  "target-lexicon",
 ]
@@ -1441,6 +1566,11 @@ name = "cranelift-srcgen"
 version = "0.132.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a3ceab9a53f7d362c89841fbaa8e63e44d47c40e91dc96ee6f777fca5d6b323b"
+
+[[package]]
+name = "cranelift-srcgen"
+version = "0.133.0"
+source = "git+https://github.com/Aditya1404Sal/wasmtime?branch=fix-cross-component-stream-copy#49f1010ad5ec2ac5ac6f9fa3a6fbb308ab610bd5"
 
 [[package]]
 name = "crc32fast"
@@ -3681,6 +3811,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "mach2"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dae608c151f68243f2b000364e1f7b186d9c29845f7d2d85bd31b9ad77ad552b"
+
+[[package]]
 name = "markup5ever"
 version = "0.16.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5235,10 +5371,21 @@ version = "45.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e9204ad9435f2a6fe3bd13bba52389fb8488fa20ba497e35c5d2db638166019d"
 dependencies = [
- "cranelift-bitset",
+ "cranelift-bitset 0.132.0",
  "log",
- "pulley-macros",
- "wasmtime-internal-core",
+ "pulley-macros 45.0.0",
+ "wasmtime-internal-core 45.0.0",
+]
+
+[[package]]
+name = "pulley-interpreter"
+version = "46.0.0"
+source = "git+https://github.com/Aditya1404Sal/wasmtime?branch=fix-cross-component-stream-copy#49f1010ad5ec2ac5ac6f9fa3a6fbb308ab610bd5"
+dependencies = [
+ "cranelift-bitset 0.133.0",
+ "log",
+ "pulley-macros 46.0.0",
+ "wasmtime-internal-core 46.0.0",
 ]
 
 [[package]]
@@ -5246,6 +5393,16 @@ name = "pulley-macros"
 version = "45.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "53009b033747e0d79a76549a744da58e84c9da8076492c7e6d491fdc6cc41b95"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+]
+
+[[package]]
+name = "pulley-macros"
+version = "46.0.0"
+source = "git+https://github.com/Aditya1404Sal/wasmtime?branch=fix-cross-component-stream-copy#49f1010ad5ec2ac5ac6f9fa3a6fbb308ab610bd5"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -6162,7 +6319,7 @@ source = "git+https://github.com/wasi-gfx/wasi-gfx-runtime.git?rev=24ac92e1a2fff
 dependencies = [
  "async-broadcast",
  "async-trait",
- "wasmtime-wasi-io",
+ "wasmtime-wasi-io 45.0.0",
 ]
 
 [[package]]
@@ -6816,6 +6973,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "tokio-tungstenite"
+version = "0.29.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8f72a05e828585856dacd553fba484c242c46e391fb0e58917c942ee9202915c"
+dependencies = [
+ "futures-util",
+ "log",
+ "tokio",
+ "tungstenite",
+]
+
+[[package]]
 name = "tokio-util"
 version = "0.7.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7168,6 +7337,22 @@ checksum = "9fe58ebd5edd976e0fe0f8a14d2a04b7c81ef153ea9a54eebc42e67c2c23b4e5"
 dependencies = [
  "pin-project-lite",
  "tokio",
+]
+
+[[package]]
+name = "tungstenite"
+version = "0.29.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6c01152af293afb9c7c2a57e4b559c5620b421f6d133261c60dd2d0cdb38e6b8"
+dependencies = [
+ "bytes",
+ "data-encoding",
+ "http",
+ "httparse",
+ "log",
+ "rand 0.9.4",
+ "sha1",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -7599,7 +7784,7 @@ dependencies = [
  "testcontainers",
  "tokio",
  "url",
- "wasmtime",
+ "wasmtime 46.0.0",
  "wat",
 ]
 
@@ -7610,6 +7795,7 @@ dependencies = [
  "anyhow",
  "async-nats",
  "async-trait",
+ "base64 0.22.1",
  "bigdecimal 0.4.10",
  "bit-vec 0.6.3",
  "bon",
@@ -7658,6 +7844,7 @@ dependencies = [
  "semver",
  "serde",
  "serde_json",
+ "sha1",
  "sha2 0.10.9",
  "sysinfo",
  "tempfile",
@@ -7666,6 +7853,7 @@ dependencies = [
  "tokio-postgres",
  "tokio-postgres-rustls",
  "tokio-rustls",
+ "tokio-tungstenite",
  "tokio-util",
  "tonic",
  "tonic-prost",
@@ -7678,10 +7866,10 @@ dependencies = [
  "uuid",
  "wasi-graphics-context-wasmtime",
  "wasi-webgpu-wasmtime",
- "wasmtime",
- "wasmtime-wasi",
+ "wasmtime 46.0.0",
+ "wasmtime-wasi 46.0.0",
  "wasmtime-wasi-http",
- "wasmtime-wasi-io",
+ "wasmtime-wasi-io 46.0.0",
  "wasmtime-wasi-tls",
  "wat",
  "webpki-roots 0.26.11",
@@ -7709,9 +7897,9 @@ version = "0.1.0"
 source = "git+https://github.com/wasi-gfx/wasi-gfx-runtime.git?rev=24ac92e1a2fff283b2326a8607dd9b96c302237d#24ac92e1a2fff283b2326a8607dd9b96c302237d"
 dependencies = [
  "raw-window-handle",
- "wasmtime",
- "wasmtime-wasi",
- "wasmtime-wasi-io",
+ "wasmtime 45.0.0",
+ "wasmtime-wasi 45.0.0",
+ "wasmtime-wasi-io 45.0.0",
 ]
 
 [[package]]
@@ -7732,9 +7920,9 @@ dependencies = [
  "raw-window-handle",
  "shared",
  "wasi-graphics-context-wasmtime",
- "wasmtime",
- "wasmtime-wasi",
- "wasmtime-wasi-io",
+ "wasmtime 45.0.0",
+ "wasmtime-wasi 45.0.0",
+ "wasmtime-wasi-io 45.0.0",
  "wgpu-core",
  "wgpu-types",
 ]
@@ -7897,6 +8085,16 @@ checksum = "ac92cf547bc18d27ecc521015c08c353b4f18b84ab388bb6d1b6b682c620d9b6"
 dependencies = [
  "leb128fmt",
  "wasmparser 0.248.0",
+]
+
+[[package]]
+name = "wasm-encoder"
+version = "0.249.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "69830ccbbf41c55eb585991659fb70867ef628193af3a495f09a6956f7615e59"
+dependencies = [
+ "leb128fmt",
+ "wasmparser 0.249.0",
 ]
 
 [[package]]
@@ -8100,6 +8298,19 @@ dependencies = [
 
 [[package]]
 name = "wasmparser"
+version = "0.249.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "30538cae9a794215f490b532df01c557e2e2bfac92569482554acd0992a102ea"
+dependencies = [
+ "bitflags",
+ "hashbrown 0.17.0",
+ "indexmap 2.14.0",
+ "semver",
+ "serde",
+]
+
+[[package]]
+name = "wasmparser"
 version = "0.250.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "071d99cdfb8111603ed05500506c3298a940b58d609dd0259d3981785dd33556"
@@ -8131,6 +8342,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "wasmprinter"
+version = "0.249.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a4e227e800fc74c0d60117391f71d60e4c956333cfc3be796ae72d269002aa52"
+dependencies = [
+ "anyhow",
+ "termcolor",
+ "wasmparser 0.249.0",
+]
+
+[[package]]
 name = "wasmtime"
 version = "45.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8140,7 +8362,6 @@ dependencies = [
  "async-trait",
  "bitflags",
  "bumpalo",
- "bytes",
  "cc",
  "cfg-if",
  "encoding_rs",
@@ -8150,12 +8371,12 @@ dependencies = [
  "ittapi",
  "libc",
  "log",
- "mach2",
+ "mach2 0.4.3",
  "memfd",
  "object",
  "once_cell",
  "postcard",
- "pulley-interpreter",
+ "pulley-interpreter 45.0.0",
  "rayon",
  "rustix",
  "semver",
@@ -8168,19 +8389,62 @@ dependencies = [
  "wasm-compose 0.248.0",
  "wasm-encoder 0.248.0",
  "wasmparser 0.248.0",
- "wasmtime-environ",
+ "wasmtime-environ 45.0.0",
  "wasmtime-internal-cache",
- "wasmtime-internal-component-macro",
- "wasmtime-internal-component-util",
- "wasmtime-internal-core",
- "wasmtime-internal-cranelift",
- "wasmtime-internal-fiber",
- "wasmtime-internal-jit-debug",
- "wasmtime-internal-jit-icache-coherence",
- "wasmtime-internal-unwinder",
- "wasmtime-internal-versioned-export-macros",
- "wasmtime-internal-winch",
+ "wasmtime-internal-component-macro 45.0.0",
+ "wasmtime-internal-component-util 45.0.0",
+ "wasmtime-internal-core 45.0.0",
+ "wasmtime-internal-cranelift 45.0.0",
+ "wasmtime-internal-fiber 45.0.0",
+ "wasmtime-internal-jit-debug 45.0.0",
+ "wasmtime-internal-jit-icache-coherence 45.0.0",
+ "wasmtime-internal-unwinder 45.0.0",
+ "wasmtime-internal-versioned-export-macros 45.0.0",
+ "wasmtime-internal-winch 45.0.0",
  "wat",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "wasmtime"
+version = "46.0.0"
+source = "git+https://github.com/Aditya1404Sal/wasmtime?branch=fix-cross-component-stream-copy#49f1010ad5ec2ac5ac6f9fa3a6fbb308ab610bd5"
+dependencies = [
+ "addr2line",
+ "async-trait",
+ "bitflags",
+ "bumpalo",
+ "bytes",
+ "cc",
+ "cfg-if",
+ "encoding_rs",
+ "futures",
+ "libc",
+ "log",
+ "mach2 0.6.0",
+ "memfd",
+ "object",
+ "once_cell",
+ "postcard",
+ "pulley-interpreter 46.0.0",
+ "rustix",
+ "semver",
+ "serde",
+ "serde_derive",
+ "smallvec",
+ "target-lexicon",
+ "wasmparser 0.249.0",
+ "wasmtime-environ 46.0.0",
+ "wasmtime-internal-component-macro 46.0.0",
+ "wasmtime-internal-component-util 46.0.0",
+ "wasmtime-internal-core 46.0.0",
+ "wasmtime-internal-cranelift 46.0.0",
+ "wasmtime-internal-fiber 46.0.0",
+ "wasmtime-internal-jit-debug 46.0.0",
+ "wasmtime-internal-jit-icache-coherence 46.0.0",
+ "wasmtime-internal-unwinder 46.0.0",
+ "wasmtime-internal-versioned-export-macros 46.0.0",
+ "wasmtime-internal-winch 46.0.0",
  "windows-sys 0.61.2",
 ]
 
@@ -8192,9 +8456,9 @@ checksum = "d7da3dcce82a7e784121c19c8c9c5f69a743088264ff5212033e4a1f1b9dfaaf"
 dependencies = [
  "anyhow",
  "cpp_demangle",
- "cranelift-bforest",
- "cranelift-bitset",
- "cranelift-entity",
+ "cranelift-bforest 0.132.0",
+ "cranelift-bitset 0.132.0",
+ "cranelift-entity 0.132.0",
  "gimli",
  "hashbrown 0.17.0",
  "indexmap 2.14.0",
@@ -8211,8 +8475,38 @@ dependencies = [
  "wasm-encoder 0.248.0",
  "wasmparser 0.248.0",
  "wasmprinter 0.248.0",
- "wasmtime-internal-component-util",
- "wasmtime-internal-core",
+ "wasmtime-internal-component-util 45.0.0",
+ "wasmtime-internal-core 45.0.0",
+]
+
+[[package]]
+name = "wasmtime-environ"
+version = "46.0.0"
+source = "git+https://github.com/Aditya1404Sal/wasmtime?branch=fix-cross-component-stream-copy#49f1010ad5ec2ac5ac6f9fa3a6fbb308ab610bd5"
+dependencies = [
+ "anyhow",
+ "cpp_demangle",
+ "cranelift-bforest 0.133.0",
+ "cranelift-bitset 0.133.0",
+ "cranelift-entity 0.133.0",
+ "gimli",
+ "hashbrown 0.17.0",
+ "indexmap 2.14.0",
+ "log",
+ "object",
+ "postcard",
+ "rustc-demangle",
+ "semver",
+ "serde",
+ "serde_derive",
+ "sha2 0.10.9",
+ "smallvec",
+ "target-lexicon",
+ "wasm-encoder 0.249.0",
+ "wasmparser 0.249.0",
+ "wasmprinter 0.249.0",
+ "wasmtime-internal-component-util 46.0.0",
+ "wasmtime-internal-core 46.0.0",
 ]
 
 [[package]]
@@ -8230,7 +8524,7 @@ dependencies = [
  "serde_derive",
  "sha2 0.10.9",
  "toml 0.9.12+spec-1.1.0",
- "wasmtime-environ",
+ "wasmtime-environ 45.0.0",
  "windows-sys 0.61.2",
  "zstd",
 ]
@@ -8245,9 +8539,23 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
- "wasmtime-internal-component-util",
- "wasmtime-internal-wit-bindgen",
+ "wasmtime-internal-component-util 45.0.0",
+ "wasmtime-internal-wit-bindgen 45.0.0",
  "wit-parser 0.248.0",
+]
+
+[[package]]
+name = "wasmtime-internal-component-macro"
+version = "46.0.0"
+source = "git+https://github.com/Aditya1404Sal/wasmtime?branch=fix-cross-component-stream-copy#49f1010ad5ec2ac5ac6f9fa3a6fbb308ab610bd5"
+dependencies = [
+ "anyhow",
+ "proc-macro2",
+ "quote",
+ "syn",
+ "wasmtime-internal-component-util 46.0.0",
+ "wasmtime-internal-wit-bindgen 46.0.0",
+ "wit-parser 0.249.0",
 ]
 
 [[package]]
@@ -8255,6 +8563,11 @@ name = "wasmtime-internal-component-util"
 version = "45.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "47fda091250d7ab839ea51e4d98190b6eee37e9de4ab2462e8fe8465369c1986"
+
+[[package]]
+name = "wasmtime-internal-component-util"
+version = "46.0.0"
+source = "git+https://github.com/Aditya1404Sal/wasmtime?branch=fix-cross-component-stream-copy#49f1010ad5ec2ac5ac6f9fa3a6fbb308ab610bd5"
 
 [[package]]
 name = "wasmtime-internal-core"
@@ -8269,30 +8582,67 @@ dependencies = [
 ]
 
 [[package]]
+name = "wasmtime-internal-core"
+version = "46.0.0"
+source = "git+https://github.com/Aditya1404Sal/wasmtime?branch=fix-cross-component-stream-copy#49f1010ad5ec2ac5ac6f9fa3a6fbb308ab610bd5"
+dependencies = [
+ "anyhow",
+ "hashbrown 0.17.0",
+ "libm",
+ "serde",
+]
+
+[[package]]
 name = "wasmtime-internal-cranelift"
 version = "45.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5773b36b87566239b020f1d01aa753a35626df85030485e40e36fc42a97acf4f"
 dependencies = [
  "cfg-if",
- "cranelift-codegen",
- "cranelift-control",
- "cranelift-entity",
- "cranelift-frontend",
- "cranelift-native",
+ "cranelift-codegen 0.132.0",
+ "cranelift-control 0.132.0",
+ "cranelift-entity 0.132.0",
+ "cranelift-frontend 0.132.0",
+ "cranelift-native 0.132.0",
  "gimli",
  "itertools 0.14.0",
  "log",
  "object",
- "pulley-interpreter",
+ "pulley-interpreter 45.0.0",
  "smallvec",
  "target-lexicon",
  "thiserror 2.0.18",
  "wasmparser 0.248.0",
- "wasmtime-environ",
- "wasmtime-internal-core",
- "wasmtime-internal-unwinder",
- "wasmtime-internal-versioned-export-macros",
+ "wasmtime-environ 45.0.0",
+ "wasmtime-internal-core 45.0.0",
+ "wasmtime-internal-unwinder 45.0.0",
+ "wasmtime-internal-versioned-export-macros 45.0.0",
+]
+
+[[package]]
+name = "wasmtime-internal-cranelift"
+version = "46.0.0"
+source = "git+https://github.com/Aditya1404Sal/wasmtime?branch=fix-cross-component-stream-copy#49f1010ad5ec2ac5ac6f9fa3a6fbb308ab610bd5"
+dependencies = [
+ "cfg-if",
+ "cranelift-codegen 0.133.0",
+ "cranelift-control 0.133.0",
+ "cranelift-entity 0.133.0",
+ "cranelift-frontend 0.133.0",
+ "cranelift-native 0.133.0",
+ "gimli",
+ "itertools 0.14.0",
+ "log",
+ "object",
+ "pulley-interpreter 46.0.0",
+ "smallvec",
+ "target-lexicon",
+ "thiserror 2.0.18",
+ "wasmparser 0.249.0",
+ "wasmtime-environ 46.0.0",
+ "wasmtime-internal-core 46.0.0",
+ "wasmtime-internal-unwinder 46.0.0",
+ "wasmtime-internal-versioned-export-macros 46.0.0",
 ]
 
 [[package]]
@@ -8305,8 +8655,22 @@ dependencies = [
  "cfg-if",
  "libc",
  "rustix",
- "wasmtime-environ",
- "wasmtime-internal-versioned-export-macros",
+ "wasmtime-environ 45.0.0",
+ "wasmtime-internal-versioned-export-macros 45.0.0",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "wasmtime-internal-fiber"
+version = "46.0.0"
+source = "git+https://github.com/Aditya1404Sal/wasmtime?branch=fix-cross-component-stream-copy#49f1010ad5ec2ac5ac6f9fa3a6fbb308ab610bd5"
+dependencies = [
+ "cc",
+ "cfg-if",
+ "libc",
+ "rustix",
+ "wasmtime-environ 46.0.0",
+ "wasmtime-internal-versioned-export-macros 46.0.0",
  "windows-sys 0.61.2",
 ]
 
@@ -8319,7 +8683,16 @@ dependencies = [
  "cc",
  "object",
  "rustix",
- "wasmtime-internal-versioned-export-macros",
+ "wasmtime-internal-versioned-export-macros 45.0.0",
+]
+
+[[package]]
+name = "wasmtime-internal-jit-debug"
+version = "46.0.0"
+source = "git+https://github.com/Aditya1404Sal/wasmtime?branch=fix-cross-component-stream-copy#49f1010ad5ec2ac5ac6f9fa3a6fbb308ab610bd5"
+dependencies = [
+ "cc",
+ "wasmtime-internal-versioned-export-macros 46.0.0",
 ]
 
 [[package]]
@@ -8330,7 +8703,18 @@ checksum = "8a312ba8bb77955dcd44294a223e7f124c3071ff966583d385d3f6a4639c62e3"
 dependencies = [
  "cfg-if",
  "libc",
- "wasmtime-internal-core",
+ "wasmtime-internal-core 45.0.0",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "wasmtime-internal-jit-icache-coherence"
+version = "46.0.0"
+source = "git+https://github.com/Aditya1404Sal/wasmtime?branch=fix-cross-component-stream-copy#49f1010ad5ec2ac5ac6f9fa3a6fbb308ab610bd5"
+dependencies = [
+ "cfg-if",
+ "libc",
+ "wasmtime-internal-core 46.0.0",
  "windows-sys 0.61.2",
 ]
 
@@ -8341,10 +8725,22 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4a62ad422ee3cbf1e87c2242dc0717a01c7a5878fbc3a68abc4b4d2fff3e85e1"
 dependencies = [
  "cfg-if",
- "cranelift-codegen",
+ "cranelift-codegen 0.132.0",
  "log",
  "object",
- "wasmtime-environ",
+ "wasmtime-environ 45.0.0",
+]
+
+[[package]]
+name = "wasmtime-internal-unwinder"
+version = "46.0.0"
+source = "git+https://github.com/Aditya1404Sal/wasmtime?branch=fix-cross-component-stream-copy#49f1010ad5ec2ac5ac6f9fa3a6fbb308ab610bd5"
+dependencies = [
+ "cfg-if",
+ "cranelift-codegen 0.133.0",
+ "log",
+ "object",
+ "wasmtime-environ 46.0.0",
 ]
 
 [[package]]
@@ -8359,20 +8755,46 @@ dependencies = [
 ]
 
 [[package]]
+name = "wasmtime-internal-versioned-export-macros"
+version = "46.0.0"
+source = "git+https://github.com/Aditya1404Sal/wasmtime?branch=fix-cross-component-stream-copy#49f1010ad5ec2ac5ac6f9fa3a6fbb308ab610bd5"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+]
+
+[[package]]
 name = "wasmtime-internal-winch"
 version = "45.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d2aceb92b48b6e3a5cc2a05ab7a2dcb565eaf86fb870d04664b7f12cf9bba39a"
 dependencies = [
- "cranelift-codegen",
+ "cranelift-codegen 0.132.0",
  "gimli",
  "log",
  "object",
  "target-lexicon",
  "wasmparser 0.248.0",
- "wasmtime-environ",
- "wasmtime-internal-cranelift",
- "winch-codegen",
+ "wasmtime-environ 45.0.0",
+ "wasmtime-internal-cranelift 45.0.0",
+ "winch-codegen 45.0.0",
+]
+
+[[package]]
+name = "wasmtime-internal-winch"
+version = "46.0.0"
+source = "git+https://github.com/Aditya1404Sal/wasmtime?branch=fix-cross-component-stream-copy#49f1010ad5ec2ac5ac6f9fa3a6fbb308ab610bd5"
+dependencies = [
+ "cranelift-codegen 0.133.0",
+ "gimli",
+ "log",
+ "object",
+ "target-lexicon",
+ "wasmparser 0.249.0",
+ "wasmtime-environ 46.0.0",
+ "wasmtime-internal-cranelift 46.0.0",
+ "winch-codegen 46.0.0",
 ]
 
 [[package]]
@@ -8386,6 +8808,18 @@ dependencies = [
  "heck 0.5.0",
  "indexmap 2.14.0",
  "wit-parser 0.248.0",
+]
+
+[[package]]
+name = "wasmtime-internal-wit-bindgen"
+version = "46.0.0"
+source = "git+https://github.com/Aditya1404Sal/wasmtime?branch=fix-cross-component-stream-copy#49f1010ad5ec2ac5ac6f9fa3a6fbb308ab610bd5"
+dependencies = [
+ "anyhow",
+ "bitflags",
+ "heck 0.5.0",
+ "indexmap 2.14.0",
+ "wit-parser 0.249.0",
 ]
 
 [[package]]
@@ -8412,17 +8846,44 @@ dependencies = [
  "tokio",
  "tracing",
  "url",
- "wasmtime",
- "wasmtime-wasi-io",
+ "wasmtime 45.0.0",
+ "wasmtime-wasi-io 45.0.0",
  "wiggle",
  "windows-sys 0.61.2",
 ]
 
 [[package]]
+name = "wasmtime-wasi"
+version = "46.0.0"
+source = "git+https://github.com/Aditya1404Sal/wasmtime?branch=fix-cross-component-stream-copy#49f1010ad5ec2ac5ac6f9fa3a6fbb308ab610bd5"
+dependencies = [
+ "async-trait",
+ "bitflags",
+ "bytes",
+ "cap-fs-ext",
+ "cap-net-ext",
+ "cap-std",
+ "cap-time-ext",
+ "cfg-if",
+ "fs-set-times",
+ "futures",
+ "io-extras",
+ "io-lifetimes",
+ "rand 0.10.1",
+ "rustix",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "url",
+ "wasmtime 46.0.0",
+ "wasmtime-wasi-io 46.0.0",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "wasmtime-wasi-http"
-version = "45.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c7ac191e49f1cfb8567b335a4e4375d275552f5e5ce199fd7631c8722865b598"
+version = "46.0.0"
+source = "git+https://github.com/Aditya1404Sal/wasmtime?branch=fix-cross-component-stream-copy#49f1010ad5ec2ac5ac6f9fa3a6fbb308ab610bd5"
 dependencies = [
  "async-trait",
  "bytes",
@@ -8436,9 +8897,9 @@ dependencies = [
  "tokio-rustls",
  "tokio-util",
  "tracing",
- "wasmtime",
- "wasmtime-wasi",
- "wasmtime-wasi-io",
+ "wasmtime 46.0.0",
+ "wasmtime-wasi 46.0.0",
+ "wasmtime-wasi-io 46.0.0",
  "webpki-roots 0.26.11",
 ]
 
@@ -8452,14 +8913,26 @@ dependencies = [
  "bytes",
  "futures",
  "tracing",
- "wasmtime",
+ "wasmtime 45.0.0",
+]
+
+[[package]]
+name = "wasmtime-wasi-io"
+version = "46.0.0"
+source = "git+https://github.com/Aditya1404Sal/wasmtime?branch=fix-cross-component-stream-copy#49f1010ad5ec2ac5ac6f9fa3a6fbb308ab610bd5"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "futures",
+ "tracing",
+ "wasmtime 46.0.0",
 ]
 
 [[package]]
 name = "wasmtime-wasi-tls"
-version = "45.0.0"
+version = "46.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "093d4872f2b93fb4fc5cee1d081e8de4b527fedd53432934b5d7cc4762248aab"
+checksum = "a3e06cc23dfe472fd57a01c18b693e2be581f073034164e21a1d8b0ab757a220"
 dependencies = [
  "bytes",
  "cfg-if",
@@ -8467,8 +8940,8 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tracing",
- "wasmtime",
- "wasmtime-wasi",
+ "wasmtime 46.0.0",
+ "wasmtime-wasi 46.0.0",
  "webpki-roots 0.26.11",
 ]
 
@@ -8720,8 +9193,8 @@ dependencies = [
  "bitflags",
  "thiserror 2.0.18",
  "tracing",
- "wasmtime",
- "wasmtime-environ",
+ "wasmtime 45.0.0",
+ "wasmtime-environ 45.0.0",
  "wiggle-macro",
 ]
 
@@ -8735,7 +9208,7 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
- "wasmtime-environ",
+ "wasmtime-environ 45.0.0",
  "witx",
 ]
 
@@ -8788,17 +9261,35 @@ version = "45.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3128bd53313b132e8737d7d318edbc438bab1abe525ac037bbf9857839e717e2"
 dependencies = [
- "cranelift-assembler-x64",
- "cranelift-codegen",
+ "cranelift-assembler-x64 0.132.0",
+ "cranelift-codegen 0.132.0",
  "gimli",
  "regalloc2",
  "smallvec",
  "target-lexicon",
  "thiserror 2.0.18",
  "wasmparser 0.248.0",
- "wasmtime-environ",
- "wasmtime-internal-core",
- "wasmtime-internal-cranelift",
+ "wasmtime-environ 45.0.0",
+ "wasmtime-internal-core 45.0.0",
+ "wasmtime-internal-cranelift 45.0.0",
+]
+
+[[package]]
+name = "winch-codegen"
+version = "46.0.0"
+source = "git+https://github.com/Aditya1404Sal/wasmtime?branch=fix-cross-component-stream-copy#49f1010ad5ec2ac5ac6f9fa3a6fbb308ab610bd5"
+dependencies = [
+ "cranelift-assembler-x64 0.133.0",
+ "cranelift-codegen 0.133.0",
+ "gimli",
+ "regalloc2",
+ "smallvec",
+ "target-lexicon",
+ "thiserror 2.0.18",
+ "wasmparser 0.249.0",
+ "wasmtime-environ 46.0.0",
+ "wasmtime-internal-core 46.0.0",
+ "wasmtime-internal-cranelift 46.0.0",
 ]
 
 [[package]]
@@ -9401,6 +9892,25 @@ dependencies = [
  "serde_json",
  "unicode-xid",
  "wasmparser 0.248.0",
+]
+
+[[package]]
+name = "wit-parser"
+version = "0.249.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "50840f2e2cf170d910858089d7dfb3e97c6f9a0d6ec7bff7f7cc28f5aeacc15f"
+dependencies = [
+ "anyhow",
+ "hashbrown 0.17.0",
+ "id-arena",
+ "indexmap 2.14.0",
+ "log",
+ "semver",
+ "serde",
+ "serde_derive",
+ "serde_json",
+ "unicode-xid",
+ "wasmparser 0.249.0",
 ]
 
 [[package]]
