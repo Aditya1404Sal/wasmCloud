@@ -952,38 +952,42 @@ pub async fn handle_component_request(
         .map_err(anyhow::Error::from)
         .context("failed to instantiate proxy pre")?;
 
-    // Run the http request itself in a separate task so the task can
-    // optionally continue to execute beyond after the initial
-    // headers/response code are sent.
-    let task: JoinHandle<anyhow::Result<()>> = tokio::task::spawn(
-        async move {
-            // Run the http request itself by instantiating and calling the component
-            let proxy = pre.instantiate_async(&mut store).await?;
+    // Run the component in a blocking thread so it does not starve the host's other
+    // async task. The NATS heartbeat keeps going, so the host CRD will not be killed
+    // Tokio's blocking pool defaults to 512 threads, so concurrency is bounded by
+    // that pool
+    let span = tracing::Span::current();
+    let task: JoinHandle<anyhow::Result<()>> = tokio::task::spawn_blocking(move || {
+        tokio::runtime::Handle::current().block_on(
+            async move {
+                // Run the http request itself by instantiating and calling the component
+                let proxy = pre.instantiate_async(&mut store).await?;
 
-            fuel_meter
-                .observe(
-                    &[
-                        KeyValue::new("plugin", "wasi-http"),
-                        KeyValue::new("method", method),
-                        KeyValue::new("host", host_header),
-                        KeyValue::new("uri", uri),
-                    ],
-                    &mut store,
-                    async move |store| {
-                        proxy
-                            .wasi_http_incoming_handler()
-                            .call_handle(store, req, out)
-                            .await?;
+                fuel_meter
+                    .observe(
+                        &[
+                            KeyValue::new("plugin", "wasi-http"),
+                            KeyValue::new("method", method),
+                            KeyValue::new("host", host_header),
+                            KeyValue::new("uri", uri),
+                        ],
+                        &mut store,
+                        async move |store| {
+                            proxy
+                                .wasi_http_incoming_handler()
+                                .call_handle(store, req, out)
+                                .await?;
 
-                        Ok(())
-                    },
-                )
-                .await?;
+                            Ok(())
+                        },
+                    )
+                    .await?;
 
-            Ok(())
-        }
-        .in_current_span(),
-    );
+                Ok(())
+            }
+            .instrument(span),
+        )
+    });
 
     // receiver drops when the task ends without setting the outparam;
     // join the task to recover the real cause (trap, panic, or clean exit).
