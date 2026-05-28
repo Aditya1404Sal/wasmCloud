@@ -57,10 +57,10 @@ mod bindings {
 }
 
 use bindings::WebsocketPre;
+use bindings::betty_blocks::websockets::types::CloseInfo as GuestCloseInfo;
 use bindings::exports::betty_blocks::websockets::handler::{
     Frame as GuestFrame, UpgradeRequest as GuestUpgradeRequest,
 };
-use bindings::betty_blocks::websockets::types::CloseInfo as GuestCloseInfo;
 
 /// RFC 6455 §1.3 magic GUID used to derive `Sec-WebSocket-Accept` from
 /// the client's `Sec-WebSocket-Key`.

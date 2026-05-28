@@ -1978,6 +1978,30 @@ impl UnresolvedWorkload {
             }
         }
 
+        // Linked components share a single Wasmtime store. P3 background tasks
+        // can continue after the cross-component call that spawned them returns,
+        // and host imports observe the store's current active context. Keep the
+        // resolved plugin instances available from every context in the store,
+        // while still only adding linker functions for components that actually
+        // import the plugin interface.
+        let shared_store_plugins: Vec<_> = bound_plugins
+            .iter()
+            .map(|(plugin, _)| (plugin.id(), plugin.clone()))
+            .collect();
+        if !shared_store_plugins.is_empty() {
+            for component in self.components.values_mut() {
+                for (plugin_id, plugin) in &shared_store_plugins {
+                    component.metadata.add_plugin(*plugin_id, plugin.clone());
+                }
+            }
+
+            if let Some(service) = &mut self.service {
+                for (plugin_id, plugin) in &shared_store_plugins {
+                    service.metadata.add_plugin(*plugin_id, plugin.clone());
+                }
+            }
+        }
+
         Ok(bound_plugins)
     }
 
