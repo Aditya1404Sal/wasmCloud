@@ -62,7 +62,7 @@ impl StreamingBody {
         )
     }
 
-    fn signal_done(&mut self) {
+    fn notify_done(&mut self) {
         if let Some(tx) = self.done.take() {
             let _ = tx.send(());
         }
@@ -79,7 +79,7 @@ impl Body for StreamingBody {
     ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
         match Pin::new(&mut self.inner).poll_frame(cx) {
             Poll::Ready(None) => {
-                self.signal_done();
+                self.notify_done();
                 Poll::Ready(None)
             }
             other => other,
@@ -97,7 +97,7 @@ impl Body for StreamingBody {
 
 impl Drop for StreamingBody {
     fn drop(&mut self) {
-        self.signal_done();
+        self.notify_done();
     }
 }
 
@@ -171,6 +171,7 @@ pub async fn handle_component_request_p3(
                             let hyper_resp = hyper::Response::from_parts(parts, body);
 
                             if resp_tx.send(Ok(hyper_resp)).is_err() {
+                                tracing::debug!("P3 response receiver dropped; request cancelled");
                                 return Ok::<_, anyhow::Error>(());
                             }
                             // Keep run_concurrent alive while hyper drains.

@@ -79,6 +79,7 @@ async fn test_http_webgpu_integration() -> Result<()> {
                 },
                 pool_size: 1,
                 max_invocations: 100,
+                is_precompiled: false,
             }],
             host_interfaces: vec![
                 WitInterface {
