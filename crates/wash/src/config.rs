@@ -531,6 +531,12 @@ pub struct DevConfig {
     pub tls_key_path: Option<PathBuf>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tls_ca_path: Option<PathBuf>,
+    /// Optional PEM CA bundle used by the WASI TLS client provider.
+    ///
+    /// This is distinct from `tls_ca_path`, which configures client
+    /// certificate verification for the HTTP server started by `wash dev`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wasi_tls_ca_path: Option<PathBuf>,
 
     /// Enable WASI WebGPU support in the dev environment. Only supported on non-Windows platforms.
     #[serde(default)]
@@ -595,6 +601,15 @@ impl DevConfig {
                 errors.push("dev.tls_key_path is set but dev.tls_cert_path is missing".to_string())
             }
             _ => {}
+        }
+
+        if let Some(path) = &self.wasi_tls_ca_path
+            && !path.exists()
+        {
+            errors.push(format!(
+                "dev.wasi_tls_ca_path does not exist: {}",
+                path.display()
+            ));
         }
 
         if let Some(url) = &self.wasi_keyvalue_redis_url {

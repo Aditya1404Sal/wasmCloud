@@ -9,6 +9,8 @@ use bytes::Bytes;
 use clap::Args;
 use tokio::{select, sync::mpsc};
 use tracing::{debug, info, instrument, warn};
+#[cfg(feature = "wasi-tls")]
+use wash_runtime::engine::ctx::SharedTlsProvider;
 use wash_runtime::{
     engine::Engine,
     host::{Host, HostApi},
@@ -71,6 +73,16 @@ impl CliCommand for DevCommand {
         #[cfg(feature = "wasip3")]
         {
             engine_builder = engine_builder.with_wasip3(dev_config.wasip3);
+        }
+        #[cfg(feature = "wasi-tls")]
+        if let Some(ca_path) = dev_config.wasi_tls_ca_path.as_deref() {
+            ensure!(
+                ca_path.exists(),
+                "WASI TLS CA certificate file does not exist: {}",
+                ca_path.display()
+            );
+            engine_builder =
+                engine_builder.with_tls_provider(SharedTlsProvider::from_pem_ca_file(ca_path)?);
         }
         let engine = engine_builder.build()?;
 

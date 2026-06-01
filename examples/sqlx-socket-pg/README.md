@@ -1,5 +1,15 @@
 # sqlx-socket-pg
 
+## What do I need to get this running ?
+
+Compile wash with : 
+
+```zsh
+cargo build -p wash --features wasip3,wasi-tls
+```
+
+and run this component using `./../target/debug/wash dev` (and have postgres running on the port mentioned in .wash/config)
+
 A wasmCloud example showing how to reach a real PostgreSQL service from inside
 a sandboxed WASIP3 component. It is the Postgres twin of `examples/sqlx-socket`:
 the HTTP component is unchanged, while the long-running service owns a
@@ -44,7 +54,7 @@ Both wasm workloads run inside a sandbox. The TCP between `http-api` and
 ## The socket-tunnel policy
 
 The service component dials normal Postgres:
-
+> sslmode=disable for non-tls connections
 ```text
 postgres://postgres:Password123!@127.0.0.1:5432/todos?sslmode=require
 ```

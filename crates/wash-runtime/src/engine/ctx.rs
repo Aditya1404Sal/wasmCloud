@@ -8,6 +8,8 @@ use std::{
     any::Any,
     collections::HashMap,
     ops::{Deref, DerefMut},
+    path::Path,
+    pin::Pin,
     sync::Arc,
 };
 
@@ -33,6 +35,107 @@ pub struct SharedTlsProvider(Arc<dyn wasmtime_wasi_tls::TlsProvider>);
 impl SharedTlsProvider {
     pub fn new(provider: impl wasmtime_wasi_tls::TlsProvider + 'static) -> Self {
         Self(Arc::new(provider))
+    }
+
+    /// Build a rustls-backed provider that trusts the PEM certificates in
+    /// `ca_path`. This is useful for dev/test databases with private CAs or
+    /// self-signed certificates.
+    pub fn from_pem_ca_file(ca_path: impl AsRef<Path>) -> anyhow::Result<Self> {
+        let file = std::fs::File::open(ca_path.as_ref())?;
+        let mut reader = std::io::BufReader::new(file);
+        let certs: Vec<_> = rustls_pemfile::certs(&mut reader).collect::<Result<_, _>>()?;
+
+        anyhow::ensure!(
+            !certs.is_empty(),
+            "no certificates found in {}",
+            ca_path.as_ref().display()
+        );
+
+        let mut root_store = tokio_rustls::rustls::RootCertStore::empty();
+        let (added, ignored) = root_store.add_parsable_certificates(certs);
+        anyhow::ensure!(
+            added > 0,
+            "no usable certificates found in {} ({ignored} ignored)",
+            ca_path.as_ref().display()
+        );
+
+        let client_config = tokio_rustls::rustls::ClientConfig::builder()
+            .with_root_certificates(root_store)
+            .with_no_client_auth();
+
+        Ok(Self::new(RustlsTlsProvider {
+            client_config: Arc::new(client_config),
+        }))
+    }
+}
+
+#[cfg(feature = "wasi-tls")]
+struct RustlsTlsProvider {
+    client_config: Arc<tokio_rustls::rustls::ClientConfig>,
+}
+
+#[cfg(feature = "wasi-tls")]
+struct ClientTlsStream(tokio_rustls::client::TlsStream<Box<dyn wasmtime_wasi_tls::TlsTransport>>);
+
+#[cfg(feature = "wasi-tls")]
+impl tokio::io::AsyncRead for ClientTlsStream {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        tokio::io::AsyncRead::poll_read(Pin::new(&mut self.0), cx, buf)
+    }
+}
+
+#[cfg(feature = "wasi-tls")]
+impl tokio::io::AsyncWrite for ClientTlsStream {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        tokio::io::AsyncWrite::poll_write(Pin::new(&mut self.0), cx, buf)
+    }
+
+    fn poll_flush(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        tokio::io::AsyncWrite::poll_flush(Pin::new(&mut self.0), cx)
+    }
+
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        tokio::io::AsyncWrite::poll_shutdown(Pin::new(&mut self.0), cx)
+    }
+}
+
+#[cfg(feature = "wasi-tls")]
+impl Unpin for ClientTlsStream {}
+
+#[cfg(feature = "wasi-tls")]
+impl wasmtime_wasi_tls::TlsStream for ClientTlsStream {}
+
+#[cfg(feature = "wasi-tls")]
+impl wasmtime_wasi_tls::TlsProvider for RustlsTlsProvider {
+    fn connect(
+        &self,
+        server_name: String,
+        transport: Box<dyn wasmtime_wasi_tls::TlsTransport>,
+    ) -> TlsConnectFuture {
+        let config = Arc::clone(&self.client_config);
+        Box::pin(async move {
+            let domain = tokio_rustls::rustls::pki_types::ServerName::try_from(server_name.clone())
+                .map_err(|_| wasmtime_wasi_tls::Error::msg("invalid server name"))?;
+            let stream = tokio_rustls::TlsConnector::from(config)
+                .connect(domain, transport)
+                .await
+                .map_err(|e| wasmtime_wasi_tls::Error::msg(e.to_string()))?;
+            Ok(Box::new(ClientTlsStream(stream)) as Box<dyn wasmtime_wasi_tls::TlsStream>)
+        })
     }
 }
 
