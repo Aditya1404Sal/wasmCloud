@@ -1,0 +1,35 @@
+services:
+  postgres:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: todos-postgres
+    restart: unless-stopped
+    ports:
+      # Host 5433 → container 5432. The component still dials
+      # 127.0.0.1:5432 (its DATABASE_URL is unchanged); the socket_tunnels
+      # rule in .wash/config.yaml rewrites the destination to 127.0.0.1:5433
+      # at the OS layer, which docker then forwards to Postgres inside.
+      - "5433:5432"
+    environment:
+      POSTGRES_DB: todos
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: Password123!
+    volumes:
+      - todos-pg-data:/var/lib/postgresql/data
+    healthcheck:
+      # `pg_isready` returns 0 once the server accepts connections; the
+      # service is only considered "healthy" after that, so anything depending
+      # on it (e.g. `wash dev` started from a script) can wait it out.
+      test: ["CMD-SHELL", "pg_isready -U postgres -d todos"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+    command: >
+      -c ssl=on
+      -c ssl_cert_file=/var/lib/postgresql/server.crt
+      -c ssl_key_file=/var/lib/postgresql/server.key
+
+volumes:
+  todos-pg-data:
