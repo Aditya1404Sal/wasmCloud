@@ -564,12 +564,11 @@ pub struct WorkloadEntrypoint {
     component_id: String,
 }
 
-/// Incoming HTTP/SSE entrypoints registered for a workload.
+/// Incoming HTTP entrypoints registered for a workload.
 #[derive(Clone)]
 pub struct WorkloadIncomingHandles {
     resolved_handle: ResolvedWorkload,
     http: Option<WorkloadEntrypoint>,
-    sse: Option<WorkloadEntrypoint>,
 }
 
 impl WorkloadIncomingHandles {
@@ -577,7 +576,6 @@ impl WorkloadIncomingHandles {
         Self {
             resolved_handle,
             http: None,
-            sse: None,
         }
     }
 }
@@ -828,10 +826,6 @@ impl<T: Router, O: OutgoingHandler> HostHandler for HttpServer<T, O> {
             .await?;
         let instance_pre = resolved_handle.instantiate_pre(component_id).await?;
         let exports_http = crate::engine::exports_wasi_http(instance_pre.component());
-        #[cfg(feature = "wasip3")]
-        let exports_sse = crate::engine::targets_sse(instance_pre.component());
-        #[cfg(not(feature = "wasip3"))]
-        let exports_sse = false;
 
         let entrypoint = WorkloadEntrypoint {
             instance_pre,
@@ -845,10 +839,7 @@ impl<T: Router, O: OutgoingHandler> HostHandler for HttpServer<T, O> {
         workload_handles.resolved_handle = resolved_handle.clone();
 
         if exports_http {
-            workload_handles.http = Some(entrypoint.clone());
-        }
-        if exports_sse {
-            workload_handles.sse = Some(entrypoint);
+            workload_handles.http = Some(entrypoint);
         }
 
         Ok(())
@@ -1007,30 +998,6 @@ fn new_trace_id() -> String {
     uuid[..12].to_string()
 }
 
-/// True iff this request is asking for an SSE stream — a `GET` with an
-/// `Accept` header whose media-range list contains `text/event-stream`.
-/// The HTML SSE spec permits an explicit `Accept: text/event-stream`
-/// header on the subscription request; the EventSource API sets it by
-/// default. We deliberately do NOT match `*/*` here so that ordinary
-/// browsers loading the same workload over plain HTTP still route to
-/// the wasi:http handler.
-#[cfg(feature = "wasip3")]
-fn is_sse_request(req: &hyper::Request<hyper::body::Incoming>) -> bool {
-    if req.method() != hyper::Method::GET {
-        return false;
-    }
-    let Some(accept) = req.headers().get(hyper::header::ACCEPT) else {
-        return false;
-    };
-    let Ok(accept_str) = accept.to_str() else {
-        return false;
-    };
-    accept_str
-        .split(',')
-        .map(|range| range.split(';').next().unwrap_or("").trim())
-        .any(|media| media.eq_ignore_ascii_case("text/event-stream"))
-}
-
 /// Build an error response with the given status code.
 /// Building HTTP responses with valid status codes is infallible.
 #[allow(clippy::expect_used)]
@@ -1110,10 +1077,6 @@ async fn handle_http_request<T: Router>(
 
     let method = req.method().clone();
     let uri = req.uri().clone();
-    #[cfg(feature = "wasip3")]
-    let is_sse = is_sse_request(&req);
-    #[cfg(not(feature = "wasip3"))]
-    let is_sse = false;
 
     // server.port is recorded separately from server.address per the OTel HTTP
     // semconv; only set it when the Host header actually carries a port.
@@ -1150,21 +1113,11 @@ async fn handle_http_request<T: Router>(
 
     let response = match workload_handle {
         Some(handles) => {
-            // SSE is preferred over WS over HTTP when the workload exports it
-            // and the request matches. SSE never coincides with a WS upgrade
-            // (one is a body protocol, the other an Upgrade handshake) so
-            // ordering between them is moot.
-            let entrypoint = if is_sse && handles.sse.is_some() {
-                handles.sse.as_ref()
-            } else {
-                handles.http.as_ref()
-            }
-            .cloned();
+            let entrypoint = handles.http.as_ref().cloned();
             let Some(entrypoint) = entrypoint else {
                 warn!(
                     trace_id = %trace_id,
                     host = %workload_id,
-                    sse = is_sse,
                     "workload is bound to host but has no matching incoming component"
                 );
                 return Ok(error_response(404, &trace_id));
@@ -1277,24 +1230,6 @@ async fn invoke_component_handler(
     // Create a new store for this request with plugin contexts
     #[allow(unused_mut)]
     let mut store = workload_handle.new_store(component_id).await?;
-
-    // SSE subscription requests bypass the wasi:http handler entirely:
-    // the host opens a streaming 200 response and pipes events produced by
-    // the component's `betty-blocks:sse/handler` export.
-    #[cfg(feature = "wasip3")]
-    if is_sse_request(&req) && crate::engine::targets_sse(instance_pre.component()) {
-        workload_handle
-            .pre_instantiate_linked_components_for_component(&mut store, component_id)
-            .await?;
-        return crate::host::sse::handle_sse_request(
-            workload_handle.clone(),
-            store,
-            instance_pre,
-            req,
-            fuel_meter,
-        )
-        .await;
-    }
 
     // Check if this component targets WASIP3 and dispatch accordingly
     #[cfg(feature = "wasip3")]
