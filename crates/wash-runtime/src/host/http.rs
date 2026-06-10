@@ -1517,6 +1517,7 @@ async fn send_grpc_request_handler(
     // Strip scheme/authority from URI for the actual HTTP/2 request
     // The URI was already validated, so rebuilding with just path+query is safe
     if let Ok(uri) = hyper::Uri::builder()
+        .scheme(if use_tls { "https" } else { "http" })
         .path_and_query(
             request
                 .uri()
