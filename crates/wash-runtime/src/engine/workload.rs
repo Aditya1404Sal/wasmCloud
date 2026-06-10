@@ -4,7 +4,7 @@ use std::{
     collections::{HashMap, HashSet},
     ops::{Deref, DerefMut},
     path::PathBuf,
-    sync::Arc,
+    sync::{Arc, OnceLock},
     time::Duration,
 };
 
@@ -56,6 +56,8 @@ pub struct WorkloadMetadata {
     component: Component,
     /// The wasmtime [`Linker`] used to instantiate the component
     linker: Linker<SharedCtx>,
+    /// Cached pre-instantiated component for request-time instantiation.
+    runtime_instance_pre: Arc<OnceLock<InstancePre<SharedCtx>>>,
     /// The volume mounts requested by this component
     volume_mounts: Vec<(PathBuf, VolumeMount)>,
     /// The local resources requested by this component
@@ -100,6 +102,22 @@ impl WorkloadMetadata {
     /// Returns a mutable reference to the component's linker.
     pub fn linker(&mut self) -> &mut Linker<SharedCtx> {
         &mut self.linker
+    }
+
+    /// Returns a cached pre-instantiated component for runtime request handling.
+    pub fn runtime_instance_pre(&self) -> wasmtime::Result<InstancePre<SharedCtx>> {
+        if let Some(pre) = self.runtime_instance_pre.get() {
+            return Ok(pre.clone());
+        }
+
+        let pre = self.linker.instantiate_pre(&self.component)?;
+        if self.runtime_instance_pre.set(pre.clone()).is_err()
+            && let Some(pre) = self.runtime_instance_pre.get()
+        {
+            return Ok(pre.clone());
+        }
+
+        Ok(pre)
     }
 
     /// Returns a reference to component local resources.
@@ -259,6 +277,7 @@ impl WorkloadService {
                 workload_namespace: workload_namespace.into(),
                 component,
                 linker,
+                runtime_instance_pre: Default::default(),
                 volume_mounts,
                 local_resources,
                 plugins: None,
@@ -339,6 +358,7 @@ impl WorkloadComponent {
                 workload_namespace: workload_namespace.into(),
                 component,
                 linker,
+                runtime_instance_pre: Default::default(),
                 volume_mounts,
                 local_resources,
                 plugins: None,
@@ -992,15 +1012,16 @@ impl ResolvedWorkload {
                                             move |accessor, _func_ty, params, results| {
                                                 let import_name = import_name.clone();
                                                 let export_name = export_name.clone();
+                                                let pre = pre.clone();
                                                 let exporter_instances =
                                                     exporter_instances.clone();
                                                 let plugin_component_id =
                                                     plugin_component_id.clone();
                                                 Box::pin(async move {
-                                                    let (prev_id, func, params_buf): (
+                                                    let (prev_id, store_id, cached_instance): (
                                                         Arc<str>,
-                                                        wasmtime::component::Func,
-                                                        Vec<Val>,
+                                                        String,
+                                                        Option<wasmtime::component::Instance>,
                                                     ) = accessor.with(
                                                         |mut access| -> wasmtime::Result<_> {
                                                             let prev_id = access
@@ -1020,7 +1041,7 @@ impl ResolvedWorkload {
                                                                     .active_ctx
                                                                     .store_id
                                                                     .clone();
-                                                                let instance = exporter_instances
+                                                                let cached_instance = exporter_instances
                                                                     .read()
                                                                     .expect(
                                                                         "exporter instance cache poisoned",
@@ -1028,53 +1049,10 @@ impl ResolvedWorkload {
                                                                     .get(&(
                                                                         plugin_component_id
                                                                             .clone(),
-                                                                        store_id,
+                                                                        store_id.clone(),
                                                                     ))
-                                                                    .cloned()
-                                                                    .ok_or_else(|| {
-                                                                        wasmtime::format_err!(
-                                                                            "linked component instance '{plugin_component_id}' was not pre-instantiated for this store"
-                                                                        )
-                                                                    })?;
-                                                                let func = instance
-                                                                    .get_func(
-                                                                        &mut access,
-                                                                        func_idx,
-                                                                    )
-                                                                    .ok_or_else(|| {
-                                                                        wasmtime::format_err!(
-                                                                            "function not found"
-                                                                        )
-                                                                    })?;
-                                                                let param_tys = func
-                                                                    .ty(access.as_context())
-                                                                    .params()
-                                                                    .map(|(_, ty)| ty)
-                                                                    .collect::<Vec<_>>();
-                                                                trace!(
-                                                                    name = %import_name,
-                                                                    fn_name = %export_name,
-                                                                    ?params,
-                                                                    "lowering params"
-                                                                );
-                                                                let mut params_buf =
-                                                                    Vec::with_capacity(
-                                                                        params.len(),
-                                                                    );
-                                                                for (v, ty) in
-                                                                    params.iter().zip(&param_tys)
-                                                                {
-                                                                    params_buf.push(
-                                                                        lower_with_type(
-                                                                            &mut access
-                                                                                .as_context_mut(),
-                                                                            v,
-                                                                            ty,
-                                                                        )?,
-                                                                    );
-                                                                }
-
-                                                                Ok((func, params_buf))
+                                                                    .cloned();
+                                                                Ok((store_id, cached_instance))
                                                             })();
 
                                                             if result.is_err() {
@@ -1083,11 +1061,99 @@ impl ResolvedWorkload {
                                                                     .set_active_ctx(&prev_id)?;
                                                             }
 
-                                                            result.map(|(func, params_buf)| {
-                                                                (prev_id, func, params_buf)
-                                                            })
+                                                            result.map(
+                                                                |(store_id, cached_instance)| {
+                                                                    (
+                                                                        prev_id,
+                                                                        store_id,
+                                                                        cached_instance,
+                                                                    )
+                                                                },
+                                                            )
                                                         },
                                                     )?;
+
+                                                    let instance = if let Some(instance) =
+                                                        cached_instance
+                                                    {
+                                                        instance
+                                                    } else {
+                                                        let instance = match accessor
+                                                            .instantiate_async(&pre)
+                                                            .await
+                                                        {
+                                                            Ok(instance) => instance,
+                                                            Err(err) => {
+                                                                accessor.with(
+                                                                    |mut access| -> wasmtime::Result<_> {
+                                                                        access
+                                                                            .data_mut()
+                                                                            .set_active_ctx(&prev_id)
+                                                                    },
+                                                                )?;
+                                                                return Err(err);
+                                                            }
+                                                        };
+                                                        exporter_instances
+                                                            .write()
+                                                            .expect(
+                                                                "exporter instance cache poisoned",
+                                                            )
+                                                            .insert(
+                                                                (
+                                                                    plugin_component_id.clone(),
+                                                                    store_id.clone(),
+                                                                ),
+                                                                instance,
+                                                            );
+                                                        instance
+                                                    };
+
+                                                    let lower_result = accessor.with(
+                                                        |mut access| -> wasmtime::Result<_> {
+                                                            let func = instance
+                                                                .get_func(&mut access, func_idx)
+                                                                .ok_or_else(|| {
+                                                                    wasmtime::format_err!(
+                                                                        "function not found for linked import {import_name}.{export_name}"
+                                                                    )
+                                                                })?;
+                                                            let param_tys = func
+                                                                .ty(access.as_context())
+                                                                .params()
+                                                                .map(|(_, ty)| ty)
+                                                                .collect::<Vec<_>>();
+                                                            trace!(
+                                                                name = %import_name,
+                                                                fn_name = %export_name,
+                                                                ?params,
+                                                                "lowering params"
+                                                            );
+                                                            let mut params_buf =
+                                                                Vec::with_capacity(params.len());
+                                                            for (v, ty) in
+                                                                params.iter().zip(&param_tys)
+                                                            {
+                                                                params_buf.push(lower_with_type(
+                                                                    &mut access.as_context_mut(),
+                                                                    v,
+                                                                    ty,
+                                                                )?);
+                                                            }
+                                                            Ok((func, params_buf))
+                                                        },
+                                                    );
+
+                                                    if lower_result.is_err() {
+                                                        accessor.with(
+                                                            |mut access| -> wasmtime::Result<_> {
+                                                                access
+                                                                    .data_mut()
+                                                                    .set_active_ctx(&prev_id)
+                                                            },
+                                                        )?;
+                                                    }
+                                                    let (func, params_buf) = lower_result?;
 
                                                     trace!(
                                                         name = %import_name,
@@ -1534,13 +1600,11 @@ impl ResolvedWorkload {
         &self,
         component_id: &str,
     ) -> anyhow::Result<wasmtime::component::InstancePre<SharedCtx>> {
-        let mut components = self.components.write().await;
+        let components = self.components.read().await;
         let component = components
-            .get_mut(component_id)
+            .get(component_id)
             .context("component ID not found in workload")?;
-        let wasmtime_component = component.metadata.component.clone();
-        let linker = component.metadata.linker();
-        let pre = linker.instantiate_pre(&wasmtime_component)?;
+        let pre = component.metadata.runtime_instance_pre()?;
 
         Ok(pre)
     }

@@ -1234,9 +1234,6 @@ async fn invoke_component_handler(
     // Check if this component targets WASIP3 and dispatch accordingly
     #[cfg(feature = "wasip3")]
     if crate::engine::targets_wasip3_http(instance_pre.component()) {
-        workload_handle
-            .pre_instantiate_linked_components_for_component(&mut store, component_id)
-            .await?;
         let store_id = store.data().active_ctx.store_id.clone();
         let cleanup_workload = workload_handle.clone();
         let cleanup_store_id = store_id.clone();

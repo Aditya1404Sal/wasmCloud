@@ -5,7 +5,7 @@ interface broker {
     unregister: func(client-id: u64);
     wait-message: async func(client-id: u64) -> option<string>;
     publish-message: async func(message: string) -> result<_, string>;
-    request-cancel: func() -> u64;
-    cancel-generation: func() -> u64;
-    wait-cancel-after: async func(generation: u64) -> u64;
+    request-cancel: func(key: string) -> u64;
+    cancel-generation: func(key: string) -> u64;
+    wait-cancel-after: async func(key: string, generation: u64) -> u64;
 }

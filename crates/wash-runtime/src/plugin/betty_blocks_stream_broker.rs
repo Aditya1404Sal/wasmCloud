@@ -26,10 +26,17 @@ mod bindings {
     });
 }
 
+/// Per-key cancellation state. Each `plan-id` gets its own generation counter
+/// and notifier, so cancelling one key never wakes waiters on another.
+#[derive(Default)]
+struct CancelKey {
+    generation: u64,
+    notify: Arc<Notify>,
+}
+
 struct WorkloadBroker {
     next_client_id: u64,
-    cancel_generation: u64,
-    cancel_notify: Arc<Notify>,
+    cancels: HashMap<String, CancelKey>,
     tx: broadcast::Sender<String>,
     clients: HashMap<u64, Arc<Mutex<broadcast::Receiver<String>>>>,
 }
@@ -39,8 +46,7 @@ impl Default for WorkloadBroker {
         let (tx, _rx) = broadcast::channel(BROKER_CHANNEL_CAPACITY);
         Self {
             next_client_id: 1,
-            cancel_generation: 0,
-            cancel_notify: Arc::new(Notify::new()),
+            cancels: HashMap::new(),
             tx,
             clients: HashMap::new(),
         }
@@ -96,7 +102,7 @@ impl<'a> bindings::betty_blocks::stream_broker::broker::Host for ActiveCtx<'a> {
         Ok(())
     }
 
-    async fn request_cancel(&mut self) -> wasmtime::Result<u64> {
+    async fn request_cancel(&mut self, key: String) -> wasmtime::Result<u64> {
         let (workloads_arc, workload_id) = {
             let Some(plugin) = self.get_plugin::<StreamBroker>(PLUGIN_STREAM_BROKER_ID) else {
                 wasmtime::bail!("StreamBroker plugin not found in context");
@@ -106,12 +112,13 @@ impl<'a> bindings::betty_blocks::stream_broker::broker::Host for ActiveCtx<'a> {
 
         let mut workloads = workloads_arc.write().await;
         let broker = workloads.entry(workload_id).or_default();
-        broker.cancel_generation = broker.cancel_generation.saturating_add(1).max(1);
-        broker.cancel_notify.notify_waiters();
-        Ok(broker.cancel_generation)
+        let cancel = broker.cancels.entry(key).or_default();
+        cancel.generation = cancel.generation.saturating_add(1).max(1);
+        cancel.notify.notify_waiters();
+        Ok(cancel.generation)
     }
 
-    async fn cancel_generation(&mut self) -> wasmtime::Result<u64> {
+    async fn cancel_generation(&mut self, key: String) -> wasmtime::Result<u64> {
         let (workloads_arc, workload_id) = {
             let Some(plugin) = self.get_plugin::<StreamBroker>(PLUGIN_STREAM_BROKER_ID) else {
                 wasmtime::bail!("StreamBroker plugin not found in context");
@@ -123,7 +130,8 @@ impl<'a> bindings::betty_blocks::stream_broker::broker::Host for ActiveCtx<'a> {
             .read()
             .await
             .get(&workload_id)
-            .map(|broker| broker.cancel_generation)
+            .and_then(|broker| broker.cancels.get(&key))
+            .map(|cancel| cancel.generation)
             .unwrap_or_default())
     }
 }
@@ -137,6 +145,7 @@ impl<'a> bindings::betty_blocks::stream_broker::broker::Host for ActiveCtx<'a> {
 impl bindings::betty_blocks::stream_broker::broker::HostWithStore for SharedCtx {
     async fn wait_cancel_after<T: 'static>(
         accessor: &wasmtime::component::Accessor<T, Self>,
+        key: String,
         generation: u64,
     ) -> wasmtime::Result<u64> {
         let (workloads_arc, workload_id) = accessor.with(|mut access| {
@@ -153,10 +162,8 @@ impl bindings::betty_blocks::stream_broker::broker::HostWithStore for SharedCtx 
             let (current_generation, notified) = {
                 let mut workloads = workloads_arc.write().await;
                 let broker = workloads.entry(workload_id.clone()).or_default();
-                (
-                    broker.cancel_generation,
-                    broker.cancel_notify.clone().notified_owned(),
-                )
+                let cancel = broker.cancels.entry(key.clone()).or_default();
+                (cancel.generation, cancel.notify.clone().notified_owned())
             };
 
             if current_generation > generation {

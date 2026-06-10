@@ -114,7 +114,7 @@ impl CliCommand for WashCliCommand {
     }
 }
 
-#[tokio::main]
+#[tokio::main(flavor = "multi_thread", worker_threads = 64)]
 async fn main() {
     let global_parser = Cli::command_for_update()
         .arg_required_else_help(false)

@@ -881,7 +881,7 @@ impl EngineBuilder {
             if use_pooling_allocator && let Ok(true) = is_pooling_allocator_supported() {
                 tracing::debug!("using pooling allocator by default");
                 cfg.allocation_strategy(wasmtime::InstanceAllocationStrategy::Pooling(
-                    new_pooling_config(self.max_instances.unwrap_or(1000)),
+                    new_pooling_config(self.max_instances.unwrap_or(2000)),
                 ));
             } else if use_pooling_allocator {
                 tracing::warn!("pooling allocator requested but not supported");
