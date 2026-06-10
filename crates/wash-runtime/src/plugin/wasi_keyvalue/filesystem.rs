@@ -78,7 +78,7 @@ impl FilesystemKeyValue {
 
 // Implementation for the store interface
 impl<'a> bindings::wasi::keyvalue::store::Host for ActiveCtx<'a> {
-    #[instrument(skip(self))]
+    #[instrument(name = "wasi.keyvalue.open", skip(self))]
     async fn open(
         &mut self,
         identifier: String,
@@ -111,7 +111,7 @@ impl<'a> bindings::wasi::keyvalue::store::Host for ActiveCtx<'a> {
 
 // Resource host trait implementations for bucket
 impl<'a> bindings::wasi::keyvalue::store::HostBucket for ActiveCtx<'a> {
-    #[instrument(skip(self, bucket))]
+    #[instrument(name = "wasi.keyvalue.get", skip(self, bucket))]
     async fn get(
         &mut self,
         bucket: Resource<BucketHandle>,
@@ -133,14 +133,14 @@ impl<'a> bindings::wasi::keyvalue::store::HostBucket for ActiveCtx<'a> {
             Ok(entry) => Some(entry.to_vec()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
             Err(e) => {
-                return Ok(Err(StoreError::Other(format!("Filesystem error: {}", e))));
+                return Ok(Err(StoreError::Other(format!("Filesystem error: {e}"))));
             }
         };
 
         Ok(Ok(entry))
     }
 
-    #[instrument(skip(self, bucket, value))]
+    #[instrument(name = "wasi.keyvalue.set", skip(self, bucket, value))]
     async fn set(
         &mut self,
         bucket: Resource<BucketHandle>,
@@ -164,12 +164,12 @@ impl<'a> bindings::wasi::keyvalue::store::HostBucket for ActiveCtx<'a> {
             Ok(_) => Ok(Ok(())),
             Err(e) => {
                 tracing::error!("Filesystem error setting key: {}", e);
-                Ok(Err(StoreError::Other(format!("Filesystem error: {}", e))))
+                Ok(Err(StoreError::Other(format!("Filesystem error: {e}"))))
             }
         }
     }
 
-    #[instrument(skip(self, bucket))]
+    #[instrument(name = "wasi.keyvalue.delete", skip(self, bucket))]
     async fn delete(
         &mut self,
         bucket: Resource<BucketHandle>,
@@ -191,12 +191,12 @@ impl<'a> bindings::wasi::keyvalue::store::HostBucket for ActiveCtx<'a> {
             Ok(_) => Ok(Ok(())),
             Err(e) => {
                 tracing::error!("Filesystem error deleting key: {}", e);
-                Ok(Err(StoreError::Other(format!("Filesystem error: {}", e))))
+                Ok(Err(StoreError::Other(format!("Filesystem error: {e}"))))
             }
         }
     }
 
-    #[instrument(skip(self, bucket))]
+    #[instrument(name = "wasi.keyvalue.exists", skip(self, bucket))]
     async fn exists(
         &mut self,
         bucket: Resource<BucketHandle>,
@@ -223,7 +223,7 @@ impl<'a> bindings::wasi::keyvalue::store::HostBucket for ActiveCtx<'a> {
         Ok(Ok(path.exists()))
     }
 
-    #[instrument(skip(self, bucket))]
+    #[instrument(name = "wasi.keyvalue.list_keys", skip(self, bucket))]
     async fn list_keys(
         &mut self,
         bucket: Resource<BucketHandle>,
@@ -242,7 +242,7 @@ impl<'a> bindings::wasi::keyvalue::store::HostBucket for ActiveCtx<'a> {
             Ok(i) => i,
             Err(e) => {
                 tracing::error!("Filesystem error getting key: {}", e);
-                return Ok(Err(StoreError::Other(format!("Filesystem error: {}", e))));
+                return Ok(Err(StoreError::Other(format!("Filesystem error: {e}"))));
             }
         };
 
@@ -287,7 +287,7 @@ impl<'a> bindings::wasi::keyvalue::store::HostBucket for ActiveCtx<'a> {
 
 // Implementation for the atomics interface
 impl<'a> bindings::wasi::keyvalue::atomics::Host for ActiveCtx<'a> {
-    #[instrument(skip(self, bucket))]
+    #[instrument(name = "wasi.keyvalue.increment", skip(self, bucket))]
     async fn increment(
         &mut self,
         bucket: Resource<BucketHandle>,
@@ -311,7 +311,7 @@ impl<'a> bindings::wasi::keyvalue::atomics::Host for ActiveCtx<'a> {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
             Err(e) => {
                 tracing::error!("Filesystem error getting key entry: {}", e);
-                return Ok(Err(StoreError::Other(format!("Filesystem error: {}", e))));
+                return Ok(Err(StoreError::Other(format!("Filesystem error: {e}"))));
             }
         };
 
@@ -321,7 +321,7 @@ impl<'a> bindings::wasi::keyvalue::atomics::Host for ActiveCtx<'a> {
             Ok(_) => Ok(Ok(new_value)),
             Err(e) => {
                 tracing::error!("Filesystem error putting key: {}", e);
-                Ok(Err(StoreError::Other(format!("Filesystem error: {}", e))))
+                Ok(Err(StoreError::Other(format!("Filesystem error: {e}"))))
             }
         }
     }
@@ -329,7 +329,7 @@ impl<'a> bindings::wasi::keyvalue::atomics::Host for ActiveCtx<'a> {
 
 // Implementation for the batch interface
 impl<'a> bindings::wasi::keyvalue::batch::Host for ActiveCtx<'a> {
-    #[instrument(skip(self, bucket, keys))]
+    #[instrument(name = "wasi.keyvalue.get_many", skip(self, bucket, keys))]
     #[allow(clippy::type_complexity)]
     async fn get_many(
         &mut self,
@@ -354,7 +354,7 @@ impl<'a> bindings::wasi::keyvalue::batch::Host for ActiveCtx<'a> {
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
                 Err(e) => {
                     tracing::error!("JetStream error getting key: {}", e);
-                    Err(StoreError::Other(format!("JetStream error: {}", e)))
+                    Err(StoreError::Other(format!("JetStream error: {e}")))
                 }
             }
         }))
@@ -373,7 +373,7 @@ impl<'a> bindings::wasi::keyvalue::batch::Host for ActiveCtx<'a> {
         Ok(Ok(result))
     }
 
-    #[instrument(skip(self, bucket, key_values))]
+    #[instrument(name = "wasi.keyvalue.set_many", skip(self, bucket, key_values))]
     async fn set_many(
         &mut self,
         bucket: Resource<BucketHandle>,
@@ -397,7 +397,7 @@ impl<'a> bindings::wasi::keyvalue::batch::Host for ActiveCtx<'a> {
                     Ok(_) => Ok(()),
                     Err(e) => {
                         tracing::error!("JetStream error putting key: {}", e);
-                        Err(StoreError::Other(format!("JetStream error: {}", e)))
+                        Err(StoreError::Other(format!("JetStream error: {e}")))
                     }
                 }
             },
@@ -415,7 +415,7 @@ impl<'a> bindings::wasi::keyvalue::batch::Host for ActiveCtx<'a> {
         Ok(Ok(()))
     }
 
-    #[instrument(skip(self, bucket, keys))]
+    #[instrument(name = "wasi.keyvalue.delete_many", skip(self, bucket, keys))]
     async fn delete_many(
         &mut self,
         bucket: Resource<BucketHandle>,
@@ -438,7 +438,7 @@ impl<'a> bindings::wasi::keyvalue::batch::Host for ActiveCtx<'a> {
                 Ok(_) => Ok(()),
                 Err(e) => {
                     tracing::error!("JetStream error deleting key: {}", e);
-                    Err(StoreError::Other(format!("JetStream error: {}", e)))
+                    Err(StoreError::Other(format!("JetStream error: {e}")))
                 }
             }
         }))

@@ -39,6 +39,50 @@ pub struct WitConfig {
     pub sources: HashMap<String, String>,
 }
 
+impl WitConfig {
+    pub fn validate(&self, project_dir: &Path) -> anyhow::Result<()> {
+        let mut errors: Vec<String> = Vec::new();
+
+        for reg in &self.registries {
+            if let Err(err) = Url::parse(&reg.url) {
+                errors.push(format!(
+                    "wit.registries entry '{}' is not a valid URL: {}",
+                    reg.url, err
+                ));
+            }
+        }
+
+        for (target, source) in &self.sources {
+            if target.trim().is_empty() {
+                errors.push("wit.sources contains an entry with empty target key".to_string());
+            }
+
+            if source.trim().is_empty() {
+                errors.push(format!("wit.sources['{target}'] has an empty source value"));
+                continue;
+            }
+
+            if let RegistryPullSource::LocalPath(_) = detect_source_type(source) {
+                let resolved = project_dir.join(source);
+                let exists = resolved.exists();
+
+                if !exists {
+                    errors.push(format!(
+                        "wit.sources['{target}'] local path '{}' does not exist",
+                        resolved.display()
+                    ));
+                }
+            }
+        }
+
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            anyhow::bail!("{}", errors.join("\n"))
+        }
+    }
+}
+
 /// Default WIT registries (just the standard wasm.pkg registry)
 fn default_wit_registries() -> Vec<WitRegistry> {
     // TODO(#1): bring BCA + wasmcloud here.
@@ -78,7 +122,7 @@ impl TryFrom<RegistryPullSource> for RegistryMapping {
     fn try_from(source: RegistryPullSource) -> Result<Self, Self::Error> {
         match source {
             RegistryPullSource::RemoteOci(url) => Ok(RegistryMapping::Registry(url.parse()?)),
-            _ => bail!("Cannot convert {:?} to RegistryMapping", source),
+            _ => bail!("Cannot convert {source:?} to RegistryMapping"),
         }
     }
 }
@@ -249,13 +293,13 @@ impl WkgFetcher {
                 RegistryPullSource::RemoteHttp(_) => {
                     let wit_dir = download_and_extract_http(source)
                         .await
-                        .with_context(|| format!("failed to download HTTP source [{}]", source))?;
+                        .with_context(|| format!("failed to download HTTP source [{source}]"))?;
                     set_override_for_target(wkg_config_overrides, &ns, &pkgs, wit_dir);
                 }
                 RegistryPullSource::RemoteGit(_) => {
                     let wit_dir = clone_git_and_find_wit(source)
                         .await
-                        .with_context(|| format!("failed to clone Git source [{}]", source))?;
+                        .with_context(|| format!("failed to clone Git source [{source}]"))?;
                     set_override_for_target(wkg_config_overrides, &ns, &pkgs, wit_dir);
                 }
                 RegistryPullSource::RemoteOci(_) => {
@@ -330,7 +374,7 @@ impl WkgFetcher {
 
 /// Detect source type from string format
 fn detect_source_type(source: &str) -> RegistryPullSource {
-    if source.starts_with("git+") || source.contains(".git") {
+    if is_git_source(source) {
         RegistryPullSource::RemoteGit(source.to_string())
     } else if source.starts_with("http://") || source.starts_with("https://") {
         RegistryPullSource::RemoteHttp(source.to_string())
@@ -341,6 +385,21 @@ fn detect_source_type(source: &str) -> RegistryPullSource {
         // Default to local path
         RegistryPullSource::LocalPath(source.to_string())
     }
+}
+
+/// Heuristic for detecting a Git source URL.
+///
+/// A bare `.contains(".git")` is too eager — it misclassifies OCI registries
+/// whose hostname happens to include `.git`, such as `registry.gitlab.com`.
+/// Treat a source as Git only when it uses a Git-specific scheme/form or its
+/// resource path ends with `.git` (optionally followed by a `#<ref>` fragment).
+fn is_git_source(source: &str) -> bool {
+    if source.starts_with("git+") || source.starts_with("git@") {
+        return true;
+    }
+    // Strip any `#<ref>` fragment and trailing slash, then look for a `.git` suffix.
+    let without_fragment = source.split('#').next().unwrap_or(source);
+    without_fragment.trim_end_matches('/').ends_with(".git")
 }
 
 /// Parse a WIT package name into namespace, packages, and version
@@ -388,7 +447,7 @@ fn set_override_for_target(
     } else {
         // Package-level override: "namespace:package" = { path = "..." }
         for package in packages {
-            let key = format!("{}:{}", namespace, package);
+            let key = format!("{namespace}:{package}");
             overrides.insert(
                 key,
                 Override {
@@ -402,10 +461,10 @@ fn set_override_for_target(
 
 /// Download and extract HTTP tar.gz source
 async fn download_and_extract_http(url: &str) -> Result<PathBuf> {
-    let parsed_url = Url::parse(url).with_context(|| format!("invalid HTTP URL [{}]", url))?;
+    let parsed_url = Url::parse(url).with_context(|| format!("invalid HTTP URL [{url}]"))?;
 
     let tempdir = tempfile::tempdir()
-        .with_context(|| format!("failed to create temp dir for downloading [{}]", url))?
+        .with_context(|| format!("failed to create temp dir for downloading [{url}]"))?
         .keep();
 
     let output_path = tempdir.join("unpacked");
@@ -419,19 +478,19 @@ async fn download_and_extract_http(url: &str) -> Result<PathBuf> {
         .get(parsed_url)
         .send()
         .await
-        .with_context(|| format!("failed to download from URL [{}]", url))?;
+        .with_context(|| format!("failed to download from URL [{url}]"))?;
 
     let bytes = response
         .bytes()
         .await
-        .with_context(|| format!("failed to read response from URL [{}]", url))?;
+        .with_context(|| format!("failed to read response from URL [{url}]"))?;
 
     // Extract tar.gz
     let decoder = flate2::read::GzDecoder::new(&bytes[..]);
     let mut archive = tar::Archive::new(decoder);
     archive
         .unpack(&output_path)
-        .with_context(|| format!("failed to unpack archive from URL [{}]", url))?;
+        .with_context(|| format!("failed to unpack archive from URL [{url}]"))?;
 
     find_wit_folder_in_path(&output_path).await
 }
@@ -439,7 +498,7 @@ async fn download_and_extract_http(url: &str) -> Result<PathBuf> {
 /// Clone git repository and find WIT directory
 async fn clone_git_and_find_wit(url: &str) -> Result<PathBuf> {
     let tempdir = tempfile::tempdir()
-        .with_context(|| format!("failed to create temp dir for cloning [{}]", url))?
+        .with_context(|| format!("failed to create temp dir for cloning [{url}]"))?
         .keep();
 
     // Parse git URL to handle git+ prefix
@@ -462,11 +521,11 @@ async fn clone_git_and_find_wit(url: &str) -> Result<PathBuf> {
     let output = cmd
         .output()
         .await
-        .with_context(|| format!("failed to execute git clone command for [{}]", git_url))?;
+        .with_context(|| format!("failed to execute git clone command for [{git_url}]"))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!("Git clone failed for [{}]: {}", git_url, stderr);
+        bail!("Git clone failed for [{git_url}]: {stderr}");
     }
 
     debug!(url = git_url, "successfully cloned git repository");
@@ -597,7 +656,29 @@ mod tests {
             RegistryPullSource::RemoteGit(_)
         ));
         assert!(matches!(
+            detect_source_type("git@github.com:user/repo.git"),
+            RegistryPullSource::RemoteGit(_)
+        ));
+        assert!(matches!(
+            detect_source_type("https://github.com/user/repo.git"),
+            RegistryPullSource::RemoteGit(_)
+        ));
+        assert!(matches!(
+            detect_source_type("https://github.com/user/repo.git#main"),
+            RegistryPullSource::RemoteGit(_)
+        ));
+        assert!(matches!(
             detect_source_type("ghcr.io/user/package"),
+            RegistryPullSource::RemoteOci(_)
+        ));
+        // Regression: OCI registries whose hostname contains `.git` must not be
+        // misclassified as Git sources (see wasmCloud/wasmCloud#5194).
+        assert!(matches!(
+            detect_source_type("registry.gitlab.com/group/project/wasm-component:1.0.0"),
+            RegistryPullSource::RemoteOci(_)
+        ));
+        assert!(matches!(
+            detect_source_type("registry.gitlab.com/group/project/wasm-component"),
             RegistryPullSource::RemoteOci(_)
         ));
     }
@@ -659,5 +740,136 @@ mod tests {
             config.sources["wasi:config"],
             "https://example.com/config.tar.gz"
         );
+    }
+
+    fn empty_wit() -> WitConfig {
+        WitConfig {
+            registries: vec![],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn wit_default_with_no_sources_is_ok() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(empty_wit().validate(tmp.path()).is_ok());
+    }
+
+    #[test]
+    fn wit_invalid_registry_url_is_err() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = WitConfig {
+            registries: vec![WitRegistry {
+                url: "not a url".to_string(),
+                token: None,
+            }],
+            ..Default::default()
+        };
+        let err = cfg.validate(tmp.path()).unwrap_err().to_string();
+        assert!(err.contains("wit.registries"));
+    }
+
+    #[test]
+    fn wit_valid_registry_url_is_ok() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = WitConfig {
+            registries: vec![WitRegistry {
+                url: "https://wasm.pkg".to_string(),
+                token: None,
+            }],
+            ..Default::default()
+        };
+        assert!(cfg.validate(tmp.path()).is_ok());
+    }
+
+    #[test]
+    fn wit_empty_source_key_is_err() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cfg = empty_wit();
+        cfg.sources
+            .insert("  ".to_string(), "./local/wit".to_string());
+        let err = cfg.validate(tmp.path()).unwrap_err().to_string();
+        assert!(err.contains("empty target key"));
+    }
+
+    #[test]
+    fn wit_empty_source_value_is_err() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cfg = empty_wit();
+        cfg.sources
+            .insert("wasi:http".to_string(), "  ".to_string());
+        let err = cfg.validate(tmp.path()).unwrap_err().to_string();
+        assert!(err.contains("empty source value"));
+    }
+
+    #[test]
+    fn wit_local_path_missing_is_err() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cfg = empty_wit();
+        cfg.sources
+            .insert("example:local".to_string(), "./does-not-exist".to_string());
+        let err = cfg.validate(tmp.path()).unwrap_err().to_string();
+        assert!(err.contains("does not exist"));
+    }
+
+    #[test]
+    fn wit_local_path_exists_is_ok() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wit_dir = tmp.path().join("my-wit");
+        std::fs::create_dir_all(&wit_dir).unwrap();
+        let mut cfg = empty_wit();
+        cfg.sources
+            .insert("example:local".to_string(), "my-wit".to_string());
+        assert!(cfg.validate(tmp.path()).is_ok());
+    }
+
+    #[test]
+    fn wit_http_source_not_validated() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cfg = empty_wit();
+        cfg.sources.insert(
+            "example:http".to_string(),
+            "https://example.com/nonexistent.tar.gz".to_string(),
+        );
+        assert!(cfg.validate(tmp.path()).is_ok());
+    }
+
+    #[test]
+    fn wit_git_source_not_validated() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cfg = empty_wit();
+        cfg.sources.insert(
+            "example:git".to_string(),
+            "git+https://github.com/nonexistent/repo.git".to_string(),
+        );
+        assert!(cfg.validate(tmp.path()).is_ok());
+    }
+
+    #[test]
+    fn wit_oci_source_not_validated() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cfg = empty_wit();
+        cfg.sources.insert(
+            "example:oci".to_string(),
+            "ghcr.io/nonexistent/pkg".to_string(),
+        );
+        assert!(cfg.validate(tmp.path()).is_ok());
+    }
+
+    #[test]
+    fn wit_multiple_errors_are_all_reported() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cfg = WitConfig {
+            registries: vec![WitRegistry {
+                url: "bad url".to_string(),
+                token: None,
+            }],
+            ..Default::default()
+        };
+        cfg.sources
+            .insert("wasi:http".to_string(), "./missing-path".to_string());
+        let err = cfg.validate(tmp.path()).unwrap_err().to_string();
+        assert!(err.contains("wit.registries"), "missing registry error");
+        assert!(err.contains("does not exist"), "missing path error");
     }
 }

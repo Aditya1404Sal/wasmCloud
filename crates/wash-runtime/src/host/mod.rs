@@ -62,6 +62,7 @@ use crate::wit::{WitInterface, WitWorld};
 mod sysinfo;
 use sysinfo::SystemMonitor;
 
+pub mod allowed_hosts;
 pub mod http;
 #[cfg(feature = "wasip3")]
 pub mod http_p3;
@@ -168,7 +169,7 @@ impl std::fmt::Display for HostWorkload {
             HostWorkload::Starting => write!(f, "Starting"),
             HostWorkload::Running(_) => write!(f, "Running"),
             HostWorkload::Stopping => write!(f, "Stopping"),
-            HostWorkload::Error(err) => write!(f, "Error: {}", err),
+            HostWorkload::Error(err) => write!(f, "Error: {err}"),
         }
     }
 }
@@ -483,6 +484,8 @@ impl Host {
             "wasi:filesystem/preopens,types@0.2.0".into(),
             "wasi:random/insecure-seed,insecure,random@0.2.0".into(),
             "wasi:sockets/instance-network,ip-name-lookup,network,tcp-create-socket,tcp,udp-create-socket,udp@0.2.0".into(),
+            #[cfg(feature = "wasi-tls")]
+            "wasi:tls/client,types@0.3.0-draft".into(),
         ]);
 
         // Include imports and exports that plugins specify

@@ -15,6 +15,7 @@ use crate::plugin::HostPlugin;
 use crate::wit::{WitInterface, WitWorld};
 use futures::StreamExt;
 use redis::AsyncCommands;
+use tracing::instrument;
 use wasmtime::component::Resource;
 
 const LIST_KEYS_BATCH_SIZE: usize = 1000;
@@ -90,6 +91,7 @@ impl RedisKeyValue {
 
 // Implementation for the store interface
 impl<'a> bindings::wasi::keyvalue::store::Host for ActiveCtx<'a> {
+    #[instrument(name = "wasi.keyvalue.open", skip(self))]
     async fn open(
         &mut self,
         identifier: String,
@@ -123,6 +125,7 @@ impl<'a> bindings::wasi::keyvalue::store::Host for ActiveCtx<'a> {
 
 // Resource host trait implementations for bucket
 impl<'a> bindings::wasi::keyvalue::store::HostBucket for ActiveCtx<'a> {
+    #[instrument(name = "wasi.keyvalue.get", skip(self, bucket))]
     async fn get(
         &mut self,
         bucket: Resource<BucketHandle>,
@@ -143,11 +146,12 @@ impl<'a> bindings::wasi::keyvalue::store::HostBucket for ActiveCtx<'a> {
             Ok(value) => Ok(Ok(value)),
             Err(e) => {
                 tracing::error!("Redis error getting key: {}", e);
-                Ok(Err(StoreError::Other(format!("Redis error: {}", e))))
+                Ok(Err(StoreError::Other(format!("Redis error: {e}"))))
             }
         }
     }
 
+    #[instrument(name = "wasi.keyvalue.set", skip(self, bucket, value))]
     async fn set(
         &mut self,
         bucket: Resource<BucketHandle>,
@@ -169,11 +173,12 @@ impl<'a> bindings::wasi::keyvalue::store::HostBucket for ActiveCtx<'a> {
             Ok(_) => Ok(Ok(())),
             Err(e) => {
                 tracing::error!("Redis error setting key: {}", e);
-                Ok(Err(StoreError::Other(format!("Redis error: {}", e))))
+                Ok(Err(StoreError::Other(format!("Redis error: {e}"))))
             }
         }
     }
 
+    #[instrument(name = "wasi.keyvalue.delete", skip(self, bucket))]
     async fn delete(
         &mut self,
         bucket: Resource<BucketHandle>,
@@ -194,11 +199,12 @@ impl<'a> bindings::wasi::keyvalue::store::HostBucket for ActiveCtx<'a> {
             Ok(_) => Ok(Ok(())),
             Err(e) => {
                 tracing::error!("Redis error deleting key: {}", e);
-                Ok(Err(StoreError::Other(format!("Redis error: {}", e))))
+                Ok(Err(StoreError::Other(format!("Redis error: {e}"))))
             }
         }
     }
 
+    #[instrument(name = "wasi.keyvalue.exists", skip(self, bucket))]
     async fn exists(
         &mut self,
         bucket: Resource<BucketHandle>,
@@ -219,11 +225,12 @@ impl<'a> bindings::wasi::keyvalue::store::HostBucket for ActiveCtx<'a> {
             Ok(exists) => Ok(Ok(exists)),
             Err(e) => {
                 tracing::error!("Redis error checking key existence: {}", e);
-                Ok(Err(StoreError::Other(format!("Redis error: {}", e))))
+                Ok(Err(StoreError::Other(format!("Redis error: {e}"))))
             }
         }
     }
 
+    #[instrument(name = "wasi.keyvalue.list_keys", skip(self, bucket))]
     async fn list_keys(
         &mut self,
         bucket: Resource<BucketHandle>,
@@ -253,7 +260,7 @@ impl<'a> bindings::wasi::keyvalue::store::HostBucket for ActiveCtx<'a> {
             Ok(result) => result,
             Err(e) => {
                 tracing::error!("Redis error listing keys: {}", e);
-                return Ok(Err(StoreError::Other(format!("Redis error: {}", e))));
+                return Ok(Err(StoreError::Other(format!("Redis error: {e}"))));
             }
         };
 
@@ -291,6 +298,7 @@ impl<'a> bindings::wasi::keyvalue::store::HostBucket for ActiveCtx<'a> {
 // Atomics use Redis' native INCRBY for atomic increment, storing values as
 // Redis integer strings rather than big-endian bytes.
 impl<'a> bindings::wasi::keyvalue::atomics::Host for ActiveCtx<'a> {
+    #[instrument(name = "wasi.keyvalue.increment", skip(self, bucket))]
     async fn increment(
         &mut self,
         bucket: Resource<BucketHandle>,
@@ -314,7 +322,7 @@ impl<'a> bindings::wasi::keyvalue::atomics::Host for ActiveCtx<'a> {
             Ok(new_value) => Ok(Ok(new_value as u64)),
             Err(e) => {
                 tracing::error!("Redis error incrementing key: {}", e);
-                Ok(Err(StoreError::Other(format!("Redis error: {}", e))))
+                Ok(Err(StoreError::Other(format!("Redis error: {e}"))))
             }
         }
     }
@@ -322,6 +330,8 @@ impl<'a> bindings::wasi::keyvalue::atomics::Host for ActiveCtx<'a> {
 
 // Implementation for the batch interface
 impl<'a> bindings::wasi::keyvalue::batch::Host for ActiveCtx<'a> {
+    #[instrument(name = "wasi.keyvalue.get_many", skip(self, bucket, keys))]
+    #[allow(clippy::type_complexity)]
     async fn get_many(
         &mut self,
         bucket: Resource<BucketHandle>,
@@ -347,7 +357,7 @@ impl<'a> bindings::wasi::keyvalue::batch::Host for ActiveCtx<'a> {
             Ok(v) => v,
             Err(e) => {
                 tracing::error!("Redis error getting keys: {}", e);
-                return Ok(Err(StoreError::Other(format!("Redis error: {}", e))));
+                return Ok(Err(StoreError::Other(format!("Redis error: {e}"))));
             }
         };
 
@@ -360,6 +370,7 @@ impl<'a> bindings::wasi::keyvalue::batch::Host for ActiveCtx<'a> {
         Ok(Ok(result))
     }
 
+    #[instrument(name = "wasi.keyvalue.set_many", skip(self, bucket, key_values))]
     async fn set_many(
         &mut self,
         bucket: Resource<BucketHandle>,
@@ -388,11 +399,12 @@ impl<'a> bindings::wasi::keyvalue::batch::Host for ActiveCtx<'a> {
             Ok(_) => Ok(Ok(())),
             Err(e) => {
                 tracing::error!("Redis error setting keys: {}", e);
-                Ok(Err(StoreError::Other(format!("Redis error: {}", e))))
+                Ok(Err(StoreError::Other(format!("Redis error: {e}"))))
             }
         }
     }
 
+    #[instrument(name = "wasi.keyvalue.delete_many", skip(self, bucket, keys))]
     async fn delete_many(
         &mut self,
         bucket: Resource<BucketHandle>,
@@ -415,7 +427,7 @@ impl<'a> bindings::wasi::keyvalue::batch::Host for ActiveCtx<'a> {
                     Ok(_) => Ok(()),
                     Err(e) => {
                         tracing::error!("Redis error deleting key: {}", e);
-                        Err(StoreError::Other(format!("Redis error: {}", e)))
+                        Err(StoreError::Other(format!("Redis error: {e}")))
                     }
                 }
             }

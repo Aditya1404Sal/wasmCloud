@@ -3,8 +3,6 @@
 //! Tests HTTP request handling, counter persistence, concurrent access,
 //! error handling, and plugin isolation.
 
-#![allow(clippy::unwrap_used, clippy::expect_used)]
-
 use anyhow::{Context, Result};
 use std::{collections::HashMap, time::Duration};
 use tokio::time::timeout;
@@ -50,7 +48,8 @@ async fn test_http_counter_integration() -> Result<()> {
             ]),
             environment: HashMap::new(),
             volume_mounts: vec![],
-            allowed_hosts: Default::default(),
+            // http-counter calls example.com
+            allowed_hosts: vec!["example.com".parse().unwrap()].into(),
         },
     );
 

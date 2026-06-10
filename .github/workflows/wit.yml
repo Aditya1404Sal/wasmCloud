@@ -1,0 +1,324 @@
+name: wit
+
+# Validates and publishes wasmCloud WIT interface packages from `wit/`.
+# Each top-level subdirectory of `wit/` is one publishable package whose
+# OCI tag is the version declared in its `package <ns>:<name>@<ver>;`
+# header — independent of the monorepo's `vX.Y.Z` release cadence.
+#
+# Destination: ghcr.io/wasmcloud/interfaces/<name>:<version>
+# (the matrix builder enforces `<ns>` == `wasmcloud`).
+#
+# Pipeline:
+#   validate  for each wit/<pkg>/: round-trips the WIT through
+#             wasm-tools as an independent sanity check, builds the
+#             component with `wash wit build`, enriches it with
+#             provenance via `wasm-tools metadata add` (source repo,
+#             commit SHA, license, etc.), asserts wit/<pkg>/wkg.lock
+#             is committed and in sync, and uploads the enriched wasm
+#             bundle as a workflow artifact. Emits a matrix describing
+#             the packages.
+#   publish   matrix-fans over validate's output (one job per package);
+#             downloads the exact wasm validate built, pushes it via
+#             `wash oci push` (which translates the embedded wasm
+#             metadata into `org.opencontainers.image.*` annotations
+#             on the OCI manifest), and Sigstore-attests the pushed
+#             manifest digest. Stable versions (no `-` pre-release
+#             suffix) are treated as immutable: a tag that already
+#             exists at the destination is skipped, never overwritten.
+
+on:
+  pull_request:
+    branches:
+      - main
+    types: [opened, synchronize, reopened]
+  push:
+    branches:
+      - main
+    # Path filter on push so a main commit that doesn't touch WIT source
+    # (or this workflow) doesn't pay the validate + matrix + per-package
+    # publish cost. PR triggers stay broad so dorny/paths-filter in the
+    # `changes` job can drive the status gate uniformly — required-check
+    # users always see a result.
+    paths:
+      - '.github/workflows/wit.yml'
+      - 'wit/**'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions: {}
+
+# Pinned wasm-tools version. Bare semver (no leading `v`).
+# Kept in sync by .github/workflows/wit-tools-bump.yml, which opens a
+# weekly PR when upstream publishes a new stable release.
+env:
+  WASM_TOOLS_VERSION: '1.248.0'
+
+jobs:
+  changes:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      relevant: ${{ steps.filter.outputs.relevant }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: dorny/paths-filter@fbd0ab8f3e69293af611ebaee6363fc25e6d187d # v4.0.1
+        id: filter
+        with:
+          filters: |
+            relevant:
+              - '.github/workflows/wit.yml'
+              - 'wit/**'
+
+  validate:
+    needs:
+      - changes
+    if: always() && (needs.changes.result == 'skipped' || needs.changes.outputs.relevant == 'true')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      matrix: ${{ steps.list.outputs.matrix }}
+      has_packages: ${{ steps.list.outputs.has_packages }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Setup wasm-tools
+        uses: bytecodealliance/actions/wasm-tools/setup@9152e710e9f7182e4c29ad218e4f335a7b203613 # v1.1.3
+        with:
+          version: ${{ env.WASM_TOOLS_VERSION }}
+
+      - uses: wasmcloud/setup-wash-action@47756fa211cc82f392c57e39504f43ef46fc0b3e # v2.1.0
+
+      - name: Build and validate each WIT package
+        # Layout (per `wash wit build`'s convention):
+        #   wit/<pkg>/
+        #     wit/world.wit   ← WIT source
+        #     wkg.lock        ← lock file at project root
+        # For each <pkg>: wasm-tools round-trips the WIT source as an
+        # independent sanity check, then `wash wit build` produces the
+        # canonical component (wash uses the wasm-pkg-tools library, so
+        # the wkg.lock format is unchanged from any prior wkg builds).
+        # The raw wasm is then enriched with provenance metadata via
+        # `wasm-tools metadata add`; those fields are surfaced as
+        # `org.opencontainers.image.*` annotations by `wash oci push`
+        # because both read/write the same wasm_metadata custom section.
+        # The enriched bytes are what we upload + attest + push, so the
+        # attestation covers the annotations too.
+        env:
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          PKGS=(wit/*/)
+          if (( ${#PKGS[@]} == 0 )); then
+            echo "no WIT packages under wit/ — nothing to validate"
+            exit 0
+          fi
+          mkdir -p wit-build/.roundtrip
+          BUILD_ABS="$(pwd)/wit-build"
+          for pkg in "${PKGS[@]}"; do
+            name=$(basename "${pkg}")
+            wit_dir="${pkg}wit"
+            echo "::group::wasm-tools component wit ${wit_dir}"
+            wasm-tools component wit "${wit_dir}"
+            echo "::endgroup::"
+            echo "::group::wasm-tools component wit ${wit_dir} --wasm (round-trip)"
+            wasm-tools component wit "${wit_dir}" --wasm --output "${BUILD_ABS}/.roundtrip/${name}.wasm"
+            echo "::endgroup::"
+            echo "::group::wash wit build ${pkg}"
+            raw="$(mktemp)"
+            ( cd "${pkg}" && wash wit build --output-file "${raw}" )
+            wasm-tools metadata add "${raw}" \
+              --output "${BUILD_ABS}/${name}.wasm" \
+              --source "https://github.com/${GITHUB_REPOSITORY}" \
+              --homepage "https://wasmcloud.com" \
+              --revision "${GITHUB_SHA}" \
+              --licenses "Apache-2.0" \
+              --authors "wasmCloud Maintainers"
+            rm -f "${raw}"
+            # Belt-and-suspenders: every field we just embedded must be
+            # readable back from the wasm. If any is null/missing, `wash
+            # oci push` won't surface the corresponding OCI annotation,
+            # and the attested manifest will be missing provenance.
+            META=$(wasm-tools metadata show "${BUILD_ABS}/${name}.wasm" --json)
+            for field in name version authors licenses source homepage revision; do
+              val=$(echo "${META}" | jq -r ".component.metadata.${field} // empty")
+              if [[ -z "${val}" ]]; then
+                echo "metadata field '${field}' missing or null on ${name}.wasm" >&2
+                echo "${META}" | jq . >&2
+                exit 1
+              fi
+            done
+            echo "::endgroup::"
+          done
+
+      - name: Verify wkg.lock files are committed and in sync
+        # `wash wit build` writes wkg.lock at each package root (via the
+        # wasm-pkg-tools library — same file format as `wkg wit build`).
+        # We use `git status --porcelain` rather than `git diff --exit-code`
+        # so that a *new* wit/<pkg>/wkg.lock (e.g. a contributor added a
+        # brand-new package and forgot to commit its lock) also fails CI —
+        # `git diff` only reports changes against tracked files and would
+        # silently miss the untracked-lock case.
+        run: |
+          set -euo pipefail
+          PORCELAIN=$(git status --porcelain -- 'wit/*/wkg.lock')
+          if [[ -n "${PORCELAIN}" ]]; then
+            echo "${PORCELAIN}" >&2
+            echo "one or more wkg.lock files are out of sync (untracked or modified) — commit the lock file(s)" >&2
+            exit 1
+          fi
+
+      - name: Build publish matrix from built wasms
+        id: list
+        # Extracts the package id from each built wasm artifact via
+        # `wasm-tools component wit <wasm>`. wasm-tools parses the
+        # component and re-emits the WIT — the package header is the
+        # parsed/canonical form, so this is immune to source-file comment
+        # or whitespace edge cases that grep over *.wit would hit.
+        # Implementation lives in build-wit-matrix.mjs (JSON construction
+        # is easier to get right in JS than in bash string-concat).
+        run: node .github/scripts/build-wit-matrix.mjs
+
+      - name: Upload built wasm bundle
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: wit-build
+          path: wit-build/*.wasm
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    # Matrix-fans across the packages discovered by validate. Each job
+    # publishes exactly one package using the wasm bytes validate built —
+    # not a rebuild — so the attestation we record covers the same bits
+    # that passed validation.
+    # `always()` is required to break the skipped-`changes` propagation
+    # through `validate` (which uses `always()` itself to bypass the
+    # PR-only `changes` gate). Without it, this job silently skips on
+    # every main push even when `validate` succeeded.
+    if: |
+      always() &&
+      github.event_name == 'push' &&
+      github.ref == 'refs/heads/main' &&
+      needs.validate.result == 'success' &&
+      needs.validate.outputs.has_packages == 'true'
+    needs:
+      - validate
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      # actions/attest-build-provenance signs via Fulcio (id-token) and
+      # writes the bundle to the GitHub Attestations API (attestations).
+      # artifact-metadata silences a "Failed to create storage record"
+      # warning when the action also writes its org-level storage record.
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.validate.outputs.matrix) }}
+    steps:
+      # wash pushes and emits the OCI manifest digest in its JSON output
+      # (see "Push and attest" below). The destination-exists check uses
+      # `docker manifest inspect` so it shares credentials with
+      # docker/login-action.
+      - uses: wasmcloud/setup-wash-action@47756fa211cc82f392c57e39504f43ef46fc0b3e # v2.1.0
+
+      - name: Login to ghcr.io
+        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ github.token }}
+
+      - name: Download built wasm bundle
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: wit-build
+          path: wit-build
+
+      - name: Push and attest
+        id: push
+        env:
+          REF: ${{ matrix.ref }}
+          ARTIFACT: wit-build/${{ matrix.artifact }}
+          VERSION: ${{ matrix.version }}
+        run: |
+          set -euo pipefail
+          # Immutable for stable versions: if `${VERSION}` has no `-`
+          # pre-release suffix and the destination tag already exists,
+          # skip the push entirely. SemVer build metadata (`+build.42`)
+          # is correctly treated as stable. Pre-release tags (-rc.N,
+          # -draft, etc.) may be moved by re-running this workflow.
+          # Distinguish three outcomes: tag exists (skip), manifest
+          # unknown (proceed), any other error from the inspect (abort).
+          if [[ ! "${VERSION}" =~ - ]]; then
+            if INSPECT_ERR=$(docker manifest inspect "${REF}" 2>&1 >/dev/null); then
+              echo "${REF} already exists at the destination and version is stable — skipping (immutable)"
+              echo "skipped=true" >> "${GITHUB_OUTPUT}"
+              exit 0
+            elif echo "${INSPECT_ERR}" | grep -qiE 'manifest unknown|no such manifest|not found'; then
+              echo "${REF} not yet published — proceeding with push"
+            else
+              echo "destination check for ${REF} failed — refusing to push" >&2
+              echo "${INSPECT_ERR}" >&2
+              exit 1
+            fi
+          fi
+          # `wash -o json oci push` wraps the response as
+          # `{ "success": true, "data": { "digest": "sha256:…" } }`.
+          # `.digest` fallback is for older wash builds that emitted
+          # the unwrapped form.
+          PUSH_OUT=$(wash -o json oci push "${REF}" "${ARTIFACT}")
+          echo "${PUSH_OUT}"
+          DIGEST=$(echo "${PUSH_OUT}" | jq -r '.data.digest // .digest // empty')
+          if [[ -z "${DIGEST}" ]]; then
+            echo "wash oci push did not report a manifest digest for ${REF}" >&2
+            exit 1
+          fi
+          echo "digest=${DIGEST}" >> "${GITHUB_OUTPUT}"
+          echo "skipped=false" >> "${GITHUB_OUTPUT}"
+
+      - name: Attest pushed manifest
+        if: steps.push.outputs.skipped == 'false'
+        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
+        with:
+          subject-name: ghcr.io/wasmcloud/interfaces/${{ matrix.name }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
+
+  # Single pass/fail signal for required-check enforcement. Sits at the
+  # bottom so the dependency list mirrors the visual job order, and
+  # `if: !cancelled()` ensures it runs whether upstream jobs passed,
+  # failed, or got skipped (e.g. publish skips on PR events — that's
+  # "skipped", not failure). The bash check rejects only failure/cancelled.
+  # Workflow-level cancellation (e.g. concurrency cancel-in-progress)
+  # skips the gate entirely so it doesn't post a phantom failure when a
+  # newer run will report the real verdict on the same SHA.
+  gate:
+    needs:
+      - changes
+      - validate
+      - publish
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require all jobs to pass or be skipped
+        env:
+          RESULTS: ${{ toJSON(needs.*.result) }}
+        run: |
+          if echo "$RESULTS" | grep -qE '"(failure|cancelled)"'; then
+            exit 1
+          fi

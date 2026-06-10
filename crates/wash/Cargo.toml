@@ -13,6 +13,7 @@ version.workspace = true
 
 [features]
 wasip3 = ["wash-runtime/wasip3"]
+wasi-tls = ["wash-runtime/wasi-tls"]
 
 [lints]
 workspace = true
@@ -31,6 +32,7 @@ maintenance = { status = "actively-developed" }
 [dependencies]
 anyhow = { workspace = true }
 async-nats = { workspace = true }
+bon = { workspace = true }
 bytes = { workspace = true }
 chrono = { workspace = true }
 clap = { workspace = true, features = ["derive", "env", "help", "color", "suggestions", "wrap_help", "cargo", "string"] }
@@ -41,6 +43,7 @@ dialoguer = { workspace = true, features = ["editor", "password", "zeroize", "fu
 etcetera = { workspace = true }
 figment = { workspace = true, features = ["json", "env", "yaml", "toml"] }
 flate2 = { workspace = true, features = ["rust_backend"] }
+humansize = { workspace = true }
 humantime = { workspace = true }
 reqwest = { workspace = true, features = ["json", "rustls-tls"] }
 semver = { workspace = true }
@@ -48,6 +51,7 @@ serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true, features = ["std"] }
 serde_yaml_ng = { workspace = true }
 tar = { workspace = true }
+toml = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 tracing = { workspace = true, features = ["attributes"] }
@@ -64,6 +68,11 @@ wit-component = { workspace = true }
 [target.'cfg(not(target_os = "windows"))'.dependencies]
 wash-runtime = { workspace = true, features = ["wasi-webgpu"] }
 
+# `O_NOFOLLOW` for the secret-file-open hardening in `crate::workload`.
+# Unix-only. Windows has no portable equivalent.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 
 [build-dependencies]
 anyhow = { workspace = true, default-features = true }
@@ -74,6 +83,7 @@ pbjson-build = { workspace = true, default-features = true }
 bytes = { version = "1", default-features = false }
 http = { version = "1.3.1", default-features = false }
 http-body-util = { version = "0.1.3", default-features = false }
+hyper = { workspace = true }
 rcgen = { version = "0.14.7", default-features = false, features = ["crypto", "aws_lc_rs", "pem"] }
 scopeguard = { version = "1.2", default-features = false }
 tempfile = { version = "3.0", default-features = false }

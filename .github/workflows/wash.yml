@@ -4,22 +4,17 @@ on:
   pull_request:
     branches:
       - main
-    paths:
-      - ".github/workflows/wash.yml"
-      - "crates/**"
-      - "src/**"
-      - "tests/**"
-      - "Cargo.*"
-      - "rust-toolchain.toml"
-      - "rustfmt.toml"
-      - "runtime-operator/test/e2e/**"
-      - "charts/runtime-operator/**"
-      - "deploy/kind/kind-config.yaml"
   push:
     branches:
       - main
     tags:
       - "v*"
+  workflow_dispatch:
+    inputs:
+      is_release:
+        description: "Treat this run as a release: run canary-binaries, gate as if Cargo.toml had bumped. Use when re-releasing a SHA whose Cargo.toml is already at the target version, or when finalizing a release whose train run failed."
+        type: boolean
+        default: false
 
 defaults:
   run:
@@ -31,10 +26,104 @@ concurrency:
 
 permissions: {}
 
+env:
+  # Drop most DWARF; keep enough for usable backtraces. Shrinks target/ by
+  # several GB on this workspace (wasmtime, OTel, oci-client).
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+  CARGO_PROFILE_TEST_DEBUG: line-tables-only
+  # Swatinem/rust-cache doesn't cache target/<profile>/incremental, so on CI
+  # incremental artifacts are pure disk cost with no reuse.
+  CARGO_INCREMENTAL: "0"
+
 jobs:
+  changes:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      relevant: ${{ steps.filter.outputs.relevant }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: dorny/paths-filter@fbd0ab8f3e69293af611ebaee6363fc25e6d187d # v4.0.1
+        id: filter
+        with:
+          filters: |
+            relevant:
+              - '.github/workflows/wash.yml'
+              - 'crates/**'
+              - 'src/**'
+              - 'tests/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'rust-toolchain.toml'
+              - 'rustfmt.toml'
+              - 'runtime-operator/test/e2e/**'
+              - 'charts/runtime-operator/**'
+              - 'deploy/kind/kind-config.yaml'
+
+  # Detect whether this commit bumps the workspace version — the signal
+  # that "this is a release." Compare `[workspace.package].version` at
+  # HEAD against HEAD~1. workflow_dispatch can override via `is_release`
+  # input (e.g., re-releases where Cargo.toml is already at the target
+  # version, or finalizing a release whose train run failed).
+  release-detect:
+    needs:
+      - changes
+    if: always() && (needs.changes.result == 'skipped' || needs.changes.outputs.relevant == 'true')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      is_release: ${{ steps.detect.outputs.is_release }}
+      version: ${{ steps.detect.outputs.version }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+      - name: Detect workspace version bump
+        id: detect
+        env:
+          INPUT_IS_RELEASE: ${{ inputs.is_release }}
+        run: |
+          set -euo pipefail
+          read_ws_version() {
+            local src="$1"
+            if [[ "${src}" == "HEAD" ]]; then
+              cat Cargo.toml
+            else
+              git show "${src}:Cargo.toml"
+            fi | awk -F'"' '
+              /^\[workspace\.package\]/ { in_pkg = 1; next }
+              /^\[/ && !/^\[workspace\.package\]/ { in_pkg = 0 }
+              in_pkg && /^version = "/ { print $2; exit }
+            '
+          }
+          CUR=$(read_ws_version HEAD)
+          PREV=$(read_ws_version HEAD~1 2>/dev/null || true)
+          if [[ "${INPUT_IS_RELEASE}" == "true" ]]; then
+            echo "workflow_dispatch with is_release=true — treating as release"
+            echo "is_release=true" >> "${GITHUB_OUTPUT}"
+            echo "version=${CUR}" >> "${GITHUB_OUTPUT}"
+          elif [[ -n "${CUR}" && "${CUR}" != "${PREV}" ]]; then
+            echo "version bump detected: ${PREV:-<none>} → ${CUR}"
+            echo "is_release=true" >> "${GITHUB_OUTPUT}"
+            echo "version=${CUR}" >> "${GITHUB_OUTPUT}"
+          else
+            echo "no version bump (HEAD=${CUR}, HEAD~1=${PREV:-<none>}) — not a release"
+            echo "is_release=false" >> "${GITHUB_OUTPUT}"
+          fi
+
   check:
+    needs:
+      - changes
+    if: always() && (needs.changes.result == 'skipped' || needs.changes.outputs.relevant == 'true')
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 45
+    timeout-minutes: 60
     permissions:
       contents: read
     strategy:
@@ -45,25 +134,13 @@ jobs:
           - macos-latest
           - windows-latest
     steps:
-      - name: Remove unused files
-        if: ${{ matrix.os == 'ubuntu-latest' }}
-        # based on https://dev.to/mathio/squeezing-disk-space-from-github-actions-runners-an-engineers-guide-3pjg
-        run: |
-          sudo rm -rf /usr/lib/jvm
-          sudo rm -rf /usr/share/dotnet
-          sudo rm -rf /usr/share/swift
-          sudo rm -rf /usr/local/.ghcup
-          sudo rm -rf /usr/local/julia*
-          sudo rm -rf /usr/local/lib/android
-          sudo rm -rf /usr/local/share/chromium
-          sudo rm -rf /opt/microsoft /opt/google
-          sudo rm -rf /opt/az
-          sudo rm -rf /usr/local/share/powershell
-          sudo rm -rf /opt/hostedtoolcache
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
+      - name: Free disk space
+        if: ${{ matrix.os == 'ubuntu-latest' }}
+        uses: ./.github/actions/free-disk-space
       - name: Setup Go
         uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
         with:
@@ -84,6 +161,11 @@ jobs:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
       - name: Setup Rust
         uses: ./.github/actions/setup-rust
+      # Compile the wash-runtime wasm test fixtures. The test/bench targets
+      # `include_bytes!` these, so they must exist before `cargo test`/`cargo
+      # bench` below. Targets wasm32-wasip2/wasip1 come from setup-rust.
+      - name: Build test fixtures
+        run: cargo xtask build-fixtures
       - name: Build
         run: cargo build
       - name: Test
@@ -96,12 +178,18 @@ jobs:
       - name: Test with wasip3
         run: |
           cargo test -p wash-runtime --features wasip3
+      - name: Test with wasi-tls + wasip3
+        run: |
+          cargo test -p wash-runtime --features wasi-tls,wasip3
       - name: Build benchmarks
         if: matrix.os == 'ubuntu-latest'
         run: |
           cargo bench -p wash-runtime --features wasip3 --no-run
 
   lint:
+    needs:
+      - changes
+    if: always() && (needs.changes.result == 'skipped' || needs.changes.outputs.relevant == 'true')
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
@@ -111,6 +199,8 @@ jobs:
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
+      - name: Free disk space
+        uses: ./.github/actions/free-disk-space
       - name: Setup protoc
         uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
         with:
@@ -122,7 +212,7 @@ jobs:
           rust-toolchain: nightly
           rust-components: rustfmt
       - name: Install cargo-machete
-        uses: taiki-e/install-action@51cd0b8c0499559d9a4d75c0f5c67bec3a894ec8 # v2.75.28
+        uses: taiki-e/install-action@873c7452cadb7c034694a1282227095d93fbdf92 # v2.79.14
         with:
           tool: cargo-machete@0.8.0
       - name: Format
@@ -130,7 +220,22 @@ jobs:
           cargo +nightly fmt -- --check
       - name: Lint
         run: |
-          cargo clippy --workspace --features wasip3
+          cargo clippy --workspace --features wasip3,wasi-tls
+      - name: Lint anyhow context message casing
+        run: |
+          # anyhow `.context()` / `.with_context()` strings are error messages,
+          # which by Rust convention start lowercase so they compose into error
+          # chains. Match sentence-case prose (capital + lowercase) so acronyms
+          # and type names (HTTP, P3, DevRouter) are left untouched.
+          #
+          # Scope is production source only (crates/*/src), matching the clippy
+          # job above; integration tests are not checked. Only single-line
+          # context calls are matched.
+          if matches=$(grep -rn --include='*.rs' -E '\.(with_)?context\((\|\| )?(format!\()?"[A-Z][a-z]' crates/*/src); then
+            echo "::error::anyhow context messages should start with a lowercase letter (Rust convention); lowercase the first letter:"
+            echo "$matches"
+            exit 1
+          fi
       - name: Check for unused dependencies
         run: |
           cargo machete
@@ -143,7 +248,9 @@ jobs:
   # `vX.Y.Z`). arm64 builds on every PR too so Dockerfile regressions are
   # caught before merge.
   wash-image:
-    if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    needs:
+      - changes
+    if: always() && (needs.changes.result == 'skipped' || needs.changes.outputs.relevant == 'true') && (github.event_name == 'pull_request' || ((github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main'))
     permissions:
       contents: read
       packages: write
@@ -156,50 +263,29 @@ jobs:
           - arch: arm64
             runner: ubuntu-24.04-arm
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 30
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
       - name: Login to ghcr.io
-        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
+        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
         with:
           registry: ghcr.io
           username: ${{ github.repository_owner }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
-      - name: Prepare build outputs
-        id: prep
-        # PRs lack org-package write access; only push by digest on main so
-        # canary-publish can assemble the manifest after all gates pass.
-        # Use $GITHUB_EVENT_NAME (built-in env var) to avoid template
-        # expansion inside a shell script (zizmor).
-        run: |
-          if [[ "$GITHUB_EVENT_NAME" == "pull_request" ]]; then
-            {
-              echo 'outputs<<EOF'
-              echo 'type=docker,dest=/tmp/wash-image.tar,name=localhost/wasmcloud-wash:e2e'
-              echo 'EOF'
-            } >> "$GITHUB_OUTPUT"
-          else
-            {
-              echo 'outputs<<EOF'
-              echo 'type=image,name=ghcr.io/wasmcloud/wash,push-by-digest=true,name-canonical=true,push=true'
-              echo 'type=docker,dest=/tmp/wash-image.tar,name=localhost/wasmcloud-wash:e2e'
-              echo 'EOF'
-            } >> "$GITHUB_OUTPUT"
-          fi
-      - name: Build wash runtime image
-        id: build
-        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7.1.0
+        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
+      # Split into two single-output builds: dual `type=image`+`type=docker`
+      # on one call confuses `digest` output (last write to
+      # `containerimage.digest` wins → docker-tarball envelope, not
+      # registry). The second call hits the cache the first wrote.
+      - name: Build wash runtime image (tarball for operator-e2e)
+        id: build_tar
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
         with:
           context: .
-          # Push by digest so the registry doesn't accumulate per-commit
-          # staging tags, and also emit a local docker tarball so the
-          # operator e2e gate (and any future arch-specific gate)
-          # exercises the exact bytes that get published.
-          outputs: ${{ steps.prep.outputs.outputs }}
+          outputs: type=docker,dest=/tmp/wash-image.tar,name=localhost/wasmcloud-wash:e2e
           # head_ref on PRs (the source branch, shared across re-pushes
           # and across PRs from the same branch); falls back to ref_name
           # on main pushes ("main"). Always falls back to the main scope
@@ -208,10 +294,23 @@ jobs:
             type=gha,scope=wash-${{ matrix.arch }}-${{ github.head_ref || github.ref_name }}
             type=gha,scope=wash-${{ matrix.arch }}-main
           cache-to: type=gha,scope=wash-${{ matrix.arch }}-${{ github.head_ref || github.ref_name }},mode=max
+      - name: Push wash runtime image to GHCR by digest (main only)
+        # PRs lack org-package write access; only push on main so
+        # canary-publish can assemble the manifest after all gates pass.
+        # No `cache-to` here — the first build already wrote it.
+        if: github.event_name != 'pull_request'
+        id: build_push
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
+        with:
+          context: .
+          outputs: type=image,name=ghcr.io/wasmcloud/wash,push-by-digest=true,name-canonical=true,push=true
+          cache-from: |
+            type=gha,scope=wash-${{ matrix.arch }}-${{ github.head_ref || github.ref_name }}
+            type=gha,scope=wash-${{ matrix.arch }}-main
       - name: Export digest
         if: github.event_name != 'pull_request'
         env:
-          DIGEST: ${{ steps.build.outputs.digest }}
+          DIGEST: ${{ steps.build_push.outputs.digest }}
         run: |
           set -euo pipefail
           mkdir -p /tmp/digests
@@ -243,7 +342,15 @@ jobs:
   # the chart, or the e2e suite, so regressions are caught before merge
   # rather than after.
   runtime-operator-e2e:
-    needs: [wash-image]
+    needs:
+      - wash-image
+    # `wash-image` runs via `if: always() && ...` to bypass the skipped
+    # `changes` job on main pushes. Without an explicit `if:` here, GHA
+    # propagates the skipped state of that indirect upstream through and
+    # marks this job skipped even though `wash-image` itself succeeded.
+    # Result: canary-publish never fires on main. Explicit gate on
+    # wash-image's actual result is the documented workaround.
+    if: always() && needs.wash-image.result == 'success'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
@@ -297,6 +404,43 @@ jobs:
           kubectl get workloaddeployments.runtime.wasmcloud.dev -A -o yaml || true
           kubectl get workloads.runtime.wasmcloud.dev -A -o yaml || true
 
+  gate:
+    needs:
+      - release-detect
+      - check
+      - lint
+      - wash-image
+      - wash-image-wasip3
+      - runtime-operator-e2e
+      - canary-publish
+      - canary-binaries
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require all jobs to pass or be skipped
+        env:
+          RESULTS: ${{ toJSON(needs.*.result) }}
+          CANARY_PUBLISH_RESULT: ${{ needs.canary-publish.result }}
+          CANARY_BINARIES_RESULT: ${{ needs.canary-binaries.result }}
+          IS_RELEASE: ${{ needs.release-detect.outputs.is_release }}
+          REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          if echo "$RESULTS" | grep -qE '"(failure|cancelled)"'; then
+            exit 1
+          fi
+          # Main pushes must publish canary.
+          if [[ "${REF}" == "refs/heads/main" ]] && [[ "${CANARY_PUBLISH_RESULT}" != "success" ]]; then
+            echo "canary-publish result=${CANARY_PUBLISH_RESULT} on main push; expected success" >&2
+            exit 1
+          fi
+          # Release commits must also build per-target binaries that
+          # release-tag.yml attaches to the GH Release.
+          if [[ "${IS_RELEASE}" == "true" ]] && [[ "${CANARY_BINARIES_RESULT}" != "success" ]]; then
+            echo "canary-binaries result=${CANARY_BINARIES_RESULT} on release commit; expected success" >&2
+            exit 1
+          fi
+
   # Tag promotion: only push `canary` once check, lint, and the
   # runtime-operator e2e have all passed against this commit. Assembles
   # the multi-arch manifest list from the per-arch digests that
@@ -306,8 +450,23 @@ jobs:
   # `canary` itself moves on every subsequent main push, so we cannot
   # rely on it.
   canary-publish:
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    needs: [check, lint, runtime-operator-e2e, wash-image]
+    # Gate canary on the things that actually exercise the published bytes:
+    # `wash-image` is what gets pushed by digest, and `runtime-operator-e2e`
+    # loads that exact image into kind and runs the suite. `check`/`lint`
+    # are workspace-level signals that have no bearing on the image we're
+    # promoting, so they intentionally aren't gates here. `always()` is
+    # required to break the chained-skip propagation from the path-filter
+    # `changes` job (skipped on main) which would otherwise mark this job
+    # skipped before evaluating the explicit gate.
+    if: |
+      always() &&
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
+      github.ref == 'refs/heads/main' &&
+      needs.wash-image.result == 'success' &&
+      needs.runtime-operator-e2e.result == 'success'
+    needs:
+      - runtime-operator-e2e
+      - wash-image
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -323,16 +482,16 @@ jobs:
           pattern: wash-image-digest-*
           merge-multiple: true
       - name: Login to ghcr.io
-        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
+        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
         with:
           registry: ghcr.io
           username: ${{ github.repository_owner }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
+        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
       - name: Docker meta
         id: meta
-        uses: docker/metadata-action@030e881283bb7a6894de51c315a6bfe6a94e05cf # v6.0.0
+        uses: docker/metadata-action@80c7e94dd9b9319bd5eb7a0e0fe9291e23a2a2e9 # v6.1.0
         with:
           images: ghcr.io/wasmcloud/wash
           tags: |
@@ -368,17 +527,61 @@ jobs:
         env:
           STEPS_META_OUTPUTS_VERSION: ${{ steps.meta.outputs.version }}
 
-  # Canary matrix binary build. Runs on every release commit on main (i.e.
-  # what release-train just merged) so release-tag.yml can promote the
-  # exact bytes that the canary CI tested instead of rebuilding on tag.
+  # wasip3 image variant. Builds wash with the `wasip3,wasi-tls` features
+  # (WASI Preview 3 compiled in) and publishes it as `canary-wasip3` /
+  # `sha-<full-sha>-wasip3`.
+  wash-image-wasip3:
+    needs:
+      - changes
+      - runtime-operator-e2e
+    if: |
+      always() &&
+      (needs.changes.result == 'skipped' || needs.changes.outputs.relevant == 'true') &&
+      (((github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main')) &&
+      needs.runtime-operator-e2e.result == 'success'
+    permissions:
+      contents: write
+      packages: write
+    uses: ./.github/workflows/docker-build-push.yml
+    with:
+      image: ghcr.io/wasmcloud/wash
+      build-args: |
+        CARGO_FEATURES=wasip3,wasi-tls
+      # Push (and the manifest merge) only on main; PRs build to validate.
+      push: ${{ github.event_name != 'pull_request' }}
+      push-by-digest: ${{ github.event_name != 'pull_request' }}
+      tags: |
+        type=raw,value=canary-wasip3
+        type=sha,format=long,prefix=sha-,suffix=-wasip3
+
+  # Canary matrix binary build. Runs on every release commit on main —
+  # detected by `release-detect` as a Cargo.toml workspace version bump
+  # vs the parent commit — so release-tag.yml can promote the exact
+  # bytes that the canary CI tested instead of rebuilding on tag.
   # Skipped for non-release main pushes to avoid burning ~7 runners on
-  # every commit. Manual fallback (train offline): push a `release: vX.Y.Z`
-  # commit by hand and this job fires.
+  # every commit. Manual fallback: `gh workflow run wash.yml --ref main
+  # -f is_release=true`.
   canary-binaries:
-    if: "github.event_name == 'push' && github.ref == 'refs/heads/main' && startsWith(github.event.head_commit.message, 'release: v')"
-    needs: [check, lint, runtime-operator-e2e]
+    # Fires whenever `release-detect` says this is a release commit —
+    # detected via Cargo.toml workspace version bump (HEAD vs HEAD~1)
+    # or forced via `workflow_dispatch` input. `always()` breaks the
+    # skipped-`changes` propagation; the explicit per-need success
+    # gates restore the default `success()` check.
+    if: |
+      always() &&
+      needs.release-detect.outputs.is_release == 'true' &&
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
+      github.ref == 'refs/heads/main' &&
+      needs.check.result == 'success' &&
+      needs.lint.result == 'success' &&
+      needs.runtime-operator-e2e.result == 'success'
+    needs:
+      - release-detect
+      - check
+      - lint
+      - runtime-operator-e2e
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 60
+    timeout-minutes: 90
     permissions:
       contents: read
     strategy:
@@ -398,6 +601,12 @@ jobs:
             buildTarget: aarch64-unknown-linux-gnu.2.17
             buildCommand: cargo zigbuild
             artifact: wash-aarch64-unknown-linux-gnu
+            runner: ubuntu-latest
+            bin: wash
+          - target: s390x-unknown-linux-gnu
+            buildTarget: s390x-unknown-linux-gnu.2.17
+            buildCommand: cargo zigbuild
+            artifact: wash-s390x-unknown-linux-gnu
             runner: ubuntu-latest
             bin: wash
           - target: x86_64-unknown-linux-musl

@@ -26,6 +26,7 @@ use std::{
     time::Duration,
 };
 
+use crate::host::allowed_hosts::AllowedHost;
 use crate::wit::WitInterface;
 use crate::{engine::ctx::SharedCtx, observability::Meters};
 use crate::{engine::workload::ResolvedWorkload, observability::FuelConsumptionMeter};
@@ -76,8 +77,8 @@ fn is_valid_hostname(host: &str) -> bool {
 /// Why a request could not be routed to a workload.
 #[derive(Debug)]
 pub enum RouteError {
-    /// Request had no `Host` header a
-    /// genuinely malformed client request. Maps to 400.
+    /// Request had no `Host` header which is a genuinely malformed client
+    /// request. Maps to 400.
     MissingHost,
     /// No workload is currently bound to the host.
     /// `DynamicRouter` passes the offending host header; `DevRouter` is
@@ -139,8 +140,20 @@ pub trait Router: Send + Sync + 'static {
         workload_id: &str,
         request: &hyper::Request<wasmtime_wasi_http::p2::body::HyperOutgoingBody>,
         config: &wasmtime_wasi_http::p2::types::OutgoingRequestConfig,
-        _allowed_hosts: &[String],
+        _allowed_hosts: &[AllowedHost],
     ) -> anyhow::Result<()>;
+
+    /// Determine if a P3 outgoing request is allowed.
+    #[cfg(feature = "wasip3")]
+    fn allow_outgoing_request_p3(
+        &self,
+        _workload_id: &str,
+        request: &hyper::Request<crate::host::http_p3::P3Body>,
+        _options: Option<wasmtime_wasi_http::p3::RequestOptions>,
+        allowed_hosts: &[AllowedHost],
+    ) -> anyhow::Result<()> {
+        check_allowed_hosts(request, allowed_hosts)
+    }
 
     /// Pick a workload ID based on the incoming request.
     ///
@@ -183,7 +196,7 @@ impl Router for DynamicRouter {
             .config
             .get("host")
             .cloned()
-            .context("No host header found")?;
+            .context("no host header found")?;
 
         anyhow::ensure!(
             is_valid_hostname(&primary_host),
@@ -246,7 +259,7 @@ impl Router for DynamicRouter {
         _workload_id: &str,
         request: &hyper::Request<wasmtime_wasi_http::p2::body::HyperOutgoingBody>,
         _config: &wasmtime_wasi_http::p2::types::OutgoingRequestConfig,
-        allowed_hosts: &[String],
+        allowed_hosts: &[AllowedHost],
     ) -> anyhow::Result<()> {
         check_allowed_hosts(request, allowed_hosts)
     }
@@ -279,6 +292,70 @@ impl Router for DynamicRouter {
                 .ok_or_else(|| RouteError::NoWorkloadForHost(workload_host.to_string()))?;
 
             Ok(workload_id.clone())
+        })
+    }
+}
+
+/// Trait for custom outgoing HTTP egress. gRPC requests (P2 and P3) are
+/// handled by the runtime before this trait is called.
+pub trait OutgoingHandler: Send + Sync + 'static {
+    /// Send a P2 outgoing HTTP request for the given `workload_id`.
+    fn send_request(
+        &self,
+        workload_id: &str,
+        request: hyper::Request<wasmtime_wasi_http::p2::body::HyperOutgoingBody>,
+        config: wasmtime_wasi_http::p2::types::OutgoingRequestConfig,
+    ) -> wasmtime_wasi_http::p2::HttpResult<wasmtime_wasi_http::p2::types::HostFutureIncomingResponse>;
+
+    /// Send a P3 outgoing HTTP request for the given `workload_id`.
+    ///
+    /// `fut` is a future provided by the WASI runtime to communicate
+    /// request-side processing errors back to the guest (for example, a
+    /// connection reset that occurs while the request body is being uploaded,
+    /// before or while the response arrives). Most implementations can ignore
+    /// it (`_fut`). It is provided so that custom transports with out-of-band
+    /// error channels can still deliver upload errors to the component after
+    /// the response has been returned.
+    #[cfg(feature = "wasip3")]
+    fn send_request_p3(
+        &self,
+        workload_id: &str,
+        request: hyper::Request<crate::host::http_p3::P3Body>,
+        options: Option<wasmtime_wasi_http::p3::RequestOptions>,
+        fut: crate::host::http_p3::P3RequestErrorFuture,
+    ) -> crate::host::http_p3::P3SendFuture;
+}
+
+/// Default [`OutgoingHandler`] — defers to `wasmtime_wasi_http::p2::default_send_request` (P2)
+/// and `wasmtime_wasi_http::p3::default_send_request` (P3).
+#[derive(Default)]
+pub struct DefaultOutgoingHandler;
+
+impl OutgoingHandler for DefaultOutgoingHandler {
+    fn send_request(
+        &self,
+        _workload_id: &str,
+        request: hyper::Request<wasmtime_wasi_http::p2::body::HyperOutgoingBody>,
+        config: wasmtime_wasi_http::p2::types::OutgoingRequestConfig,
+    ) -> wasmtime_wasi_http::p2::HttpResult<wasmtime_wasi_http::p2::types::HostFutureIncomingResponse>
+    {
+        Ok(wasmtime_wasi_http::p2::default_send_request(
+            request, config,
+        ))
+    }
+    #[cfg(feature = "wasip3")]
+    fn send_request_p3(
+        &self,
+        _workload_id: &str,
+        request: hyper::Request<crate::host::http_p3::P3Body>,
+        options: Option<wasmtime_wasi_http::p3::RequestOptions>,
+        _fut: crate::host::http_p3::P3RequestErrorFuture,
+    ) -> crate::host::http_p3::P3SendFuture {
+        Box::new(async move {
+            use http_body_util::BodyExt;
+            let (res, io) = wasmtime_wasi_http::p3::default_send_request(request, options).await?;
+            let io: crate::host::http_p3::P3RequestErrorFuture = Box::new(io);
+            Ok((res.map(BodyExt::boxed_unsync), io))
         })
     }
 }
@@ -320,12 +397,15 @@ impl Router for DevRouter {
     fn allow_outgoing_request(
         &self,
         _workload_id: &str,
-        _request: &hyper::Request<wasmtime_wasi_http::p2::body::HyperOutgoingBody>,
+        request: &hyper::Request<wasmtime_wasi_http::p2::body::HyperOutgoingBody>,
         _config: &wasmtime_wasi_http::p2::types::OutgoingRequestConfig,
-        _allowed_hosts: &[String],
+        allowed_hosts: &[AllowedHost],
     ) -> anyhow::Result<()> {
-        Ok(())
+        check_allowed_hosts(request, allowed_hosts)
     }
+
+    // `allow_outgoing_request_p3` deliberately not overridden — the trait
+    // default calls `check_allowed_hosts`, matching the P2 behavior above.
 
     /// Pick a workload ID based on the incoming request
     fn route_incoming_request(
@@ -374,8 +454,41 @@ pub trait HostHandler: Send + Sync + 'static {
         workload_id: &str,
         request: hyper::Request<wasmtime_wasi_http::p2::body::HyperOutgoingBody>,
         config: wasmtime_wasi_http::p2::types::OutgoingRequestConfig,
-        allowed_hosts: &[String],
+        allowed_hosts: &[AllowedHost],
     ) -> wasmtime_wasi_http::p2::HttpResult<wasmtime_wasi_http::p2::types::HostFutureIncomingResponse>;
+
+    /// Handle a P3 outgoing request, enforcing `allowed_hosts` policy and
+    /// delegating transport to [`wasmtime_wasi_http::p3::default_send_request`].
+    ///
+    /// Override to apply custom egress logic (e.g. alternate transports or
+    /// per-workload TLS configuration) while still honouring the allowlist via
+    /// [`check_allowed_hosts`].
+    #[cfg(feature = "wasip3")]
+    fn outgoing_request_p3(
+        &self,
+        workload_id: &str,
+        request: hyper::Request<crate::host::http_p3::P3Body>,
+        options: Option<wasmtime_wasi_http::p3::RequestOptions>,
+        // Response-side body-error sink: unused here because hyper's response
+        // body already reports body errors through its `Stream` impl.
+        _fut: crate::host::http_p3::P3RequestErrorFuture,
+        allowed_hosts: &[AllowedHost],
+    ) -> crate::host::http_p3::P3SendFuture {
+        if let Err(e) = check_allowed_hosts(&request, allowed_hosts) {
+            use wasmtime_wasi_http::p3::bindings::http::types::ErrorCode;
+            warn!(workload_id = %workload_id, err = %e, "outgoing request denied by allowed_hosts policy");
+            return Box::new(async move {
+                Err(wasmtime_wasi::TrappableError::from(
+                    ErrorCode::HttpRequestDenied,
+                ))
+            });
+        }
+        Box::new(async move {
+            let (res, io) = wasmtime_wasi_http::p3::default_send_request(request, options).await?;
+            let io: crate::host::http_p3::P3RequestErrorFuture = Box::new(io);
+            Ok((res.map(BodyExt::boxed_unsync), io))
+        })
+    }
 }
 
 impl std::fmt::Debug for dyn HostHandler {
@@ -418,12 +531,29 @@ impl HostHandler for NullServer {
         _workload_id: &str,
         _request: hyper::Request<wasmtime_wasi_http::p2::body::HyperOutgoingBody>,
         _config: wasmtime_wasi_http::p2::types::OutgoingRequestConfig,
-        _allowed_hosts: &[String],
+        _allowed_hosts: &[AllowedHost],
     ) -> wasmtime_wasi_http::p2::HttpResult<wasmtime_wasi_http::p2::types::HostFutureIncomingResponse>
     {
         Err(wasmtime_wasi_http::p2::HttpError::trap(
             wasmtime::format_err!("http client not available"),
         ))
+    }
+
+    #[cfg(feature = "wasip3")]
+    fn outgoing_request_p3(
+        &self,
+        _workload_id: &str,
+        _request: hyper::Request<crate::host::http_p3::P3Body>,
+        _options: Option<wasmtime_wasi_http::p3::RequestOptions>,
+        _fut: crate::host::http_p3::P3RequestErrorFuture,
+        _allowed_hosts: &[AllowedHost],
+    ) -> crate::host::http_p3::P3SendFuture {
+        use wasmtime_wasi_http::p3::bindings::http::types::ErrorCode;
+        Box::new(async {
+            Err(wasmtime_wasi::TrappableError::from(
+                ErrorCode::InternalError(Some("http client not available".to_string())),
+            ))
+        })
     }
 }
 
@@ -436,8 +566,19 @@ pub type WorkloadHandles =
 /// This plugin implements the `wasi:http/incoming-handler` interface and routes
 /// HTTP requests to appropriate WebAssembly components based on virtual hosting.
 /// It supports both HTTP and HTTPS connections with optional mutual TLS.
-pub struct HttpServer<T: Router> {
+///
+/// Use [`HttpServerBuilder`] to construct an instance:
+///
+/// ```rust,ignore
+/// let server = HttpServer::builder(router, "127.0.0.1:8080".parse()?)
+///     .outgoing_handler(my_handler)
+///     .tls(TlsConfig::new(cert_path, key_path))
+///     .build()
+///     .await?;
+/// ```
+pub struct HttpServer<T: Router, O: OutgoingHandler = DefaultOutgoingHandler> {
     router: Arc<T>,
+    outgoing_handler: O,
     addr: SocketAddr,
     workload_handles: WorkloadHandles,
     shutdown_tx: Arc<RwLock<Option<mpsc::Sender<()>>>>,
@@ -446,7 +587,7 @@ pub struct HttpServer<T: Router> {
     meters: RwLock<Meters>,
 }
 
-impl<T: Router> std::fmt::Debug for HttpServer<T> {
+impl<T: Router, O: OutgoingHandler> std::fmt::Debug for HttpServer<T, O> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("HttpServer")
             .field("addr", &self.addr)
@@ -454,83 +595,145 @@ impl<T: Router> std::fmt::Debug for HttpServer<T> {
     }
 }
 
-impl<T: Router> HttpServer<T> {
-    /// Creates a new HTTP server that eagerly binds to the specified address.
-    ///
-    /// The socket is bound immediately so the port is reserved. Use port `0`
-    /// to let the OS pick a free port, then call [`addr()`](Self::addr) to
-    /// discover the actual address.
-    ///
-    /// Side effect: installs the process-level rustls crypto provider via
-    /// [`crate::init_crypto`] (idempotent).
-    ///
-    /// # Arguments
-    /// * `router` - The router implementation for handling requests
-    /// * `addr` - The socket address to bind to
-    pub async fn new(router: T, addr: SocketAddr) -> anyhow::Result<Self> {
+/// TLS configuration for [`HttpServerBuilder::tls`] / [`HttpServer::new_with_tls`].
+#[derive(Debug, Clone)]
+pub struct TlsConfig {
+    cert_path: std::path::PathBuf,
+    key_path: std::path::PathBuf,
+    ca_path: Option<std::path::PathBuf>,
+}
+
+impl TlsConfig {
+    pub fn new(
+        cert_path: impl Into<std::path::PathBuf>,
+        key_path: impl Into<std::path::PathBuf>,
+    ) -> Self {
+        Self {
+            cert_path: cert_path.into(),
+            key_path: key_path.into(),
+            ca_path: None,
+        }
+    }
+
+    pub fn with_ca(mut self, ca_path: impl Into<std::path::PathBuf>) -> Self {
+        self.ca_path = Some(ca_path.into());
+        self
+    }
+}
+
+/// Builder for [`HttpServer`].
+///
+/// # Required
+/// - `router` and `addr` — set via [`HttpServer::builder`].
+///
+/// # Optional
+/// - [`outgoing_handler`](Self::outgoing_handler) — defaults to [`DefaultOutgoingHandler`].
+/// - [`tls`](Self::tls) — enables HTTPS.
+///
+/// # Example
+/// ```rust,ignore
+/// // Minimal — plain HTTP, default outgoing handler
+/// let server = HttpServer::builder(DevRouter::default(), addr)
+///     .build()
+///     .await?;
+///
+/// // Full — HTTPS with custom egress
+/// let server = HttpServer::builder(DynamicRouter::default(), addr)
+///     .outgoing_handler(custom_handler)
+///     .tls(TlsConfig::new(cert, key).with_ca(ca))
+///     .build()
+///     .await?;
+/// ```
+pub struct HttpServerBuilder<T: Router, O: OutgoingHandler = DefaultOutgoingHandler> {
+    router: T,
+    outgoing_handler: O,
+    addr: SocketAddr,
+    tls: Option<TlsConfig>,
+}
+
+impl<T: Router> HttpServerBuilder<T, DefaultOutgoingHandler> {
+    fn new(router: T, addr: SocketAddr) -> Self {
+        Self {
+            router,
+            outgoing_handler: DefaultOutgoingHandler,
+            addr,
+            tls: None,
+        }
+    }
+}
+
+impl<T: Router, O: OutgoingHandler> HttpServerBuilder<T, O> {
+    /// Set a custom [`OutgoingHandler`], changing the builder's handler type.
+    /// The same handler serves both P2 and P3 outgoing requests.
+    pub fn outgoing_handler<O2: OutgoingHandler>(self, handler: O2) -> HttpServerBuilder<T, O2> {
+        HttpServerBuilder {
+            router: self.router,
+            outgoing_handler: handler,
+            addr: self.addr,
+            tls: self.tls,
+        }
+    }
+
+    /// Enable TLS using the given [`TlsConfig`].
+    pub fn tls(mut self, tls: TlsConfig) -> Self {
+        self.tls = Some(tls);
+        self
+    }
+
+    /// Bind to the address and build the [`HttpServer`].
+    pub async fn build(self) -> anyhow::Result<HttpServer<T, O>> {
         crate::init_crypto();
-        let listener = TcpListener::bind(addr).await?;
+        let tls_acceptor = match &self.tls {
+            Some(tls) => {
+                let config =
+                    load_tls_config(&tls.cert_path, &tls.key_path, tls.ca_path.as_deref()).await?;
+                Some(TlsAcceptor::from(Arc::new(config)))
+            }
+            None => None,
+        };
+
+        let listener = TcpListener::bind(self.addr).await?;
         let addr = listener.local_addr()?;
-        Ok(Self {
-            router: Arc::new(router),
+
+        Ok(HttpServer {
+            router: Arc::new(self.router),
+            outgoing_handler: self.outgoing_handler,
             addr,
             workload_handles: Arc::default(),
             shutdown_tx: Arc::new(RwLock::new(None)),
-            tls_acceptor: None,
-            listener: Arc::new(tokio::sync::Mutex::new(Some(listener))),
-            meters: Default::default(),
-        })
-    }
-
-    /// Returns the actual bound address (useful when binding to port 0).
-    pub fn addr(&self) -> SocketAddr {
-        self.addr
-    }
-
-    /// Creates a new HTTPS server with TLS support.
-    ///
-    /// Side effect: installs the process-level rustls crypto provider via
-    /// [`crate::init_crypto`] (idempotent).
-    ///
-    /// # Arguments
-    /// * `router` - The router implementation for handling requests
-    /// * `addr` - The socket address to bind to
-    /// * `cert_path` - Path to the TLS certificate file
-    /// * `key_path` - Path to the private key file
-    /// * `ca_path` - Optional path to CA certificate for mutual TLS
-    ///
-    /// # Returns
-    /// A new `HttpServer` instance configured for HTTPS connections.
-    ///
-    /// # Errors
-    /// Returns an error if the TLS configuration cannot be loaded.
-    pub async fn new_with_tls(
-        router: T,
-        addr: SocketAddr,
-        cert_path: &Path,
-        key_path: &Path,
-        ca_path: Option<&Path>,
-    ) -> anyhow::Result<Self> {
-        crate::init_crypto();
-        let tls_config = load_tls_config(cert_path, key_path, ca_path).await?;
-        let tls_acceptor = TlsAcceptor::from(Arc::new(tls_config));
-
-        let listener = TcpListener::bind(addr).await?;
-        let addr = listener.local_addr()?;
-        Ok(Self {
-            router: Arc::new(router),
-            addr,
-            workload_handles: Arc::default(),
-            shutdown_tx: Arc::new(RwLock::new(None)),
-            tls_acceptor: Some(tls_acceptor),
+            tls_acceptor,
             listener: Arc::new(tokio::sync::Mutex::new(Some(listener))),
             meters: Default::default(),
         })
     }
 }
 
+impl<T: Router> HttpServer<T, DefaultOutgoingHandler> {
+    /// Returns a new [`HttpServerBuilder`] with the default [`DefaultOutgoingHandler`].
+    pub fn builder(router: T, addr: SocketAddr) -> HttpServerBuilder<T, DefaultOutgoingHandler> {
+        HttpServerBuilder::new(router, addr)
+    }
+
+    /// Creates a new HTTP server bound to `addr` with the default outgoing handler.
+    pub async fn new(router: T, addr: SocketAddr) -> anyhow::Result<Self> {
+        HttpServerBuilder::new(router, addr).build().await
+    }
+
+    /// Creates a new HTTPS server with TLS and the default outgoing handler.
+    pub async fn new_with_tls(router: T, addr: SocketAddr, tls: TlsConfig) -> anyhow::Result<Self> {
+        HttpServerBuilder::new(router, addr).tls(tls).build().await
+    }
+}
+
+impl<T: Router, O: OutgoingHandler> HttpServer<T, O> {
+    /// Returns the actual bound address (useful when binding to port 0).
+    pub fn addr(&self) -> SocketAddr {
+        self.addr
+    }
+}
+
 #[async_trait::async_trait]
-impl<T: Router> HostHandler for HttpServer<T> {
+impl<T: Router, O: OutgoingHandler> HostHandler for HttpServer<T, O> {
     async fn inject_meters(&self, meters: &crate::observability::Meters) {
         *self.meters.write().await = meters.clone();
     }
@@ -626,7 +829,7 @@ impl<T: Router> HostHandler for HttpServer<T> {
         workload_id: &str,
         request: hyper::Request<wasmtime_wasi_http::p2::body::HyperOutgoingBody>,
         config: wasmtime_wasi_http::p2::types::OutgoingRequestConfig,
-        allowed_hosts: &[String],
+        allowed_hosts: &[AllowedHost],
     ) -> wasmtime_wasi_http::p2::HttpResult<wasmtime_wasi_http::p2::types::HostFutureIncomingResponse>
     {
         if let Err(e) =
@@ -638,14 +841,39 @@ impl<T: Router> HostHandler for HttpServer<T> {
                 wasmtime_wasi_http::p2::bindings::http::types::ErrorCode::HttpRequestDenied,
             ));
         }
-
         if is_grpc_request(&request) {
-            Ok(send_grpc_request(request, config))
-        } else {
-            Ok(wasmtime_wasi_http::p2::default_send_request(
-                request, config,
-            ))
+            return Ok(send_grpc_request(request, config));
         }
+        self.outgoing_handler
+            .send_request(workload_id, request, config)
+    }
+
+    #[cfg(feature = "wasip3")]
+    fn outgoing_request_p3(
+        &self,
+        workload_id: &str,
+        request: hyper::Request<crate::host::http_p3::P3Body>,
+        options: Option<wasmtime_wasi_http::p3::RequestOptions>,
+        fut: crate::host::http_p3::P3RequestErrorFuture,
+        allowed_hosts: &[AllowedHost],
+    ) -> crate::host::http_p3::P3SendFuture {
+        if let Err(e) =
+            self.router
+                .allow_outgoing_request_p3(workload_id, &request, options, allowed_hosts)
+        {
+            warn!(workload_id = %workload_id, err = %e, "P3 outgoing request denied by allowed_hosts policy");
+            use wasmtime_wasi_http::p3::bindings::http::types::ErrorCode;
+            return Box::new(async move {
+                Err(wasmtime_wasi::TrappableError::from(
+                    ErrorCode::HttpRequestDenied,
+                ))
+            });
+        }
+        if is_grpc_request(&request) {
+            return send_grpc_request_p3(request, options);
+        }
+        self.outgoing_handler
+            .send_request_p3(workload_id, request, options, fut)
     }
 }
 
@@ -674,12 +902,12 @@ async fn run_http_server<T: Router>(
                         let handles_clone = workload_handles.clone();
                         let tls_acceptor_clone = tls_acceptor.clone();
                         let handler_clone = handler.clone();
-                         let fuel_meter = fuel_meter.clone();
+                        let fuel_meter = fuel_meter.clone();
                         tokio::spawn(async move {
                             let service = hyper::service::service_fn(move |req| {
                                 let handles = handles_clone.clone();
                                 let handler = handler_clone.clone();
-                                 let fuel_meter = fuel_meter.clone();
+                                let fuel_meter = fuel_meter.clone();
                                 async move {
                                     let extractor = opentelemetry_http::HeaderExtractor(req.headers());
                                     let remote_context =
@@ -787,11 +1015,27 @@ fn describe_join_error(join_err: tokio::task::JoinError) -> String {
 }
 
 /// Handle individual HTTP requests by looking up workload and invoking component
+///
+/// HTTP request attributes are emitted under both the current-stable OTel HTTP
+/// semconv names (`http.request.method`, `url.path`, `server.address`,
+/// `server.port`) and the legacy names (`http.method`, `http.uri`, `http.host`)
+/// so dashboards built against either convention resolve. `server.address` holds
+/// the host without its port; the port is recorded separately as `server.port`
+/// when the `Host` header carries one. In addition:
+/// - `http.response.status_code` is recorded before returning so span-metrics
+///   collectors can break down requests by 2xx/4xx/5xx.
+/// - `otel.status_code` is set to `ERROR` for 5xx; 4xx stays UNSET per semconv.
 #[instrument(skip_all, fields(
     trace_id = tracing::field::Empty,
     http.method = %req.method(),
+    http.request.method = %req.method(),
     http.uri = %req.uri(),
-    http.host = %req.headers().get(hyper::header::HOST).and_then(|h| h.to_str().ok()).unwrap_or("unknown"),
+    url.path = %req.uri().path(),
+    http.host = %host_header(&req),
+    server.address = split_host_port(host_header(&req)).0,
+    server.port = tracing::field::Empty,
+    http.response.status_code = tracing::field::Empty,
+    otel.status_code = tracing::field::Empty,
 ))]
 async fn handle_http_request<T: Router>(
     handler: Arc<T>,
@@ -805,17 +1049,19 @@ async fn handle_http_request<T: Router>(
     let method = req.method().clone();
     let uri = req.uri().clone();
 
+    // server.port is recorded separately from server.address per the OTel HTTP
+    // semconv; only set it when the Host header actually carries a port.
+    if let Some(port) = split_host_port(host_header(&req)).1 {
+        tracing::Span::current().record("server.port", port);
+    }
+
     let workload_id = match handler.route_incoming_request(&req) {
         Ok(id) => id,
-        Err(reason) => {
-            warn!(
-                trace_id = %trace_id,
-                method = %method,
-                uri = %uri,
-                reason = ?reason,
-                "no route matched incoming request",
-            );
-            return Ok(error_response(400, &trace_id));
+        Err(e) => {
+            warn!(err = %e, "failed to route incoming request");
+            let resp = error_response(e.status(), &trace_id);
+            record_response_status(&resp);
+            return Ok(resp);
         }
     };
 
@@ -885,7 +1131,47 @@ async fn handle_http_request<T: Router>(
         }
     };
 
+    record_response_status(&response);
     Ok(response)
+}
+
+/// Record the response's status on the current span as the OTel HTTP semconv
+/// attribute `http.response.status_code`. 5xx flips `otel.status_code` to
+/// `ERROR` per the HTTP semconv (4xx is a client error and stays UNSET).
+fn record_response_status<B>(response: &hyper::Response<B>) {
+    let status = response.status().as_u16();
+    let span = tracing::Span::current();
+    span.record("http.response.status_code", status);
+    if status >= 500 {
+        span.record("otel.status_code", "ERROR");
+    }
+}
+
+/// The request's `Host` header as a string, or `"unknown"` when absent or
+/// non-UTF-8.
+fn host_header<B>(req: &hyper::Request<B>) -> &str {
+    req.headers()
+        .get(hyper::header::HOST)
+        .and_then(|h| h.to_str().ok())
+        .unwrap_or("unknown")
+}
+
+/// Split a `Host` header value into the OTel `server.address` (host without
+/// port) and an optional `server.port`. Handles bracketed IPv6 literals such as
+/// `[::1]:8080`, returning the address without brackets.
+fn split_host_port(host: &str) -> (&str, Option<u16>) {
+    if let Some(rest) = host.strip_prefix('[') {
+        // IPv6 literal: `[addr]` or `[addr]:port`.
+        if let Some((addr, after)) = rest.split_once(']') {
+            let port = after.strip_prefix(':').and_then(|p| p.parse().ok());
+            return (addr, port);
+        }
+        return (host, None);
+    }
+    match host.rsplit_once(':') {
+        Some((addr, port)) => (addr, port.parse().ok()),
+        None => (host, None),
+    }
 }
 
 /// Invoke the component handler for the given workload
@@ -1047,7 +1333,7 @@ async fn load_tls_config(
     let mut config = ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(cert_chain, key)
-        .context("Failed to create TLS configuration")?;
+        .context("failed to create TLS configuration")?;
 
     // Advertise both h2 and http/1.1 via ALPN
     config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
@@ -1056,10 +1342,10 @@ async fn load_tls_config(
     if let Some(ca_path) = ca_path {
         let ca_data = tokio::fs::read(ca_path)
             .await
-            .context(format!("Failed to read CA file: {}", ca_path.display()))?;
+            .context(format!("failed to read CA file: {}", ca_path.display()))?;
         let ca_certs: Vec<CertificateDer<'static>> = CertificateDer::pem_slice_iter(&ca_data)
             .collect::<Result<Vec<_>, _>>()
-            .context(format!("Failed to parse CA file: {}", ca_path.display()))?;
+            .context(format!("failed to parse CA file: {}", ca_path.display()))?;
 
         ensure!(
             !ca_certs.is_empty(),
@@ -1075,46 +1361,48 @@ async fn load_tls_config(
     Ok(config)
 }
 
-/// Check if an outgoing request's host is permitted by the allowed_hosts list.
+/// Checks whether an outgoing request is permitted by the `allowed_hosts`
+/// policy.
 ///
-/// If `allowed_hosts` is empty, all requests are allowed.
-/// Supports wildcard patterns like `*.example.com` which match any subdomain.
+/// **Empty list = deny all.** A workload with no entries cannot
+/// reach any outbound host. Callers that want unrestricted egress must pass
+/// an explicit `[AllowedHost::Any]`. The wash config layer enforces this by
+/// substituting `[Any]` when `allowedHosts` is omitted from the YAML
+/// (see `wash::workload::resolve_workload`), so runtime callers that come
+/// through wash never see an empty list.
+///
+/// Otherwise the request's host (and, when the policy entry specifies them,
+/// scheme and port) must satisfy at least one [`AllowedHost`] entry. See
+/// [`AllowedHost::matches`] for per-variant semantics.
+///
+/// # Errors
+///
+/// Returns an error when the request has no host, when `allowed_hosts` is
+/// empty, or when no policy entry matches.
 pub fn check_allowed_hosts<B>(
     request: &hyper::Request<B>,
-    allowed_hosts: &[String],
+    allowed_hosts: &[AllowedHost],
 ) -> anyhow::Result<()> {
+    let uri = request.uri();
+    let request_host = uri.host().context("outgoing request has no host")?;
+
     if allowed_hosts.is_empty() {
+        anyhow::bail!(
+            "outgoing request to host '{request_host}' denied: allowed_hosts policy is empty (deny-all)"
+        );
+    }
+
+    if allowed_hosts.iter().any(|entry| entry.matches(uri)) {
         return Ok(());
     }
 
-    let request_host = request
-        .uri()
-        .host()
-        .context("outgoing request has no host")?;
-
-    let request_host_lower = request_host.to_ascii_lowercase();
-    for pattern in allowed_hosts {
-        if let Some(suffix) = pattern.strip_prefix('*') {
-            // Wildcard: *.example.com matches foo.example.com but not example.com
-            let suffix_lower = suffix.to_ascii_lowercase();
-            if let Some(prefix) = request_host_lower.strip_suffix(suffix_lower.as_str())
-                && !prefix.is_empty()
-            {
-                return Ok(());
-            }
-        } else if request_host.eq_ignore_ascii_case(pattern) {
-            return Ok(());
-        }
-    }
-
     anyhow::bail!(
-        "outgoing request to host '{}' is not allowed by allowed_hosts policy",
-        request_host
+        "outgoing request to host '{request_host}' is not allowed by allowed_hosts policy"
     )
 }
 
 /// Check if a request is a gRPC request based on Content-Type header.
-fn is_grpc_request(req: &hyper::Request<HyperOutgoingBody>) -> bool {
+fn is_grpc_request<B>(req: &hyper::Request<B>) -> bool {
     req.headers()
         .get(hyper::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
@@ -1254,10 +1542,182 @@ async fn send_grpc_request_handler(
     })
 }
 
+/// P3 sibling of send_grpc_request: HTTP/2 sender for P3 outgoing gRPC.
+#[cfg(feature = "wasip3")]
+fn send_grpc_request_p3(
+    request: hyper::Request<crate::host::http_p3::P3Body>,
+    options: Option<wasmtime_wasi_http::p3::RequestOptions>,
+) -> crate::host::http_p3::P3SendFuture {
+    Box::new(send_grpc_request_p3_handler(request, options))
+}
+
+#[cfg(feature = "wasip3")]
+async fn send_grpc_request_p3_handler(
+    mut request: hyper::Request<crate::host::http_p3::P3Body>,
+    options: Option<wasmtime_wasi_http::p3::RequestOptions>,
+) -> crate::host::http_p3::P3SendResult {
+    use tokio::net::TcpStream;
+    use tokio::time::timeout;
+    use wasmtime_wasi_http::p3::bindings::http::types::ErrorCode;
+
+    let connect_timeout = options
+        .and_then(|o| o.connect_timeout)
+        .unwrap_or(Duration::from_secs(600));
+    let first_byte_timeout = options
+        .and_then(|o| o.first_byte_timeout)
+        .unwrap_or(Duration::from_secs(600));
+    let between_bytes_timeout = options
+        .and_then(|o| o.between_bytes_timeout)
+        .unwrap_or(Duration::from_secs(600));
+
+    let use_tls = request.uri().scheme() == Some(&hyper::http::uri::Scheme::HTTPS);
+
+    let authority = request
+        .uri()
+        .authority()
+        .ok_or(ErrorCode::HttpRequestUriInvalid)?;
+    let authority = if authority.port().is_some() {
+        authority.to_string()
+    } else {
+        let port = if use_tls { 443 } else { 80 };
+        format!("{authority}:{port}")
+    };
+
+    let tcp_stream = timeout(connect_timeout, TcpStream::connect(&authority))
+        .await
+        .map_err(|_| ErrorCode::ConnectionTimeout)?
+        .map_err(|_| ErrorCode::ConnectionRefused)?;
+
+    let (mut sender, _worker) = if use_tls {
+        use rustls::pki_types::ServerName;
+
+        let root_cert_store = rustls::RootCertStore {
+            roots: webpki_roots::TLS_SERVER_ROOTS.into(),
+        };
+        let mut config = rustls::ClientConfig::builder()
+            .with_root_certificates(root_cert_store)
+            .with_no_client_auth();
+        config.alpn_protocols = vec![b"h2".to_vec()];
+
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
+        let host = authority.split(':').next().unwrap_or(&authority);
+        if host.is_empty() {
+            return Err(ErrorCode::HttpRequestUriInvalid.into());
+        }
+        let domain = ServerName::try_from(host)
+            .map_err(|e| {
+                tracing::warn!("invalid server name '{host}': {e:?}");
+                ErrorCode::HttpRequestUriInvalid
+            })?
+            .to_owned();
+        let stream = connector.connect(domain, tcp_stream).await.map_err(|e| {
+            tracing::warn!("tls protocol error: {e:?}");
+            ErrorCode::TlsProtocolError
+        })?;
+        let stream = TokioIo::new(stream);
+        let (sender, conn) = timeout(
+            connect_timeout,
+            http2::handshake(TokioExecutor::new(), stream),
+        )
+        .await
+        .map_err(|_| ErrorCode::ConnectionTimeout)?
+        .map_err(ErrorCode::from_hyper_request_error)?;
+        let worker = wasmtime_wasi::runtime::spawn(async move {
+            if let Err(e) = conn.await {
+                tracing::warn!("dropping error {e}");
+            }
+        });
+        (sender, worker)
+    } else {
+        let stream = TokioIo::new(tcp_stream);
+        let (sender, conn) = timeout(
+            connect_timeout,
+            http2::handshake(TokioExecutor::new(), stream),
+        )
+        .await
+        .map_err(|_| ErrorCode::ConnectionTimeout)?
+        .map_err(ErrorCode::from_hyper_request_error)?;
+        let worker = wasmtime_wasi::runtime::spawn(async move {
+            if let Err(e) = conn.await {
+                tracing::warn!("dropping error {e}");
+            }
+        });
+        (sender, worker)
+    };
+
+    if let Ok(uri) = hyper::Uri::builder()
+        .path_and_query(
+            request
+                .uri()
+                .path_and_query()
+                .map(|p| p.as_str())
+                .unwrap_or("/"),
+        )
+        .build()
+    {
+        *request.uri_mut() = uri;
+    }
+
+    let resp = timeout(first_byte_timeout, sender.send_request(request))
+        .await
+        .map_err(|_| ErrorCode::ConnectionReadTimeout)?
+        .map_err(ErrorCode::from_hyper_request_error)?
+        .map(|body| {
+            use http_body_util::BodyExt;
+            use std::pin::Pin;
+            use std::task::{Context, Poll, ready};
+            struct TimedBody {
+                inner: hyper::body::Incoming,
+                interval: tokio::time::Interval,
+            }
+            impl hyper::body::Body for TimedBody {
+                type Data = bytes::Bytes;
+                type Error = ErrorCode;
+                fn poll_frame(
+                    mut self: Pin<&mut Self>,
+                    cx: &mut Context<'_>,
+                ) -> Poll<Option<Result<hyper::body::Frame<Self::Data>, Self::Error>>>
+                {
+                    match Pin::new(&mut self.as_mut().inner).poll_frame(cx) {
+                        Poll::Ready(None) => Poll::Ready(None),
+                        Poll::Ready(Some(Err(err))) => {
+                            Poll::Ready(Some(Err(ErrorCode::from_hyper_request_error(err))))
+                        }
+                        Poll::Ready(Some(Ok(frame))) => {
+                            self.interval.reset();
+                            Poll::Ready(Some(Ok(frame)))
+                        }
+                        Poll::Pending => {
+                            ready!(self.interval.poll_tick(cx));
+                            Poll::Ready(Some(Err(ErrorCode::ConnectionReadTimeout)))
+                        }
+                    }
+                }
+                fn is_end_stream(&self) -> bool {
+                    self.inner.is_end_stream()
+                }
+                fn size_hint(&self) -> hyper::body::SizeHint {
+                    self.inner.size_hint()
+                }
+            }
+            let mut interval = tokio::time::interval(between_bytes_timeout);
+            interval.reset();
+            TimedBody {
+                inner: body,
+                interval,
+            }
+            .boxed_unsync()
+        });
+
+    let io: crate::host::http_p3::P3RequestErrorFuture = Box::new(async move { Ok(()) });
+    Ok((resp, io))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use wasmtime_wasi_http::p2::body::HyperOutgoingBody;
+    use wasmtime_wasi_http::p2::types::OutgoingRequestConfig;
 
     fn build_request(uri: &str) -> hyper::Request<HyperOutgoingBody> {
         hyper::Request::builder()
@@ -1268,61 +1728,79 @@ mod tests {
 
     // --- check_allowed_hosts tests ---
 
+    fn hosts(entries: &[&str]) -> Vec<AllowedHost> {
+        entries.iter().map(|s| s.parse().unwrap()).collect()
+    }
+
     #[test]
-    fn empty_allowed_hosts_permits_any() {
+    fn empty_allowed_hosts_denies_all() {
+        // An empty policy means no egress. To opt into allow-all
+        // the caller must pass an explicit `[AllowedHost::Any]`.
         let req = build_request("http://anything.example.com/path");
-        assert!(check_allowed_hosts(&req, &[]).is_ok());
+        let err = check_allowed_hosts(&req, &[]).unwrap_err();
+        assert!(err.to_string().contains("deny-all"), "{}", err.to_string());
+    }
+
+    #[test]
+    fn explicit_any_permits_anything() {
+        let req = build_request("http://anything.example.com/path");
+        assert!(check_allowed_hosts(&req, &hosts(&["*"])).is_ok());
     }
 
     #[test]
     fn exact_match_works() {
         let req = build_request("http://example.com/path");
-        let hosts = vec!["example.com".to_string()];
-        assert!(check_allowed_hosts(&req, &hosts).is_ok());
+        assert!(check_allowed_hosts(&req, &hosts(&["example.com"])).is_ok());
     }
 
     #[test]
     fn exact_match_is_case_insensitive() {
         let req = build_request("http://example.com/path");
-        let hosts = vec!["Example.COM".to_string()];
-        assert!(check_allowed_hosts(&req, &hosts).is_ok());
+        assert!(check_allowed_hosts(&req, &hosts(&["Example.COM"])).is_ok());
     }
 
     #[test]
     fn wildcard_matches_subdomain() {
         let req = build_request("http://sub.example.com/path");
-        let hosts = vec!["*.example.com".to_string()];
-        assert!(check_allowed_hosts(&req, &hosts).is_ok());
+        assert!(check_allowed_hosts(&req, &hosts(&["*.example.com"])).is_ok());
     }
 
     #[test]
     fn wildcard_does_not_match_bare_domain() {
         let req = build_request("http://example.com/path");
-        let hosts = vec!["*.example.com".to_string()];
-        assert!(check_allowed_hosts(&req, &hosts).is_err());
+        assert!(check_allowed_hosts(&req, &hosts(&["*.example.com"])).is_err());
     }
 
     #[test]
     fn wildcard_is_case_insensitive() {
         let req = build_request("http://sub.example.com/path");
-        let hosts = vec!["*.Example.COM".to_string()];
-        assert!(check_allowed_hosts(&req, &hosts).is_ok());
+        assert!(check_allowed_hosts(&req, &hosts(&["*.Example.COM"])).is_ok());
     }
 
     #[test]
     fn non_matching_host_is_rejected() {
         let req = build_request("http://evil.com/path");
-        let hosts = vec!["example.com".to_string()];
-        let err = check_allowed_hosts(&req, &hosts).unwrap_err();
+        let err = check_allowed_hosts(&req, &hosts(&["example.com"])).unwrap_err();
         assert!(err.to_string().contains("not allowed"));
     }
 
     #[test]
     fn request_with_no_host_returns_error() {
         let req = build_request("/path-only");
-        let hosts = vec!["example.com".to_string()];
-        let err = check_allowed_hosts(&req, &hosts).unwrap_err();
+        let err = check_allowed_hosts(&req, &hosts(&["example.com"])).unwrap_err();
         assert!(err.to_string().contains("no host"));
+    }
+
+    #[test]
+    fn star_any_matches_everything() {
+        let req = build_request("http://anything.example.com/path");
+        assert!(check_allowed_hosts(&req, &hosts(&["*"])).is_ok());
+    }
+
+    #[test]
+    fn url_policy_pins_scheme() {
+        let req = build_request("http://api.example.com/path");
+        assert!(check_allowed_hosts(&req, &hosts(&["https://api.example.com"])).is_err());
     }
 
     // --- error_response tests ---
@@ -1369,5 +1847,154 @@ mod tests {
     fn classify_error_defaults_to_other() {
         let err = anyhow::anyhow!("something unrelated");
         assert!(matches!(classify_error(&err), ComponentErrorKind::Other));
+    }
+
+    // --- split_host_port tests ---
+
+    #[test]
+    fn split_host_port_bare_host() {
+        assert_eq!(split_host_port("example.com"), ("example.com", None));
+    }
+
+    #[test]
+    fn split_host_port_host_with_port() {
+        assert_eq!(
+            split_host_port("example.com:8080"),
+            ("example.com", Some(8080))
+        );
+    }
+
+    #[test]
+    fn split_host_port_ipv4_with_port() {
+        assert_eq!(split_host_port("10.1.2.80:443"), ("10.1.2.80", Some(443)));
+    }
+
+    #[test]
+    fn split_host_port_ipv6_with_port() {
+        assert_eq!(split_host_port("[::1]:8080"), ("::1", Some(8080)));
+    }
+
+    #[test]
+    fn split_host_port_ipv6_without_port() {
+        assert_eq!(split_host_port("[2001:db8::1]"), ("2001:db8::1", None));
+    }
+
+    #[test]
+    fn split_host_port_invalid_port_is_dropped() {
+        // Non-numeric port can't be parsed; address is still returned.
+        assert_eq!(
+            split_host_port("example.com:notaport"),
+            ("example.com", None)
+        );
+    }
+
+    // --- OutgoingHandler delegation tests ---
+
+    fn dummy_config() -> OutgoingRequestConfig {
+        OutgoingRequestConfig {
+            use_tls: false,
+            connect_timeout: Duration::from_secs(30),
+            first_byte_timeout: Duration::from_secs(30),
+            between_bytes_timeout: Duration::from_secs(30),
+        }
+    }
+
+    struct SpyHandler {
+        called: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl OutgoingHandler for SpyHandler {
+        fn send_request(
+            &self,
+            _workload_id: &str,
+            _request: hyper::Request<HyperOutgoingBody>,
+            _config: OutgoingRequestConfig,
+        ) -> wasmtime_wasi_http::p2::HttpResult<
+            wasmtime_wasi_http::p2::types::HostFutureIncomingResponse,
+        > {
+            self.called.store(true, std::sync::atomic::Ordering::SeqCst);
+            Err(wasmtime_wasi_http::p2::HttpError::trap(
+                wasmtime::format_err!("spy: no real request"),
+            ))
+        }
+
+        #[cfg(feature = "wasip3")]
+        fn send_request_p3(
+            &self,
+            _workload_id: &str,
+            _request: hyper::Request<crate::host::http_p3::P3Body>,
+            _options: Option<wasmtime_wasi_http::p3::RequestOptions>,
+            _fut: crate::host::http_p3::P3RequestErrorFuture,
+        ) -> crate::host::http_p3::P3SendFuture {
+            unimplemented!("spy does not implement P3")
+        }
+    }
+
+    #[tokio::test]
+    async fn custom_outgoing_handler_is_invoked() {
+        let called = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let server = HttpServer::builder(DevRouter::default(), "127.0.0.1:0".parse().unwrap())
+            .outgoing_handler(SpyHandler {
+                called: called.clone(),
+            })
+            .build()
+            .await
+            .unwrap();
+        let request = build_request("http://example.com/");
+        // Explicit `[Any]` policy so the deny-all-on-empty default doesn't
+        // short-circuit before reaching the spy.
+        let allow_any = [AllowedHost::Any];
+        let _ = server.outgoing_request("test-workload", request, dummy_config(), &allow_any);
+        assert!(called.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    /// gRPC requests must bypass the OutgoingHandler and go directly to
+    /// send_grpc_request, so the spy must NOT be called.
+    #[tokio::test]
+    async fn grpc_requests_bypass_outgoing_handler() {
+        let called = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let server = HttpServer::builder(DevRouter::default(), "127.0.0.1:0".parse().unwrap())
+            .outgoing_handler(SpyHandler {
+                called: called.clone(),
+            })
+            .build()
+            .await
+            .unwrap();
+        let request = hyper::Request::builder()
+            .uri("http://example.com/")
+            .header(hyper::header::CONTENT_TYPE, "application/grpc")
+            .body(HyperOutgoingBody::default())
+            .unwrap();
+        // `[Any]` lets the policy check pass so the test actually verifies
+        // the gRPC dispatch path. With `&[]` (deny-all), the spy would
+        // appear "not called" because policy denied — for the wrong reason.
+        let allow_any = [AllowedHost::Any];
+        let _ = server.outgoing_request("test-workload", request, dummy_config(), &allow_any);
+        assert!(!called.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    /// NullServer must deny P3 outgoing requests with an internal error,
+    /// matching its P2 behaviour of returning "http client not available".
+    #[cfg(feature = "wasip3")]
+    #[tokio::test]
+    async fn null_server_denies_p3_outgoing_request() {
+        use crate::host::http_p3::{P3Body, P3RequestErrorFuture};
+        use http_body_util::BodyExt;
+
+        let server = NullServer::default();
+        let body: P3Body = http_body_util::Empty::new()
+            .map_err(|never| match never {})
+            .boxed_unsync();
+        let request = hyper::Request::builder()
+            .uri("http://example.com/")
+            .body(body)
+            .unwrap();
+        let fut: P3RequestErrorFuture = Box::new(async { Ok(()) });
+        let result =
+            Box::into_pin(server.outgoing_request_p3("test", request, None, fut, &[])).await;
+        assert!(
+            result.is_err(),
+            "NullServer P3 outgoing request should return an error"
+        );
     }
 }

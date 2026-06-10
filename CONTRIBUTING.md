@@ -13,7 +13,7 @@ Pull requests are welcome! The [good first issue][1] label is a great way to fin
 
 - **Rust** (latest stable version)
 - **Git**
-- **WebAssembly targets**: `wasm32-wasip2` (installed via `rustup target add wasm32-wasip2`)
+- **WebAssembly targets**: `wasm32-wasip2` and `wasm32-wasip1` (installed via `rustup target add wasm32-wasip2 wasm32-wasip1`) are both needed to build the `wash-runtime` wasm test fixtures.
 
 ### Building from Source
 
@@ -24,6 +24,16 @@ cargo build
 ```
 
 ### Running Tests
+
+The `wash-runtime` integration tests and benchmarks load precompiled wasm
+components from `crates/wash-runtime/tests/wasm/`. Build them once with the
+`xtask` task runner before running those tests (re-run it whenever you change
+a fixture under `crates/wash-runtime/tests/fixtures/`):
+
+```bash
+# Build the wasm test fixtures (writes crates/wash-runtime/tests/wasm/*.wasm)
+cargo xtask build-fixtures
+```
 
 ```bash
 # Run all tests
@@ -36,19 +46,46 @@ cargo test --bin wash
 
 ## Project Structure
 
-The `wash` crate is organized as a single crate with both binary and library targets:
+This repository is a workspace. The `wash` CLI lives in `crates/wash` and the core Wasm runtime it depends on lives in `crates/wash-runtime`:
 
 ```text
-src/                # The wash binary
-└── main.rs
-crates/wash/src/
-├── cli/            # CLI structs and command handling
-│   ├── mod.rs
-│   └── <subcommand>.rs
-├── <subcommand>.rs # Reusable types and libraries for commands
-├── lib.rs          # Module exports
-├── config.rs       # Configuration management
-└── new.rs          # Project creation functionality
+crates/
+├── bench-tools/            # Benchmarking utilities
+├── wash/                   # wash CLI crate
+│   └── src/
+│       ├── cli/            # CLI structs and command handling
+│       │   ├── mod.rs
+│       │   └── <subcommand>.rs
+│       ├── lib.rs          # Module exports
+│       ├── main.rs         # The wash binary entrypoint
+│       ├── config.rs       # Configuration management
+│       └── new.rs          # Project creation functionality
+└── wash-runtime/           # Core Wasm runtime powering wash
+    └── src/
+        ├── engine/         # Wasmtime engine setup and execution context
+        │   ├── ctx.rs      # Store context (WASI, linking state)
+        │   ├── value.rs    # Runtime value types
+        │   └── workload.rs # Workload execution logic
+        ├── host/           # Host-side interface implementations
+        │   ├── allowed_hosts.rs        # Network allow-list enforcement
+        │   ├── http.rs / http_p3.rs    # HTTP outbound host (P2 and P3)
+        │   └── sysinfo.rs              # System information host
+        ├── plugin/         # WASI and wasmCloud capability plugins
+        │   ├── wasi_blobstore/         # wasi:blobstore implementation
+        │   ├── wasi_config/            # wasi:config implementation
+        │   ├── wasi_keyvalue/          # wasi:keyvalue implementation
+        │   ├── wasi_logging/           # wasi:logging implementation
+        │   ├── wasi_otel/              # OpenTelemetry WASI bridge
+        │   ├── wasi_webgpu/            # wasi:webgpu implementation
+        │   ├── wasmcloud_messaging/    # wasmCloud messaging capability
+        │   └── wasmcloud_postgres/     # wasmCloud Postgres capability
+        ├── sockets/        # WASI sockets host implementations (TCP/UDP/network)
+        ├── washlet/        # Washlet runner (embedded Wasm plugin host)
+        ├── lib.rs          # Crate root and module exports
+        ├── observability.rs # Tracing and metrics setup
+        ├── oci.rs          # OCI registry image pulling
+        ├── types.rs        # Shared runtime types
+        └── wit.rs          # WIT interface bindings
 ```
 
 ## Code Style and Conventions

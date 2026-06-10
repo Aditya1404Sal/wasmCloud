@@ -22,9 +22,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     CARGO_PKG_VERSION,
     cli::update::fetch_latest_release_public,
-    config::{
-        Config, generate_default_config, load_config, locate_project_config, locate_user_config,
-    },
+    config::{Config, load_config, locate_project_config, locate_user_config},
 };
 
 pub mod completion;
@@ -488,32 +486,51 @@ impl CliContext {
         )
     }
 
-    /// Fetches the wash configuration from the config file located in the XDG config directory,
-    /// creating it with default values if it does not exist.
-    pub async fn ensure_config(&self, project_dir: Option<&Path>) -> anyhow::Result<Config> {
-        let config_path = self.user_config_path();
-
-        // Check if the config file exists, if not create it with defaults
-        if !config_path.exists() {
-            debug!(
-                ?config_path,
-                "config file not found, creating with defaults"
-            );
-            generate_default_config(&config_path, false).await?;
-        }
-
-        // Load the configuration using the hierarchical configuration system
-        load_config(&self.user_config_path(), project_dir, None::<Config>)
-    }
-
+    /// Prompt the user for a yes/no confirmation, returning the default answer (`true`)
+    /// when running in non-interactive mode.
     pub fn request_confirmation<S>(&self, prompt: S) -> anyhow::Result<bool>
     where
         S: Into<String>,
     {
+        if self.non_interactive {
+            return Ok(true);
+        }
+
         Confirm::with_theme(&ColorfulTheme::default())
             .with_prompt(prompt)
             .default(true)
             .interact()
             .context("failed to read user confirmation")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn request_confirmation_returns_true_in_non_interactive_mode() {
+        // CliContext::builder().build() mutates the process cwd; restore it before
+        // the tempdir drops so other parallel tests that read std::env::current_dir()
+        // don't see a deleted path.
+        let orig_cwd = std::env::current_dir().expect("get cwd");
+        let _restore = scopeguard::guard(orig_cwd, |c| {
+            let _ = std::env::set_current_dir(c);
+        });
+
+        let tempdir = tempfile::tempdir().unwrap();
+        let ctx = CliContext::builder()
+            .non_interactive(true)
+            .project_dir(tempdir.path().to_path_buf())
+            .build()
+            .await
+            .unwrap();
+
+        // Must not touch stdin: in CI / piped contexts the dialoguer call would
+        // error with "not a terminal", which is exactly the bug fix we're locking in.
+        assert!(
+            ctx.request_confirmation("would prompt the user")
+                .expect("non-interactive path should not read stdin")
+        );
     }
 }

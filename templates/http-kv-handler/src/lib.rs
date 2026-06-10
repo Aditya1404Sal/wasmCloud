@@ -4,16 +4,11 @@ mod bindings {
     });
 }
 
-use bindings::{
-    exports::wasi::http::incoming_handler::Guest,
-    wasi::{
-        http::types::{
-            Fields, IncomingBody, IncomingRequest, Method, OutgoingBody, OutgoingResponse,
-            ResponseOutparam,
-        },
-        keyvalue::store::open,
-    },
+use bindings::exports::wasi::http::incoming_handler::Guest;
+use bindings::wasi::http::types::{
+    Fields, IncomingBody, IncomingRequest, Method, OutgoingBody, OutgoingResponse, ResponseOutparam,
 };
+use bindings::wasi::keyvalue::store::open;
 
 struct Component;
 
@@ -29,8 +24,8 @@ struct Component;
 /// | `"nats"`       | `wasi_keyvalue_nats_url: nats://...`         |
 /// | `"redis"`      | `wasi_keyvalue_redis_url: redis://...`       |
 ///
-/// Change this constant and uncomment the matching section in `.wash/config.yaml`
-/// to switch backends.
+/// Change this constant and uncomment the matching section in
+/// `.wash/config.yaml` to switch backends.
 const BACKEND: &str = "in_memory";
 
 impl Guest for Component {
@@ -40,20 +35,38 @@ impl Guest for Component {
             Method::Get => handle_get(request),
             _ => (405u16, "Method Not Allowed\n".to_string()),
         };
-
-        let response = OutgoingResponse::new(Fields::new());
-        response.set_status_code(status).unwrap();
-        let out_body = response.body().unwrap();
-        ResponseOutparam::set(response_out, Ok(response));
-        let stream = out_body.write().unwrap();
-        stream.blocking_write_and_flush(body.as_bytes()).unwrap();
-        drop(stream);
-        OutgoingBody::finish(out_body, None).unwrap();
+        if let Err(e) = write_response(response_out, status, &body) {
+            eprintln!("failed to write response: {e}");
+        }
     }
 }
 
+/// Send the response back through `response_out`, returning the first error
+/// encountered (so the caller can log it). Returning `Result` rather than
+/// `.unwrap()`ing keeps us inside the workspace's clippy::unwrap_used deny.
+fn write_response(response_out: ResponseOutparam, status: u16, body: &str) -> Result<(), String> {
+    let response = OutgoingResponse::new(Fields::new());
+    response
+        .set_status_code(status)
+        .map_err(|()| format!("invalid status code: {status}"))?;
+    let out_body = response
+        .body()
+        .map_err(|()| "failed to take response body".to_string())?;
+    ResponseOutparam::set(response_out, Ok(response));
+    let stream = out_body
+        .write()
+        .map_err(|()| "failed to open body stream".to_string())?;
+    stream
+        .blocking_write_and_flush(body.as_bytes())
+        .map_err(|e| format!("write failed: {e:?}"))?;
+    drop(stream);
+    OutgoingBody::finish(out_body, None).map_err(|e| format!("finish failed: {e:?}"))?;
+    Ok(())
+}
+
 /// Handle `POST /` with a JSON body `{"key": "...", "value": "..."}`.
-/// Stores the key-value pair in the configured backend under the `BACKEND` bucket.
+/// Stores the key-value pair in the configured backend under the `BACKEND`
+/// bucket.
 fn handle_post(request: IncomingRequest) -> (u16, String) {
     let body_bytes = match read_body(request) {
         Ok(b) => b,
@@ -62,7 +75,12 @@ fn handle_post(request: IncomingRequest) -> (u16, String) {
 
     let payload: KvPayload = match serde_json::from_slice(&body_bytes) {
         Ok(v) => v,
-        Err(e) => return (400, format!("Invalid JSON (expected {{\"key\":\"...\",\"value\":\"...\"}}): {e}\n")),
+        Err(e) => {
+            return (
+                400,
+                format!("Invalid JSON (expected {{\"key\":\"...\",\"value\":\"...\"}}): {e}\n"),
+            );
+        }
     };
 
     let bucket = match open(BACKEND) {
@@ -92,7 +110,10 @@ fn handle_get(request: IncomingRequest) -> (u16, String) {
     };
 
     match bucket.get(&key) {
-        Ok(Some(bytes)) => (200, format!("[{BACKEND}] {}\n", String::from_utf8_lossy(&bytes))),
+        Ok(Some(bytes)) => (
+            200,
+            format!("[{BACKEND}] {}\n", String::from_utf8_lossy(&bytes)),
+        ),
         Ok(None) => (404, format!("[{BACKEND}] Key '{key}' not found\n")),
         Err(e) => (500, format!("[{BACKEND}] Failed to get key: {e:?}\n")),
     }
@@ -126,7 +147,7 @@ fn read_body(request: IncomingRequest) -> Result<Vec<u8>, String> {
 }
 
 fn parse_query_param(path_and_query: &str, param: &str) -> Option<String> {
-    let query = path_and_query.splitn(2, '?').nth(1)?;
+    let query = path_and_query.split_once('?')?.1;
     for pair in query.split('&') {
         let mut parts = pair.splitn(2, '=');
         if parts.next()? == param {
@@ -136,4 +157,8 @@ fn parse_query_param(path_and_query: &str, param: &str) -> Option<String> {
     None
 }
 
-bindings::export!(Component with_types_in bindings);
+#[allow(unsafe_code)] // bindings::export! emits unsafe FFI shims
+mod export {
+    use super::{Component, bindings};
+    bindings::export!(Component with_types_in bindings);
+}

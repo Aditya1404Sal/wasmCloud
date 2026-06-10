@@ -50,6 +50,8 @@ use wasmtime::PoolingAllocationConfig;
 use wasmtime::component::{Component, Linker};
 
 use crate::engine::ctx::SharedCtx;
+#[cfg(feature = "wasi-tls")]
+use crate::engine::ctx::SharedTlsProvider;
 use crate::engine::workload::{UnresolvedWorkload, WorkloadComponent, WorkloadService};
 use crate::types::{EmptyDirVolume, HostPathVolume, VolumeType, Workload};
 use std::env;
@@ -187,6 +189,10 @@ fn add_wasi_to_linker(
 
         // Sockets with our custom P3 implementation (with loopback)
         crate::sockets::add_p3_to_linker(linker)?;
+
+        // wasi:tls@0.3.0-draft (p3).
+        #[cfg(feature = "wasi-tls")]
+        wasmtime_wasi_tls::p3::add_to_linker(linker)?;
     }
 
     Ok(())
@@ -230,7 +236,7 @@ pub mod workload;
 /// The `Engine` is responsible for compiling WebAssembly components, managing
 /// their lifecycle, and providing the runtime environment for execution.
 /// It wraps a wasmtime engine with additional functionality for workload management.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Engine {
     // wasmtime engine
     pub(crate) inner: wasmtime::Engine,
@@ -242,6 +248,20 @@ pub struct Engine {
     /// Whether WASIP3 support is enabled for this engine.
     #[cfg(feature = "wasip3")]
     wasip3: bool,
+    /// TLS provider override for `wasi:tls` client connections.
+    #[cfg(feature = "wasi-tls")]
+    pub(crate) tls_provider: Option<SharedTlsProvider>,
+}
+
+impl std::fmt::Debug for Engine {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut s = f.debug_struct("Engine");
+        #[cfg(feature = "wasip3")]
+        s.field("wasip3", &self.wasip3);
+        #[cfg(feature = "wasi-tls")]
+        s.field("tls_provider", &self.tls_provider.is_some());
+        s.finish_non_exhaustive()
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
@@ -385,14 +405,19 @@ impl Engine {
             }
         }
 
-        Ok(UnresolvedWorkload::new(
+        let workload = UnresolvedWorkload::new(
             id.as_ref(),
             name,
             namespace,
             service,
             workload_components,
             host_interfaces,
-        ))
+        );
+
+        #[cfg(feature = "wasi-tls")]
+        let workload = workload.maybe_with_tls_provider(self.tls_provider.clone());
+
+        Ok(workload)
     }
 
     #[instrument(name = "initialize_service", skip_all)]
@@ -721,6 +746,9 @@ pub struct EngineBuilder {
     compiled_cache_dir: Option<PathBuf>,
     #[cfg(feature = "wasip3")]
     wasip3: bool,
+    /// Optional TLS provider override for wasi:tls client connections.
+    #[cfg(feature = "wasi-tls")]
+    tls_provider: Option<SharedTlsProvider>,
 }
 
 impl EngineBuilder {
@@ -794,6 +822,17 @@ impl EngineBuilder {
         self.wasip3 = enable;
         self
     }
+
+    /// Override the TLS provider used for `wasi:tls` client connections.
+    ///
+    /// Use this to plug in an alternative TLS backend, install a custom root
+    /// certificate store (corporate CAs, certificate pinning), or integrate
+    /// with HSM-backed key material.
+    #[cfg(feature = "wasi-tls")]
+    pub fn with_tls_provider(mut self, provider: SharedTlsProvider) -> Self {
+        self.tls_provider = Some(provider);
+        self
+    }
 }
 
 impl EngineBuilder {
@@ -809,6 +848,18 @@ impl EngineBuilder {
     /// # Errors
     /// Returns an error if the wasmtime engine creation fails.
     pub fn build(mut self) -> anyhow::Result<Engine> {
+        #[cfg(feature = "wasi-tls")]
+        {
+            crate::init_crypto();
+            if self.tls_provider.is_none() {
+                tracing::warn!(
+                    "wasi-tls is enabled but no TLS provider was set; \
+                     falling back to wasmtime-wasi-tls default — \
+                     set one via EngineBuilder::with_tls_provider"
+                );
+            }
+        }
+
         // If a custom config was provided, use it as-is
         let config = if let Some(cfg) = self.config.take() {
             if self.max_instances.is_some() || self.use_pooling_allocator.is_some() {
@@ -870,6 +921,8 @@ impl EngineBuilder {
             compiled_cache_dir: self.compiled_cache_dir,
             #[cfg(feature = "wasip3")]
             wasip3: self.wasip3,
+            #[cfg(feature = "wasi-tls")]
+            tls_provider: self.tls_provider,
         })
     }
 }
