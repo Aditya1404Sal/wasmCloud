@@ -10,6 +10,7 @@
 //! [`crate::host::http::OutgoingHandler`] trait via its `send_request_p3` method.
 
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll};
 
 use crate::engine::ctx::SharedCtx;
@@ -42,6 +43,14 @@ pub type P3CompletionHook = Box<dyn FnOnce() + Send + 'static>;
 
 /// Future returned by [`crate::host::http::OutgoingHandler::send_request_p3`].
 pub type P3SendFuture = Box<dyn std::future::Future<Output = P3SendResult> + Send>;
+
+static P3_ROOT_INSTANTIATIONS: AtomicU64 = AtomicU64::new(0);
+
+fn p3_instance_trace_enabled() -> bool {
+    std::env::var("WASH_P3_INSTANCE_TRACE")
+        .map(|value| matches!(value.as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false)
+}
 
 /// Streaming body wrapper that signals when hyper is done reading
 /// (drained or dropped) so the owning `Store::run_concurrent` can exit.
@@ -114,6 +123,9 @@ pub async fn handle_component_request_p3(
 ) -> anyhow::Result<hyper::Response<P3Body>> {
     let _ = &fuel_meter; // fuel metering: see P2's observe() pattern
 
+    let component_id = store.data().active_ctx.component_id.clone();
+    let store_id = store.data().active_ctx.store_id.clone();
+    let trace_instances = p3_instance_trace_enabled();
     let mut on_complete = Some(on_complete);
 
     let service_pre = match ServicePre::new(pre)
@@ -140,7 +152,21 @@ pub async fn handle_component_request_p3(
         .await
         .map_err(|e| anyhow::anyhow!(e).context("failed to instantiate P3 service"))
     {
-        Ok(service) => service,
+        Ok(service) => {
+            if trace_instances {
+                let total = P3_ROOT_INSTANTIATIONS.fetch_add(1, Ordering::Relaxed) + 1;
+                tracing::info!(
+                    target: "wash_runtime::p3_instance_trace",
+                    kind = "root",
+                    action = "instantiate",
+                    component_id = %component_id,
+                    store_id = %store_id,
+                    total_root_instantiations = total,
+                    "P3 instance trace"
+                );
+            }
+            service
+        }
         Err(err) => {
             if let Some(on_complete) = on_complete.take() {
                 on_complete();
@@ -205,6 +231,17 @@ pub async fn handle_component_request_p3(
 
         if let Err(e) = result {
             tracing::error!(err = ?e, "P3 run_concurrent failed");
+        }
+
+        if trace_instances {
+            tracing::info!(
+                target: "wash_runtime::p3_instance_trace",
+                kind = "root",
+                action = "complete",
+                component_id = %component_id,
+                store_id = %store_id,
+                "P3 instance trace"
+            );
         }
 
         if let Some(on_complete) = on_complete.take() {
