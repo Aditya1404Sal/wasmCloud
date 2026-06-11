@@ -1,11 +1,26 @@
 package betty-blocks:stream-broker@0.1.0;
 
 interface broker {
+    /// Allocate a subscriber slot. `register` and `unregister` are
+    /// synchronous because they only touch the broker's in-memory
+    /// table and never block.
     register: func() -> u64;
     unregister: func(client-id: u64);
+
+    /// Wait for the next message addressed to `client-id`. Suspends
+    /// the caller via the p3 async canonical ABI; returns `none` when
+    /// the broker closes the subscription (e.g. shutdown).
     wait-message: async func(client-id: u64) -> option<string>;
+
+    /// Publish `message` to every registered subscriber. Async so
+    /// publishers can pace themselves against slow consumers without
+    /// blocking the host scheduler.
     publish-message: async func(message: string) -> result<_, string>;
-    request-cancel: func(key: string) -> u64;
-    cancel-generation: func(key: string) -> u64;
-    wait-cancel-after: async func(key: string, generation: u64) -> u64;
+
+    /// Increment the workload-wide cancellation generation. Long-running
+    /// stream drains can compare `cancel-generation` with their starting value
+    /// and cancel any in-flight producer resource when it changes.
+    request-cancel: func() -> u64;
+    cancel-generation: func() -> u64;
+    wait-cancel-after: async func(generation: u64) -> u64;
 }
