@@ -1514,8 +1514,8 @@ async fn send_grpc_request_handler(
         (sender, worker)
     };
 
-    // Strip scheme/authority from URI for the actual HTTP/2 request
-    // The URI was already validated, so rebuilding with just path+query is safe
+    // We keep the scheme in the request to be compliant to
+    // https://datatracker.ietf.org/doc/html/rfc7540#autoid-58
     if let Ok(uri) = hyper::Uri::builder()
         .scheme(if use_tls { "https" } else { "http" })
         .path_and_query(
