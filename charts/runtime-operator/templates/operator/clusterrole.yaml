@@ -1,4 +1,12 @@
-{{- if and .Values.operator.enabled .Values.operator.serviceAccount.create -}}
+{{- if and .Values.operator.enabled .Values.operator.serviceAccount.create (not .Values.operator.watchNamespaces) -}}
+# This ClusterRole is only rendered when operator.watchNamespaces is empty, i.e.
+# the operator watches all namespaces and every grant below is cluster-wide.
+# When watchNamespaces is set, this ClusterRole (and its ClusterRoleBinding) is
+# omitted entirely and the equivalent permissions are bound per-namespace via
+# Roles/RoleBindings — see workload-crd-role.yaml (runtime.wasmcloud.dev CRDs),
+# workload-namespace-role.yaml (configmaps/secrets/services/events), and
+# endpointslice-role.yaml (endpointslices).
+# See https://wasmcloud.com/docs/kubernetes-operator/operator-manual/roles-and-rolebindings/#restricting-access-of-the-operator-to-namespaces
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
@@ -36,6 +44,17 @@ rules:
     - get
     - update
     - patch
+  # Required so the operator can stamp ownerReferences with blockOwnerDeletion=true
+  # on child objects — the GC admission plugin checks `update` on <owner>/finalizers.
+  - apiGroups:
+    - runtime.wasmcloud.dev
+    resources:
+    - artifacts/finalizers
+    - workloads/finalizers
+    - workloadreplicasets/finalizers
+    - workloaddeployments/finalizers
+    verbs:
+    - update
   - apiGroups:
     - ""
     resources:
@@ -82,6 +101,15 @@ rules:
     - jobs/status
     verbs:
     - get
+  # The route controller stamps EndpointSlices with a Service ownerRef +
+  # blockOwnerDeletion=true, so the GC admission plugin requires `update`
+  # on services/finalizers.
+  - apiGroups:
+    - ""
+    resources:
+    - services/finalizers
+    verbs:
+    - update
   {{- if not .Values.operator.watchNamespaces }}
   # If the operator is watching all namespaces, it needs permissions to manage EndpointSlices across the cluster. If it's only watching specific
   # namespaces, a more limited Role and RoleBinding will be created in each namespace instead, and this ClusterRole will not include permissions

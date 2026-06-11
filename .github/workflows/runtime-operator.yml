@@ -6,25 +6,43 @@ on:
     tags:
       - "v*"
   pull_request:
-    paths:
-      - ".github/workflows/runtime-operator.yml"
-      - "runtime-operator/**"
-      - "proto/**"
-      - "charts/runtime-operator/**"
-      - "deploy/kind/kind-config.yaml"
-
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
-permissions:
-  contents: read
+permissions: {}
 
 env:
   GOWORK: "off"
 
 jobs:
+  changes:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      relevant: ${{ steps.filter.outputs.relevant }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: dorny/paths-filter@fbd0ab8f3e69293af611ebaee6363fc25e6d187d # v4.0.1
+        id: filter
+        with:
+          filters: |
+            relevant:
+              - '.github/workflows/runtime-operator.yml'
+              - 'runtime-operator/**'
+              - 'proto/**'
+              - 'charts/runtime-operator/**'
+              - 'deploy/kind/kind-config.yaml'
+
   lint:
+    needs:
+      - changes
+    if: always() && (needs.changes.result == 'skipped' || needs.changes.outputs.relevant == 'true' || contains(github.event.pull_request.labels.*.name, 'canary'))
     permissions:
       # Required: allow read access to the content for analysis.
       contents: read
@@ -38,8 +56,46 @@ jobs:
         with:
           working-directory: runtime-operator
 
-  test:
+  # Two related checks bundled in one job because they share the same source
+  # of truth (controller-gen `+kubebuilder:rbac` annotations → config/rbac/role.yaml):
+  #   1. `make manifests` produces no diff — catches annotations that were
+  #      added/edited without re-running controller-gen, and annotations
+  #      placed where controller-gen silently skips them.
+  #   2. The Helm chart grants every (apiGroup, resource, verb) tuple in
+  #      role.yaml — catches new markers landing in code without the matching
+  #      chart update (the chart is hand-mapped from role.yaml).
+  manifests:
+    needs:
+      - changes
+    if: always() && (needs.changes.result == 'skipped' || needs.changes.outputs.relevant == 'true' || contains(github.event.pull_request.labels.*.name, 'canary'))
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-go
+      - uses: azure/setup-helm@dda3372f752e03dde6b3237bc9431cdc2f7a02a2 # v5.0.0
+        with:
+          version: v3.16.4
+      - name: Regenerate manifests
+        working-directory: runtime-operator
+        run: make manifests
+      - uses: ./.github/actions/no-diff
+        with:
+          path: runtime-operator
+          fixup-command: "(cd runtime-operator && make manifests)"
+      - name: Verify Helm chart RBAC parity with controller-gen output
+        run: node .github/scripts/runtime-operator-rbac-parity.mjs
+
+  test:
+    needs:
+      - changes
+    if: always() && (needs.changes.result == 'skipped' || needs.changes.outputs.relevant == 'true' || contains(github.event.pull_request.labels.*.name, 'canary'))
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -53,8 +109,19 @@ jobs:
         run: make test
 
   build:
-    needs: [lint, test]
+    needs:
+      - lint
+      - test
+    # `lint`/`test` use `if: always() && (changes.skipped || ...)` so they
+    # run on main pushes where `changes` is skipped. Without `always()`
+    # here, GHA propagates `changes`'s skipped state through the chain and
+    # marks `build` skipped even when lint/test both succeeded — which
+    # then cascades into `test-e2e` and `canary`. Explicit per-need
+    # success gates are the documented workaround.
+    if: always() && needs.lint.result == 'success' && needs.test.result == 'success'
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -71,9 +138,16 @@ jobs:
           retention-days: 1
 
   test-e2e:
-    needs: [build]
+    needs:
+      - build
+    # `build` overrides default with `always()` to bypass the skipped
+    # `changes` upstream; this job needs the same override so the skip
+    # state from `changes` doesn't propagate further.
+    if: always() && needs.build.result == 'success'
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -115,12 +189,44 @@ jobs:
           kubectl get workloaddeployments.runtime.wasmcloud.dev -A -o yaml || true
           kubectl get workloads.runtime.wasmcloud.dev -A -o yaml || true
 
+  gate:
+    needs:
+      - lint
+      - test
+      - manifests
+      - build
+      - test-e2e
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require all jobs to pass or be skipped
+        env:
+          RESULTS: ${{ toJSON(needs.*.result) }}
+        run: |
+          if echo "$RESULTS" | grep -qE '"(failure|cancelled)"'; then
+            exit 1
+          fi
+
   # The `sha-<full-sha>` tag is what release-tag.yml pins to when promoting
   # this canary digest as the immutable vX.Y.Z release tag. `canary` itself
   # moves on every subsequent main push.
   canary:
-    if: github.ref == 'refs/heads/main' || contains(github.event.pull_request.labels.*.name, 'canary')
-    needs: [lint, test, test-e2e]
+    # `always()` is required to break the skipped-`changes` propagation
+    # that otherwise marks this job skipped even when its direct needs
+    # all succeed. The original intent — run on main pushes or PRs with
+    # the `canary` label — is preserved as the second clause; the
+    # per-need `result == 'success'` gates restore the implicit success()
+    # check that `always()` disables.
+    if: |
+      always() &&
+      (github.ref == 'refs/heads/main' || contains(github.event.pull_request.labels.*.name, 'canary')) &&
+      needs.lint.result == 'success' &&
+      needs.test.result == 'success' &&
+      needs.test-e2e.result == 'success'
+    needs:
+      - lint
+      - test
+      - test-e2e
     permissions:
       contents: write
       packages: write

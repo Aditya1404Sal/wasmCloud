@@ -1,6 +1,14 @@
 //! Shared helpers for wash-runtime integration tests.
 
 #![allow(dead_code)]
+// Shared builder helpers unwrap/expect on constant fixtures in non-`#[test]`
+// fns, which the clippy.toml in-tests allows don't cover. This module is
+// included by many test crates, so keep the allow self-contained here rather
+// than relying on every consumer to carry one.
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
+#[cfg(feature = "wasi-tls")]
+pub mod tls;
 
 use anyhow::{Context, Result};
 use std::{collections::HashMap, path::Path, sync::Arc, time::Duration};
@@ -10,7 +18,7 @@ use wash_runtime::{
     engine::Engine,
     host::{
         HostApi, HostBuilder,
-        http::{DevRouter, DynamicRouter, HttpServer},
+        http::{DevRouter, DynamicRouter, HttpServer, TlsConfig},
     },
     plugin::{
         wasi_blobstore::InMemoryBlobstore, wasi_config::DynamicConfig,
@@ -154,13 +162,16 @@ pub fn component_workload_request(
 }
 
 pub fn default_counter_resources() -> LocalResources {
+    // http-counter calls example.com — encode that exact host in the
+    // policy so the deny-all default doesn't block it AND the test
+    // documents which upstream the fixture talks to.
     LocalResources {
         memory_limit_mb: 256,
         cpu_limit: 1,
         config: HashMap::new(),
         environment: HashMap::new(),
         volume_mounts: vec![],
-        allowed_hosts: Default::default(),
+        allowed_hosts: vec!["example.com".parse().unwrap()].into(),
     }
 }
 
@@ -169,11 +180,11 @@ pub fn default_counter_resources() -> LocalResources {
 fn with_standard_plugins(
     builder: wash_runtime::host::HostBuilder,
 ) -> Result<wash_runtime::host::HostBuilder> {
-    Ok(builder
+    builder
         .with_plugin(Arc::new(InMemoryBlobstore::new(None)))?
         .with_plugin(Arc::new(InMemoryKeyValue::new()))?
         .with_plugin(Arc::new(TracingLogger::default()))?
-        .with_plugin(Arc::new(DynamicConfig::default()))?)
+        .with_plugin(Arc::new(DynamicConfig::default()))
 }
 
 /// Start a host with a "DevRouter" backed HTTP server and the standard plugin
@@ -223,9 +234,7 @@ pub async fn start_host_with_tls(
     let http_server = HttpServer::new_with_tls(
         DevRouter::default(),
         "127.0.0.1:0".parse()?,
-        cert_path,
-        key_path,
-        None,
+        TlsConfig::new(cert_path, key_path),
     )
     .await?;
     let bound_addr = http_server.addr();

@@ -194,15 +194,13 @@ fn validate_interface_ref(package: &str) -> Result<()> {
 
     if !name_part.contains(':') {
         bail!(
-            "Invalid package format '{}': must be in 'namespace:package/interface' format (e.g., 'wasi:http/types')",
-            name_part
+            "Invalid package format '{name_part}': must be in 'namespace:package/interface' format (e.g., 'wasi:http/types')"
         );
     }
 
     if !name_part.contains('/') {
         bail!(
-            "Invalid package format '{}': must include interface name in 'namespace:package/interface' format (e.g., 'wasi:http/types')",
-            name_part
+            "Invalid package format '{name_part}': must include interface name in 'namespace:package/interface' format (e.g., 'wasi:http/types')"
         );
     }
 
@@ -412,7 +410,7 @@ async fn handle_update(
 
         if lock_file.packages.len() == before_count {
             return Ok(CommandOutput::error(
-                format!("Package '{}' not found in lock file", package_name),
+                format!("Package '{package_name}' not found in lock file"),
                 None,
             ));
         }
@@ -435,7 +433,7 @@ async fn handle_update(
         handle_fetch(ctx, config, false).await?;
 
         Ok(CommandOutput::ok(
-            format!("Updated package: {}", package_name),
+            format!("Updated package: {package_name}"),
             Some(serde_json::json!({
                 "package": package_name,
                 "wit_dir": wit_dir.display().to_string(),
@@ -496,7 +494,7 @@ async fn handle_add(ctx: &CliContext, package: &str, config: &Config) -> Result<
     let world_wit_path = match find_world_wit_file(&wit_dir).await {
         Ok(path) => path,
         Err(e) => {
-            return Ok(CommandOutput::error(format!("{:#}", e), None));
+            return Ok(CommandOutput::error(format!("{e:#}"), None));
         }
     };
 
@@ -557,7 +555,7 @@ async fn handle_add(ctx: &CliContext, package: &str, config: &Config) -> Result<
 
                 if !has_more_imports {
                     // Insert after the last import
-                    new_lines.push(format!("{}{}", world_indent, import_line));
+                    new_lines.push(format!("{world_indent}{import_line}"));
                     inserted = true;
                 }
             } else if trimmed.starts_with("world ") && trimmed.ends_with('{') {
@@ -572,7 +570,7 @@ async fn handle_add(ctx: &CliContext, package: &str, config: &Config) -> Result<
 
                 if !has_imports {
                     // No imports yet, insert as first line in world block
-                    new_lines.push(format!("{}{}", world_indent, import_line));
+                    new_lines.push(format!("{world_indent}{import_line}"));
                     inserted = true;
                 }
             }
@@ -643,7 +641,7 @@ async fn handle_remove(_ctx: &CliContext, package: &str, config: &Config) -> Res
     let world_wit_path = match find_world_wit_file(&wit_dir).await {
         Ok(path) => path,
         Err(e) => {
-            return Ok(CommandOutput::error(format!("{:#}", e), None));
+            return Ok(CommandOutput::error(format!("{e:#}"), None));
         }
     };
 
@@ -925,9 +923,8 @@ world example {
         assert!(content.contains("import wasi:cli@0.2.0;"));
 
         // Remove the import
-        let lines: Vec<&str> = content.lines().collect();
-        let new_lines: Vec<&str> = lines
-            .into_iter()
+        let new_lines: Vec<&str> = content
+            .lines()
             .filter(|line| {
                 let trimmed = line.trim();
                 !(trimmed.starts_with("import ") && trimmed.contains("wasi:cli"))
@@ -982,7 +979,7 @@ world example {
                 let trimmed = line.trim();
                 // Insert after the opening brace of the world block
                 if trimmed.starts_with("world ") && trimmed.ends_with('{') {
-                    new_lines.push(format!("   {}", import_line)); // Indent inside world block
+                    new_lines.push(format!("   {import_line}")); // Indent inside world block
                     inserted = true;
                 }
             }
@@ -1080,9 +1077,9 @@ world example {
         let version = Some("1.0.0".to_string());
 
         let filename = if let Some(ver) = &version {
-            format!("{}-{}.wasm", package_name, ver)
+            format!("{package_name}-{ver}.wasm")
         } else {
-            format!("{}.wasm", package_name)
+            format!("{package_name}.wasm")
         };
 
         assert_eq!(filename, "test-package-1.0.0.wasm");
@@ -1094,9 +1091,9 @@ world example {
         let version: Option<String> = None;
 
         let filename = if let Some(ver) = &version {
-            format!("{}-{}.wasm", package_name, ver)
+            format!("{package_name}-{ver}.wasm")
         } else {
-            format!("{}.wasm", package_name)
+            format!("{package_name}.wasm")
         };
 
         assert_eq!(filename, "test-package.wasm");
@@ -1256,9 +1253,8 @@ world example {
             .await
             .expect("failed to read world.wit");
 
-        let lines: Vec<&str> = read_content.lines().collect();
-        let new_lines: Vec<&str> = lines
-            .into_iter()
+        let new_lines: Vec<&str> = read_content
+            .lines()
             .filter(|line| {
                 let trimmed = line.trim();
                 if trimmed.starts_with("import ") {
@@ -1369,9 +1365,9 @@ digest = "sha256:abcdef1234567890abcdef1234567890abcdef1234567890abcdef123456789
 
         // Simulate the default output path logic
         let filename = if let Some(ver) = &version {
-            format!("{}-{}.wasm", package_name, ver)
+            format!("{package_name}-{ver}.wasm")
         } else {
-            format!("{}.wasm", package_name)
+            format!("{package_name}.wasm")
         };
         let default_output = project_dir.join(filename);
 
@@ -1394,9 +1390,9 @@ digest = "sha256:abcdef1234567890abcdef1234567890abcdef1234567890abcdef123456789
             output.to_path_buf()
         } else {
             let filename = if let Some(ver) = &version {
-                format!("{}-{}.wasm", package_name, ver)
+                format!("{package_name}-{ver}.wasm")
             } else {
-                format!("{}.wasm", package_name)
+                format!("{package_name}.wasm")
             };
             project_dir.join(filename)
         };
@@ -1495,20 +1491,16 @@ world example {
         let lines: Vec<&str> = content.lines().collect();
 
         // Verify comments are preserved and not mistaken for imports
-        let comment_lines: Vec<_> = lines
-            .iter()
-            .filter(|l| l.trim().starts_with("//"))
-            .collect();
-        assert_eq!(comment_lines.len(), 3, "Should preserve all comment lines");
+        let comment_count = lines.iter().filter(|l| l.trim().starts_with("//")).count();
+        assert_eq!(comment_count, 3, "Should preserve all comment lines");
 
         // Verify import detection works correctly (ignores comments)
-        let import_lines: Vec<_> = lines
+        let import_count = lines
             .iter()
             .filter(|l| l.trim().starts_with("import "))
-            .collect();
+            .count();
         assert_eq!(
-            import_lines.len(),
-            1,
+            import_count, 1,
             "Should find only actual import, not comments"
         );
     }
@@ -1535,9 +1527,8 @@ world example {
             .await
             .expect("failed to read world.wit");
 
-        let lines: Vec<&str> = content.lines().collect();
-        let new_lines: Vec<&str> = lines
-            .into_iter()
+        let new_lines: Vec<&str> = content
+            .lines()
             .filter(|line| {
                 let trimmed = line.trim();
                 if trimmed.starts_with("import ") {

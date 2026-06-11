@@ -18,6 +18,8 @@ use wasmtime::component::{
 use wasmtime_wasi::p2::bindings::CommandPre;
 use wasmtime_wasi::{DirPerms, FilePerms, WasiCtxBuilder};
 
+#[cfg(feature = "wasi-tls")]
+use crate::engine::ctx::SharedTlsProvider;
 use crate::{
     engine::{
         ctx::{Ctx, SharedCtx},
@@ -464,7 +466,7 @@ impl DerefMut for WorkloadService {
 /// A `ResolvedWorkload` contains all components that have been validated,
 /// bound to plugins, and had their dependencies resolved. This is the final
 /// state of a workload before execution.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ResolvedWorkload {
     /// The unique identifier of the workload, created with [uuid::Uuid::new_v4]
     id: Arc<str>,
@@ -481,6 +483,31 @@ pub struct ResolvedWorkload {
     service: Option<WorkloadService>,
     /// The requested host [`WitInterface`]s to resolve this workload
     host_interfaces: Vec<WitInterface>,
+    /// TLS provider override for `wasi:tls` client connections in this workload.
+    #[cfg(feature = "wasi-tls")]
+    tls_provider: Option<SharedTlsProvider>,
+}
+
+impl std::fmt::Debug for ResolvedWorkload {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut s = f.debug_struct("ResolvedWorkload");
+        s.field("id", &self.id)
+            .field("name", &self.name)
+            .field("namespace", &self.namespace)
+            .field("host_interfaces", &self.host_interfaces)
+            .field("has_service", &self.service.is_some())
+            .field(
+                "component_count",
+                &self
+                    .components
+                    .try_read()
+                    .map(|g| g.len() as isize)
+                    .unwrap_or(-1),
+            );
+        #[cfg(feature = "wasi-tls")]
+        s.field("tls_provider", &self.tls_provider.is_some());
+        s.finish_non_exhaustive()
+    }
 }
 
 impl ResolvedWorkload {
@@ -1146,6 +1173,11 @@ impl ResolvedWorkload {
             ctx_builder = ctx_builder.with_plugins(plugins.clone());
         }
 
+        #[cfg(feature = "wasi-tls")]
+        if let Some(provider) = self.tls_provider.clone() {
+            ctx_builder = ctx_builder.with_tls_provider(provider);
+        }
+
         Ok(ctx_builder.build())
     }
 
@@ -1291,6 +1323,9 @@ pub struct UnresolvedWorkload {
     service: Option<WorkloadService>,
     /// All [`WorkloadComponent`]s in the workload
     components: HashMap<Arc<str>, WorkloadComponent>,
+    /// TLS provider override for `wasi:tls` client connections in this workload.
+    #[cfg(feature = "wasi-tls")]
+    tls_provider: Option<SharedTlsProvider>,
 }
 
 impl UnresolvedWorkload {
@@ -1328,6 +1363,28 @@ impl UnresolvedWorkload {
                 })
                 .collect(),
             host_interfaces,
+            #[cfg(feature = "wasi-tls")]
+            tls_provider: None,
+        }
+    }
+
+    /// Override the TLS provider used for `wasi:tls` client connections in this workload.
+    ///
+    /// Use this to plug in an alternative TLS backend, install a custom root
+    /// certificate store (corporate CAs, certificate pinning), or integrate
+    /// with HSM-backed key material.
+    #[cfg(feature = "wasi-tls")]
+    pub fn with_tls_provider(mut self, provider: SharedTlsProvider) -> Self {
+        self.tls_provider = Some(provider);
+        self
+    }
+
+    /// Apply an optional TLS provider override. No-op when `None`.
+    #[cfg(feature = "wasi-tls")]
+    pub fn maybe_with_tls_provider(self, provider: Option<SharedTlsProvider>) -> Self {
+        match provider {
+            Some(p) => self.with_tls_provider(p),
+            None => self,
         }
     }
 
@@ -1664,6 +1721,8 @@ impl UnresolvedWorkload {
             service: self.service,
             host_interfaces: self.host_interfaces,
             http_handler: http_handler.clone(),
+            #[cfg(feature = "wasi-tls")]
+            tls_provider: self.tls_provider,
         };
 
         // Link components before plugin resolution
@@ -1810,10 +1869,7 @@ fn topological_sort_components(
             .filter(|id| !result.contains(id))
             .map(|id| id.as_ref())
             .collect();
-        bail!(
-            "circular dependency detected among components: {:?}",
-            unprocessed
-        );
+        bail!("circular dependency detected among components: {unprocessed:?}");
     }
 
     Ok(result)
@@ -1838,8 +1894,8 @@ impl AsRef<str> for IdFlavor {
 impl std::fmt::Display for IdFlavor {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            IdFlavor::Component(id) => write!(f, "Component({})", id),
-            IdFlavor::Service(id) => write!(f, "Service({})", id),
+            IdFlavor::Component(id) => write!(f, "Component({id})"),
+            IdFlavor::Service(id) => write!(f, "Service({id})"),
         }
     }
 }
@@ -2449,8 +2505,7 @@ mod tests {
         let result = topological_sort_components(&dependencies);
         assert!(
             result.is_err(),
-            "Should detect circular dependency: {:?}",
-            result
+            "Should detect circular dependency: {result:?}"
         );
     }
 

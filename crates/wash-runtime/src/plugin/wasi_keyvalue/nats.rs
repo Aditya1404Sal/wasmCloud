@@ -15,6 +15,7 @@ use crate::engine::workload::WorkloadItem;
 use crate::plugin::HostPlugin;
 use crate::wit::{WitInterface, WitWorld};
 use futures::StreamExt;
+use tracing::instrument;
 use wasmtime::component::Resource;
 
 const LIST_KEYS_BATCH_SIZE: usize = 1000;
@@ -78,6 +79,7 @@ impl NatsKeyValue {
 
 // Implementation for the store interface
 impl<'a> bindings::wasi::keyvalue::store::Host for ActiveCtx<'a> {
+    #[instrument(name = "wasi.keyvalue.open", skip(self))]
     async fn open(
         &mut self,
         identifier: String,
@@ -111,6 +113,7 @@ impl<'a> bindings::wasi::keyvalue::store::Host for ActiveCtx<'a> {
 
 // Resource host trait implementations for bucket
 impl<'a> bindings::wasi::keyvalue::store::HostBucket for ActiveCtx<'a> {
+    #[instrument(name = "wasi.keyvalue.get", skip(self, bucket))]
     async fn get(
         &mut self,
         bucket: Resource<BucketHandle>,
@@ -128,8 +131,8 @@ impl<'a> bindings::wasi::keyvalue::store::HostBucket for ActiveCtx<'a> {
         let entry = match bucket_handle.kv.get(key).await {
             Ok(entry) => entry,
             Err(e) => {
-                tracing::error!("JetStream error getting key: {}", e);
-                return Ok(Err(StoreError::Other(format!("JetStream error: {}", e))));
+                tracing::error!("JetStream error getting key: {e}");
+                return Ok(Err(StoreError::Other(format!("JetStream error: {e}"))));
             }
         };
 
@@ -139,6 +142,7 @@ impl<'a> bindings::wasi::keyvalue::store::HostBucket for ActiveCtx<'a> {
         }
     }
 
+    #[instrument(name = "wasi.keyvalue.set", skip(self, bucket, value))]
     async fn set(
         &mut self,
         bucket: Resource<BucketHandle>,
@@ -150,19 +154,20 @@ impl<'a> bindings::wasi::keyvalue::store::HostBucket for ActiveCtx<'a> {
                 "keyvalue plugin not available".to_string(),
             )));
         };
-        plugin.record_operation("get");
+        plugin.record_operation("set");
 
         let bucket_handle = self.table.get(&bucket)?;
 
         match bucket_handle.kv.put(key, value.into()).await {
             Ok(_) => Ok(Ok(())),
             Err(e) => {
-                tracing::error!("JetStream error setting key: {}", e);
-                Ok(Err(StoreError::Other(format!("JetStream error: {}", e))))
+                tracing::error!("JetStream error setting key: {e}");
+                Ok(Err(StoreError::Other(format!("JetStream error: {e}"))))
             }
         }
     }
 
+    #[instrument(name = "wasi.keyvalue.delete", skip(self, bucket))]
     async fn delete(
         &mut self,
         bucket: Resource<BucketHandle>,
@@ -180,12 +185,13 @@ impl<'a> bindings::wasi::keyvalue::store::HostBucket for ActiveCtx<'a> {
         match bucket_handle.kv.delete(key).await {
             Ok(_) => Ok(Ok(())),
             Err(e) => {
-                tracing::error!("JetStream error deleting key: {}", e);
-                Ok(Err(StoreError::Other(format!("JetStream error: {}", e))))
+                tracing::error!("JetStream error deleting key: {e}");
+                Ok(Err(StoreError::Other(format!("JetStream error: {e}"))))
             }
         }
     }
 
+    #[instrument(name = "wasi.keyvalue.exists", skip(self, bucket))]
     async fn exists(
         &mut self,
         bucket: Resource<BucketHandle>,
@@ -204,12 +210,13 @@ impl<'a> bindings::wasi::keyvalue::store::HostBucket for ActiveCtx<'a> {
             Ok(Some(_)) => Ok(Ok(true)),
             Ok(None) => Ok(Ok(false)),
             Err(e) => {
-                tracing::error!("JetStream error getting key: {}", e);
-                Ok(Err(StoreError::Other(format!("JetStream error: {}", e))))
+                tracing::error!("JetStream error getting key: {e}");
+                Ok(Err(StoreError::Other(format!("JetStream error: {e}"))))
             }
         }
     }
 
+    #[instrument(name = "wasi.keyvalue.list_keys", skip(self, bucket))]
     async fn list_keys(
         &mut self,
         bucket: Resource<BucketHandle>,
@@ -227,8 +234,8 @@ impl<'a> bindings::wasi::keyvalue::store::HostBucket for ActiveCtx<'a> {
         let keys_iter = match bucket_handle.kv.keys().await {
             Ok(i) => i,
             Err(e) => {
-                tracing::error!("JetStream error getting key: {}", e);
-                return Ok(Err(StoreError::Other(format!("JetStream error: {}", e))));
+                tracing::error!("JetStream error getting key: {e}");
+                return Ok(Err(StoreError::Other(format!("JetStream error: {e}"))));
             }
         };
 
@@ -269,6 +276,7 @@ impl<'a> bindings::wasi::keyvalue::store::HostBucket for ActiveCtx<'a> {
 
 // Implementation for the atomics interface
 impl<'a> bindings::wasi::keyvalue::atomics::Host for ActiveCtx<'a> {
+    #[instrument(name = "wasi.keyvalue.increment", skip(self, bucket))]
     async fn increment(
         &mut self,
         bucket: Resource<BucketHandle>,
@@ -292,8 +300,8 @@ impl<'a> bindings::wasi::keyvalue::atomics::Host for ActiveCtx<'a> {
             }
             Ok(None) => (None, 0),
             Err(e) => {
-                tracing::error!("JetStream error getting key entry: {}", e);
-                return Ok(Err(StoreError::Other(format!("JetStream error: {}", e))));
+                tracing::error!("JetStream error getting key entry: {e}");
+                return Ok(Err(StoreError::Other(format!("JetStream error: {e}"))));
             }
         };
 
@@ -309,8 +317,8 @@ impl<'a> bindings::wasi::keyvalue::atomics::Host for ActiveCtx<'a> {
                 match res {
                     Ok(_) => Ok(Ok(new_value)),
                     Err(e) => {
-                        tracing::error!("JetStream error updating key: {}", e);
-                        Ok(Err(StoreError::Other(format!("JetStream error: {}", e))))
+                        tracing::error!("JetStream error updating key: {e}");
+                        Ok(Err(StoreError::Other(format!("JetStream error: {e}"))))
                     }
                 }
             }
@@ -319,8 +327,8 @@ impl<'a> bindings::wasi::keyvalue::atomics::Host for ActiveCtx<'a> {
                 match res {
                     Ok(_) => Ok(Ok(new_value)),
                     Err(e) => {
-                        tracing::error!("JetStream error putting key: {}", e);
-                        Ok(Err(StoreError::Other(format!("JetStream error: {}", e))))
+                        tracing::error!("JetStream error putting key: {e}");
+                        Ok(Err(StoreError::Other(format!("JetStream error: {e}"))))
                     }
                 }
             }
@@ -330,6 +338,8 @@ impl<'a> bindings::wasi::keyvalue::atomics::Host for ActiveCtx<'a> {
 
 // Implementation for the batch interface
 impl<'a> bindings::wasi::keyvalue::batch::Host for ActiveCtx<'a> {
+    #[instrument(name = "wasi.keyvalue.get_many", skip(self, bucket, keys))]
+    #[allow(clippy::type_complexity)]
     async fn get_many(
         &mut self,
         bucket: Resource<BucketHandle>,
@@ -349,8 +359,8 @@ impl<'a> bindings::wasi::keyvalue::batch::Host for ActiveCtx<'a> {
                 Ok(Some(entry)) => Ok(Some((key.clone(), entry.to_vec()))),
                 Ok(None) => Ok(None),
                 Err(e) => {
-                    tracing::error!("JetStream error getting key: {}", e);
-                    Err(StoreError::Other(format!("JetStream error: {}", e)))
+                    tracing::error!("JetStream error getting key: {e}");
+                    Err(StoreError::Other(format!("JetStream error: {e}")))
                 }
             }
         }))
@@ -369,6 +379,7 @@ impl<'a> bindings::wasi::keyvalue::batch::Host for ActiveCtx<'a> {
         Ok(Ok(result))
     }
 
+    #[instrument(name = "wasi.keyvalue.set_many", skip(self, bucket, key_values))]
     async fn set_many(
         &mut self,
         bucket: Resource<BucketHandle>,
@@ -392,8 +403,8 @@ impl<'a> bindings::wasi::keyvalue::batch::Host for ActiveCtx<'a> {
                 {
                     Ok(_) => Ok(()),
                     Err(e) => {
-                        tracing::error!("JetStream error putting key: {}", e);
-                        Err(StoreError::Other(format!("JetStream error: {}", e)))
+                        tracing::error!("JetStream error putting key: {e}");
+                        Err(StoreError::Other(format!("JetStream error: {e}")))
                     }
                 }
             },
@@ -411,6 +422,7 @@ impl<'a> bindings::wasi::keyvalue::batch::Host for ActiveCtx<'a> {
         Ok(Ok(()))
     }
 
+    #[instrument(name = "wasi.keyvalue.delete_many", skip(self, bucket, keys))]
     async fn delete_many(
         &mut self,
         bucket: Resource<BucketHandle>,
@@ -429,8 +441,8 @@ impl<'a> bindings::wasi::keyvalue::batch::Host for ActiveCtx<'a> {
             match bucket_handle.kv.delete(key.clone()).await {
                 Ok(_) => Ok(()),
                 Err(e) => {
-                    tracing::error!("JetStream error deleting key: {}", e);
-                    Err(StoreError::Other(format!("JetStream error: {}", e)))
+                    tracing::error!("JetStream error deleting key: {e}");
+                    Err(StoreError::Other(format!("JetStream error: {e}")))
                 }
             }
         }))

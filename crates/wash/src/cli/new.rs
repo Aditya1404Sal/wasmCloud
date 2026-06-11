@@ -1,5 +1,6 @@
 //! CLI command for creating new component projects from git repositories
 
+use std::path::Path;
 use std::process::Stdio;
 
 use anyhow::{Context, bail};
@@ -10,7 +11,7 @@ use tracing::{info, instrument};
 
 use crate::{
     cli::{CliCommand, CliContext, CommandOutput},
-    config::{Config, load_config},
+    config::{load_config_from_file, locate_project_config},
     new::{clone_template, copy_dir_recursive, extract_subfolder},
 };
 
@@ -68,48 +69,13 @@ impl CliCommand for NewCommand {
                 .context("failed to copy cloned repository to output directory")?;
         }
 
-        // Check if the output directory has a wash config
-        let template_config =
-            load_config(&ctx.user_config_path(), Some(&output_dir), None::<Config>)
-                .context("couldn't load template config")?;
-
-        if let Some(new_cmd) = template_config.new.and_then(|nc| nc.command)
+        if let Some(new_cmd) =
+            load_template_new_command(&output_dir).context("couldn't load template config")?
             && ctx.request_confirmation(format!(
-                "Execute template setup command '{}'? This may modify the new project.",
-                new_cmd
+                "Execute template setup command '{new_cmd}'? This may modify the new project."
             ))?
         {
-            let (cmd_bin, first_arg) = {
-                #[cfg(not(windows))]
-                {
-                    ("sh".to_string(), "-c".to_string())
-                }
-
-                #[cfg(windows)]
-                {
-                    ("cmd".to_string(), "/c".to_string())
-                }
-            };
-
-            let cmd_args = vec![first_arg, new_cmd.clone()];
-
-            info!(command = new_cmd, "executing new command");
-            let mut cmd = Command::new(cmd_bin)
-                .args(cmd_args)
-                .stderr(Stdio::inherit())
-                .stdout(Stdio::inherit())
-                .current_dir(&output_dir)
-                .spawn()
-                .context("failed to execute new command")?;
-
-            let exit_status = cmd
-                .wait()
-                .await
-                .context("failed to wait for new command to complete")?;
-
-            if !exit_status.success() {
-                bail!("new command '{}' failed", new_cmd);
-            }
+            run_new_command(&new_cmd, &output_dir).await?;
         }
 
         Ok(CommandOutput::ok(
@@ -149,5 +115,107 @@ impl NewCommand {
                 .trim_end_matches(".git")
                 .to_string()
         }
+    }
+}
+
+fn load_template_new_command(project_dir: &Path) -> anyhow::Result<Option<String>> {
+    let config_path = locate_project_config(project_dir);
+    if !config_path.exists() {
+        return Ok(None);
+    }
+
+    Ok(load_config_from_file(&config_path)?
+        .new
+        .and_then(|nc| nc.command))
+}
+
+/// Execute a template's `new.command` shell command in `working_dir`.
+/// Returns an error if the command exits non-zero.
+async fn run_new_command(new_cmd: &str, working_dir: &Path) -> anyhow::Result<()> {
+    let (cmd_bin, first_arg) = {
+        #[cfg(not(windows))]
+        {
+            ("sh", "-c")
+        }
+
+        #[cfg(windows)]
+        {
+            ("cmd", "/c")
+        }
+    };
+
+    info!(command = new_cmd, "executing new command");
+    let mut cmd = Command::new(cmd_bin)
+        .args([first_arg, new_cmd])
+        .stderr(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .current_dir(working_dir)
+        .spawn()
+        .context("failed to execute new command")?;
+
+    let exit_status = cmd
+        .wait()
+        .await
+        .context("failed to wait for new command to complete")?;
+
+    if !exit_status.success() {
+        bail!("new command '{new_cmd}' failed");
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    // `exit N` is a builtin in both POSIX `sh` and Windows `cmd`, so these tests
+    // exercise the same code path that production uses on each platform.
+    #[tokio::test]
+    async fn run_new_command_bails_on_non_zero_exit() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let err = run_new_command("exit 1", tempdir.path())
+            .await
+            .expect_err("non-zero exit should propagate as Err");
+        assert!(
+            err.to_string().contains("exit 1"),
+            "error should name the failing command, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_new_command_succeeds_on_zero_exit() {
+        let tempdir = tempfile::tempdir().unwrap();
+        run_new_command("exit 0", tempdir.path())
+            .await
+            .expect("zero-exit command should succeed");
+    }
+
+    #[test]
+    fn template_new_command_is_absent_without_project_config() {
+        let tempdir = tempfile::tempdir().unwrap();
+
+        let new_cmd = load_template_new_command(tempdir.path())
+            .expect("missing project config should not error");
+
+        assert_eq!(new_cmd, None);
+    }
+
+    #[test]
+    fn template_new_command_comes_from_project_config() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let config_dir = tempdir.path().join(".wash");
+        fs::create_dir_all(&config_dir).unwrap();
+        fs::write(
+            config_dir.join("config.yaml"),
+            "new:\n  command: cargo test\n",
+        )
+        .unwrap();
+
+        let new_cmd =
+            load_template_new_command(tempdir.path()).expect("project config should parse");
+
+        assert_eq!(new_cmd.as_deref(), Some("cargo test"));
     }
 }

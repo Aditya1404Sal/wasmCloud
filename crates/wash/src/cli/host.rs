@@ -189,7 +189,11 @@ impl CliCommand for HostCommand {
             .with_host_config(host_config)
             .with_nats_client(Arc::new(scheduler_nats_client))
             .with_host_group(self.host_group.clone())
-            .with_plugin(Arc::new(plugin::wasi_config::DynamicConfig::new(true)))?
+            .with_plugin(Arc::new(
+                plugin::wasi_config::DynamicConfig::builder()
+                    .copy_environment(true)
+                    .build(),
+            ))?
             .with_plugin(Arc::new(plugin::wasi_logging::TracingLogger::default()))?
             .with_plugin(Arc::new(plugin::wasi_blobstore::NatsBlobstore::new(
                 &data_nats_client,
@@ -231,14 +235,11 @@ impl CliCommand for HostCommand {
             let http_server = if let (Some(cert_path), Some(key_path)) =
                 (&self.tls_cert_path, &self.tls_key_path)
             {
-                wash_runtime::host::http::HttpServer::new_with_tls(
-                    http_router,
-                    addr,
-                    cert_path,
-                    key_path,
-                    self.tls_ca_path.as_deref(),
-                )
-                .await?
+                let mut tls = wash_runtime::host::http::TlsConfig::new(cert_path, key_path);
+                if let Some(ca) = self.tls_ca_path.as_deref() {
+                    tls = tls.with_ca(ca);
+                }
+                wash_runtime::host::http::HttpServer::new_with_tls(http_router, addr, tls).await?
             } else {
                 wash_runtime::host::http::HttpServer::new(http_router, addr).await?
             };

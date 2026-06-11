@@ -1,6 +1,6 @@
 //! # WASI OpenTelemetry Plugin
 //! This module implements an OpenTelemetry plugin for the wasmCloud runtime,
-//! providing the `wasi:otel@0.2.0-rc.1` interfaces.
+//! providing the `wasi:otel@0.2.0-rc.2` interfaces.
 
 mod convert;
 
@@ -32,6 +32,12 @@ use crate::wit::{WitInterface, WitWorld};
 
 const WASI_OTEL_ID: &str = "wasi-otel";
 
+/// OTel gRPC default per the OTLP/gRPC spec. Matches what
+/// `opentelemetry_otlp::SpanExporter::builder().with_tonic()` falls back to
+/// when no `OTEL_EXPORTER_OTLP_*_ENDPOINT` is set; duplicated here only so
+/// the log line at plugin start reflects what the exporter actually used.
+const DEFAULT_OTLP_GRPC_ENDPOINT: &str = "http://localhost:4317";
+
 mod bindings {
     wasmtime::component::bindgen!({
         world: "otel",
@@ -41,25 +47,33 @@ mod bindings {
 
 use bindings::wasi::otel::tracing::{SpanContext as WitSpanContext, TraceFlags as WitTraceFlags};
 
-/// Plugin configuration
-#[derive(Clone, Debug)]
+/// Configuration for the [`WasiOtel`] plugin.
+///
+/// Construct via [`WasiOtelConfig::builder`] (or [`Default::default`]) to
+/// stay forward-compatible with new fields.
+///
+/// # Examples
+///
+/// ```
+/// use wash_runtime::plugin::wasi_otel::WasiOtelConfig;
+///
+/// let cfg = WasiOtelConfig::builder()
+///     .service_name("my-service")
+///     .build();
+/// assert_eq!(cfg.service_name, "my-service");
+/// ```
+#[derive(Clone, Debug, bon::Builder)]
+#[non_exhaustive]
 pub struct WasiOtelConfig {
-    pub endpoint: String,
-    pub protocol: String,
+    /// `service.name` resource attribute attached to all exported spans,
+    /// metrics, and logs. Defaults to the plugin id (`wasi-otel`).
+    #[builder(default = WASI_OTEL_ID.to_string(), into)]
     pub service_name: String,
-    pub propagate_context: bool,
-    pub batch_timeout_ms: u64,
 }
 
 impl Default for WasiOtelConfig {
     fn default() -> Self {
-        Self {
-            endpoint: String::new(),
-            protocol: String::new(),
-            service_name: "wasi-otel".to_string(),
-            propagate_context: true,
-            batch_timeout_ms: 5000,
-        }
+        Self::builder().build()
     }
 }
 
@@ -103,21 +117,29 @@ impl HostPlugin for WasiOtel {
     fn world(&self) -> WitWorld {
         WitWorld {
             imports: HashSet::from([WitInterface::from(
-                "wasi:otel/types,tracing,metrics,logs@0.2.0-rc.1",
+                "wasi:otel/types,tracing,metrics,logs@0.2.0-rc.2",
             )]),
             ..Default::default()
         }
     }
 
     async fn start(&self) -> anyhow::Result<()> {
+        // The exporter resolves its endpoint from `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`,
+        // then `OTEL_EXPORTER_OTLP_ENDPOINT`, falling back to the OTel gRPC default
+        // ([`DEFAULT_OTLP_GRPC_ENDPOINT`]). Protocol is fixed to gRPC because we use
+        // `with_tonic()` below; tracking richer per-target endpoint configuration as a
+        // follow-up to this PR (see TODO below).
+        let endpoint = std::env::var("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT")
+            .or_else(|_| std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT"))
+            .unwrap_or_else(|_| DEFAULT_OTLP_GRPC_ENDPOINT.to_string());
         tracing::info!(
-            endpoint = %self.config.endpoint,
-            protocol = %self.config.protocol,
+            endpoint = %endpoint,
+            protocol = "grpc",
             "Starting WASI OTel plugin"
         );
 
-        // TODO: Add configurable endpoints/protocols to use. This would be beneficial for when you want to have Host otel go to Platform engineering teams,
-        // And Workload otel go to a different backend for application monitoring.
+        // TODO: thread per-target endpoints (host vs workload) through `WasiOtelConfig`
+        // so platform telemetry and application telemetry can ship to different backends.
 
         // set up the grpc span exporter
         let span_exporter = SpanExporter::builder()
@@ -339,7 +361,7 @@ impl<'a> bindings::wasi::otel::metrics::Host for ActiveCtx<'a> {
                 // Force flush to export recorded metrics
                 if let Err(e) = provider.force_flush() {
                     tracing::warn!(error = %e, "Failed to flush metrics");
-                    return Ok(Err(format!("Failed to flush metrics: {}", e)));
+                    return Ok(Err(format!("Failed to flush metrics: {e}")));
                 }
 
                 tracing::info!(

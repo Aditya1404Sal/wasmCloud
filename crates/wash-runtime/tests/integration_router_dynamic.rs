@@ -2,7 +2,7 @@
 //! workloads by Host header (with optional comma-separated aliases).
 //!
 //! `DynamicRouter::route_incoming_request` uses `tokio::task::block_in_place`
-//! + `try_read`, so all tests run on the multi-thread runtime. Per-request
+//! with `try_read`, so all tests run on the multi-thread runtime. Per-request
 //! `timeout(...)` on individual HTTP calls guards against hangs.
 //!
 //! Covers:
@@ -17,8 +17,8 @@
 //! - HTTP/1.0 request without a Host header returns 400 (RouteError::MissingHost).
 //! - Invalid hostnames in host-aliases are silently filtered; only valid ones route.
 //! - Two workloads bound to the same host both serve requests (HashSet routing).
-
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+//! - Stopping a workload removes all of its routes — primary host and every
+//!   alias — so requests to any former alias return 404 after unbind.
 
 use anyhow::{Context, Result};
 use futures::future::join_all;
@@ -352,6 +352,46 @@ async fn test_dynamic_router_unknown_host_returns_404() -> Result<()> {
         reqwest::StatusCode::NOT_FOUND,
         "unknown host must map to RouteError::NoWorkloadForHost -> 404, got {status}"
     );
+
+    Ok(())
+}
+
+/// Stopping a workload must remove *all* of its routes — the primary host and
+/// every alias — not just the primary hostname. After unbind, a request to any
+/// former alias must map to `RouteError::NoWorkloadForHost` (404).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_dynamic_router_aliases_removed_on_unbind() -> Result<()> {
+    let (addr, host) = start_host_with_dynamic_router("127.0.0.1:0").await?;
+
+    let primary = "primary.local";
+    let aliases = ["alias-one.local", "alias-two.local"];
+
+    let req = http_counter_request(primary, Some(&aliases.join(",")));
+    let workload_id = req.workload_id.clone();
+    host.workload_start(req).await?;
+
+    let client = reqwest::Client::new();
+
+    // Sanity check: the primary host and both aliases route while bound.
+    for hostname in std::iter::once(primary).chain(aliases) {
+        assert!(
+            get_status(&client, addr, hostname).await?.is_success(),
+            "{hostname} should route while the workload is bound"
+        );
+    }
+
+    host.workload_stop(WorkloadStopRequest { workload_id })
+        .await?;
+
+    // After unbind, every former route — primary and aliases — must 404.
+    for hostname in std::iter::once(primary).chain(aliases) {
+        let status = get_status(&client, addr, hostname).await?;
+        assert_eq!(
+            status,
+            reqwest::StatusCode::NOT_FOUND,
+            "{hostname} must be removed on unbind and return 404, got {status}"
+        );
+    }
 
     Ok(())
 }

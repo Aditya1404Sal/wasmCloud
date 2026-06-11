@@ -1,0 +1,163 @@
+name: examples
+
+# Validates and (on push to main) publishes the Rust components under
+# examples/. Pipeline:
+#   plan      dorny/paths-filter → plan-matrix.mjs picks the matrix for
+#             this event (PR = intersection with changed paths, push or
+#             examples-canary label = everything).
+#   coverage  coverage-matrix.mjs asserts ITEMS matches examples/ on
+#             disk (every dir with .wash/config.yaml + Cargo.toml is
+#             enrolled; every top-level example has a README.md).
+#   build     matrix-fans over plan.outputs.matrix; each cell runs
+#             build-rust-example (fmt + clippy + wash build, plus
+#             OCI publish on pushes to main when `image` is set).
+#
+# Multi-component example (grpc-hello-world): one ITEMS entry per
+# component, both sharing `filter: grpc-hello-world` so a change anywhere
+# under examples/grpc-hello-world/** rebuilds both client and server.
+
+on:
+  pull_request:
+    branches:
+      - main
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+  push:
+    branches:
+      - main
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions: {}
+
+env:
+  # omit image to skip publish
+  # filter, when present, points at the paths-filter group that gates this
+  # item so that multiple items can share a `filter`. e.g. examples/grpc-hello-world/**
+  ITEMS: |
+    [
+      {"key": "blobby",                   "workdir": "examples/blobby",                              "image": "ghcr.io/wasmcloud/components/blobby"},
+      {"key": "grpc-hello-world-client",  "filter": "grpc-hello-world",   "workdir": "examples/grpc-hello-world/component-client", "image": "ghcr.io/wasmcloud/components/grpc-hello-world-client", "needs_protoc": true},
+      {"key": "grpc-hello-world-server",  "filter": "grpc-hello-world",   "workdir": "examples/grpc-hello-world/component-server", "image": "ghcr.io/wasmcloud/components/grpc-hello-world-server", "needs_protoc": true},
+      {"key": "otel-config",              "workdir": "examples/otel-config",                         "image": "ghcr.io/wasmcloud/components/otel-config"},
+      {"key": "qrcode",                   "workdir": "examples/qrcode",                              "image": "ghcr.io/wasmcloud/components/qrcode"}
+    ]
+  # When these change, every example rebuilds.
+  SHARED_PATHS: |
+    [
+      ".github/actions/build-rust-example/**",
+      ".github/actions/setup-rust/**",
+      ".github/scripts/plan-matrix.mjs",
+      ".github/scripts/coverage-matrix.mjs",
+      ".github/scripts/gen-filters.mjs",
+      ".github/workflows/examples.yml"
+    ]
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      matrix: ${{ steps.compute.outputs.matrix }}
+      has_items: ${{ steps.compute.outputs.has_items }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Generate paths-filter config from ITEMS
+        if: github.event_name == 'pull_request'
+        env:
+          ITEMS: ${{ env.ITEMS }}
+          SHARED_PATHS: ${{ env.SHARED_PATHS }}
+          OUTPUT: ${{ runner.temp }}/filters.yml
+        run: node .github/scripts/gen-filters.mjs
+
+      - uses: dorny/paths-filter@fbd0ab8f3e69293af611ebaee6363fc25e6d187d # v4.0.1
+        id: filter
+        if: github.event_name == 'pull_request'
+        with:
+          filters: ${{ runner.temp }}/filters.yml
+
+      - name: Compute build matrix
+        id: compute
+        env:
+          ITEMS: ${{ env.ITEMS }}
+          CHANGED: ${{ steps.filter.outputs.changes }}
+          EVENT_NAME: ${{ github.event_name }}
+          CANARY: ${{ contains(github.event.pull_request.labels.*.name, 'examples-canary') }}
+        run: node .github/scripts/plan-matrix.mjs
+
+  coverage:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Assert ITEMS matches examples/ on disk
+        env:
+          ITEMS: ${{ env.ITEMS }}
+          DISCOVERY_ROOT: examples
+          # Scoped to Rust because this workflow is Rust-only — a
+          # non-Rust subdirectory under examples/ wouldn't have a
+          # Cargo.toml and is silently ignored by the disk scan.
+          REQUIRE_FILES: '["Cargo.toml"]'
+          REQUIRE_README: "true"
+        run: node .github/scripts/coverage-matrix.mjs
+
+  build:
+    needs:
+      - plan
+    if: needs.plan.outputs.has_items == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      # Required so build-rust-example's OCI publish step can push to ghcr
+      # on push events. PRs (including forks) get the token in read-only
+      # mode, so the publish step is a no-op there even with this set.
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - uses: ./.github/actions/setup-rust
+        with:
+          install-nightly: "true"
+          install-wash: "true"
+
+      - if: matrix.needs_protoc
+        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
+        with:
+          version: "29.x"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: ./.github/actions/build-rust-example
+        with:
+          working-directory: ${{ matrix.workdir }}
+          image: ${{ matrix.image }}
+
+  gate:
+    needs:
+      - plan
+      - coverage
+      - build
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require all jobs to pass or be skipped
+        env:
+          RESULTS: ${{ toJSON(needs.*.result) }}
+        run: |
+          if echo "$RESULTS" | grep -qE '"(failure|cancelled)"'; then
+            exit 1
+          fi

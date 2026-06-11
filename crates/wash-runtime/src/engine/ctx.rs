@@ -15,8 +15,49 @@ use wasmtime::component::ResourceTable;
 use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 use wasmtime_wasi_http::WasiHttpCtx;
 use wasmtime_wasi_http::p2::{WasiHttpCtxView, WasiHttpHooks, WasiHttpView};
+#[cfg(feature = "wasi-tls")]
+use wasmtime_wasi_tls::{WasiTlsCtx, WasiTlsCtxBuilder, WasiTlsCtxView, WasiTlsView};
 
+use crate::host::allowed_hosts::AllowedHost;
 use crate::plugin::HostPlugin;
+
+/// A shareable, cloneable `wasi:tls` provider. Wraps an `Arc<dyn TlsProvider>`
+/// so the same provider can back many per-component contexts without
+/// re-creating it, and implements `TlsProvider` directly so it can be boxed
+/// and passed to `WasiTlsCtxBuilder::provider`.
+#[cfg(feature = "wasi-tls")]
+#[derive(Clone)]
+pub struct SharedTlsProvider(Arc<dyn wasmtime_wasi_tls::TlsProvider>);
+
+#[cfg(feature = "wasi-tls")]
+impl SharedTlsProvider {
+    pub fn new(provider: impl wasmtime_wasi_tls::TlsProvider + 'static) -> Self {
+        Self(Arc::new(provider))
+    }
+}
+
+/// Concrete return type of [`wasmtime_wasi_tls::TlsProvider::connect`]. The
+/// upstream alias (`BoxFutureTlsStream`) is `pub(crate)`, so we re-declare an
+/// equivalent here to keep the impl signature readable.
+#[cfg(feature = "wasi-tls")]
+type TlsConnectFuture = std::pin::Pin<
+    Box<
+        dyn std::future::Future<
+                Output = Result<Box<dyn wasmtime_wasi_tls::TlsStream>, wasmtime_wasi_tls::Error>,
+            > + Send,
+    >,
+>;
+
+#[cfg(feature = "wasi-tls")]
+impl wasmtime_wasi_tls::TlsProvider for SharedTlsProvider {
+    fn connect(
+        &self,
+        server_name: String,
+        transport: Box<dyn wasmtime_wasi_tls::TlsTransport>,
+    ) -> TlsConnectFuture {
+        self.0.connect(server_name, transport)
+    }
+}
 
 /// Shared context for linked components
 pub struct SharedCtx {
@@ -107,6 +148,9 @@ pub struct Ctx {
     pub http: WasiHttpCtx,
     /// The sockets context used to provide socket functionality (with loopback support).
     pub sockets: crate::sockets::WasiSocketsCtx,
+    /// The TLS Context used to provide TLS over the HTTP functionality to the component.
+    #[cfg(feature = "wasi-tls")]
+    pub tls: WasiTlsCtx,
     /// Plugin instances stored by string ID for access during component execution.
     /// These all implement the [`HostPlugin`] trait, but they are cast as `Arc<dyn Any + Send + Sync>`
     /// to support downcasting to the specific plugin type in [`Ctx::get_plugin`]
@@ -169,6 +213,16 @@ impl WasiHttpView for SharedCtx {
     }
 }
 
+#[cfg(feature = "wasi-tls")]
+impl WasiTlsView for SharedCtx {
+    fn tls(&mut self) -> WasiTlsCtxView<'_> {
+        WasiTlsCtxView {
+            ctx: &mut self.active_ctx.tls,
+            table: &mut self.table,
+        }
+    }
+}
+
 // Implement WasiHttpView for wasi:http P3
 #[cfg(feature = "wasip3")]
 impl wasmtime_wasi_http::p3::WasiHttpView for SharedCtx {
@@ -185,7 +239,7 @@ impl wasmtime_wasi_http::p3::WasiHttpView for SharedCtx {
 struct CtxHttpHooks {
     http_handler: Option<Arc<dyn crate::host::http::HostHandler>>,
     workload_id: Arc<str>,
-    allowed_hosts: Arc<[String]>,
+    allowed_hosts: Arc<[AllowedHost]>,
 }
 
 impl WasiHttpHooks for CtxHttpHooks {
@@ -206,11 +260,15 @@ impl WasiHttpHooks for CtxHttpHooks {
     }
 }
 
-/// P3 HTTP hooks implementation that enforces allowed hosts and delegates
-/// to the default send_request for actual HTTP transport.
+/// P3 HTTP hooks implementation that delegates outgoing requests to the
+/// configured [`HostHandler`](crate::host::http::HostHandler), so custom egress
+/// (allowed-hosts policy, alternate transports, etc.) applies uniformly to
+/// both P2 and P3 components.
 #[cfg(feature = "wasip3")]
 struct CtxHttpHooksP3 {
-    allowed_hosts: Arc<[String]>,
+    http_handler: Option<Arc<dyn crate::host::http::HostHandler>>,
+    workload_id: Arc<str>,
+    allowed_hosts: Arc<[AllowedHost]>,
 }
 
 #[cfg(feature = "wasip3")]
@@ -256,26 +314,20 @@ impl wasmtime_wasi_http::p3::WasiHttpHooks for CtxHttpHooksP3 {
     > {
         use wasmtime_wasi_http::p3::bindings::http::types::ErrorCode as P3ErrorCode;
 
-        // Check allowed hosts before sending
-        if let Err(_e) = crate::host::http::check_allowed_hosts(&request, &self.allowed_hosts) {
-            return Box::new(async move {
+        match &self.http_handler {
+            Some(handler) => handler.outgoing_request_p3(
+                &self.workload_id,
+                request,
+                options,
+                fut,
+                &self.allowed_hosts,
+            ),
+            None => Box::new(async move {
                 Err(wasmtime_wasi::TrappableError::from(
-                    P3ErrorCode::HttpRequestDenied,
+                    P3ErrorCode::InternalError(Some("http client not available".to_string())),
                 ))
-            });
+            }),
         }
-
-        // Delegate to the default send_request implementation
-        _ = fut;
-        Box::new(async move {
-            use http_body_util::BodyExt;
-            let (res, io) = wasmtime_wasi_http::p3::default_send_request(request, options).await?;
-            Ok((
-                res.map(BodyExt::boxed_unsync),
-                Box::new(io)
-                    as Box<dyn std::future::Future<Output = Result<(), P3ErrorCode>> + Send>,
-            ))
-        })
     }
 }
 
@@ -288,7 +340,10 @@ pub struct CtxBuilder {
     sockets: Option<crate::sockets::WasiSocketsCtx>,
     plugins: HashMap<&'static str, Arc<dyn HostPlugin + Send + Sync>>,
     http_handler: Option<Arc<dyn crate::host::http::HostHandler>>,
-    allowed_hosts: Arc<[String]>,
+    allowed_hosts: Arc<[AllowedHost]>,
+    /// TLS provider override for `wasi:tls` client connections.
+    #[cfg(feature = "wasi-tls")]
+    tls_provider: Option<SharedTlsProvider>,
 }
 
 impl CtxBuilder {
@@ -302,7 +357,20 @@ impl CtxBuilder {
             http_handler: None,
             plugins: HashMap::new(),
             allowed_hosts: Default::default(),
+            #[cfg(feature = "wasi-tls")]
+            tls_provider: None,
         }
+    }
+
+    /// Override the TLS provider used for `wasi:tls` client connections.
+    ///
+    /// Use this to plug in an alternative TLS backend, install a custom root
+    /// certificate store (corporate CAs, certificate pinning), or integrate
+    /// with HSM-backed key material.
+    #[cfg(feature = "wasi-tls")]
+    pub fn with_tls_provider(mut self, provider: SharedTlsProvider) -> Self {
+        self.tls_provider = Some(provider);
+        self
     }
 
     /// Set a custom [WasiCtx]
@@ -332,7 +400,7 @@ impl CtxBuilder {
         self
     }
 
-    pub fn with_allowed_hosts(mut self, allowed_hosts: Arc<[String]>) -> Self {
+    pub fn with_allowed_hosts(mut self, allowed_hosts: Arc<[AllowedHost]>) -> Self {
         self.allowed_hosts = allowed_hosts;
         self
     }
@@ -346,6 +414,8 @@ impl CtxBuilder {
 
         #[cfg(feature = "wasip3")]
         let http_hooks_p3 = CtxHttpHooksP3 {
+            http_handler: self.http_handler.clone(),
+            workload_id: self.workload_id.clone(),
             allowed_hosts: self.allowed_hosts.clone(),
         };
 
@@ -367,6 +437,17 @@ impl CtxBuilder {
             component_id: self.component_id,
             http: WasiHttpCtx::new(),
             sockets: self.sockets.unwrap_or_default(),
+            #[cfg(feature = "wasi-tls")]
+            tls: {
+                // EngineBuilder::build already warns once if no provider was
+                // set; just fall through to the wasmtime-wasi-tls default
+                // here when none is provided.
+                let mut builder = WasiTlsCtxBuilder::new();
+                if let Some(provider) = self.tls_provider {
+                    builder = builder.provider(Box::new(provider));
+                }
+                builder.build()
+            },
             plugins,
             http_hooks,
             #[cfg(feature = "wasip3")]
@@ -379,8 +460,14 @@ impl CtxBuilder {
 mod tests {
     use super::*;
 
+    fn setup() {
+        #[cfg(feature = "wasi-tls")]
+        crate::init_crypto();
+    }
+
     #[test]
     fn ctx_builder_sets_ids() {
+        setup();
         let ctx = Ctx::builder("wk-1", "comp-1").build();
         assert_eq!(ctx.workload_id.as_ref(), "wk-1");
         assert_eq!(ctx.component_id.as_ref(), "comp-1");
@@ -388,6 +475,7 @@ mod tests {
 
     #[test]
     fn ctx_builder_generates_uuid_id() {
+        setup();
         let ctx = Ctx::builder("wk", "comp").build();
         // id should be a valid UUID v4 string
         assert!(uuid::Uuid::parse_str(&ctx.id).is_ok());
@@ -395,12 +483,14 @@ mod tests {
 
     #[test]
     fn ctx_builder_uses_default_wasi_ctx_when_none_provided() {
+        setup();
         // Should not panic — proves default WasiCtx is created
         let _ctx = Ctx::builder("wk", "comp").build();
     }
 
     #[test]
     fn shared_ctx_new_sets_active_ctx() {
+        setup();
         let ctx = Ctx::builder("wk", "comp-a").build();
         let shared = SharedCtx::new(ctx);
         assert_eq!(shared.active_ctx.component_id.as_ref(), "comp-a");
@@ -409,6 +499,7 @@ mod tests {
 
     #[test]
     fn set_active_ctx_swaps_context() {
+        setup();
         let ctx_a = Ctx::builder("wk", "comp-a").build();
         let ctx_b = Ctx::builder("wk", "comp-b").build();
         let comp_b_id: Arc<str> = Arc::from("comp-b");
@@ -428,6 +519,7 @@ mod tests {
 
     #[test]
     fn set_active_ctx_returns_error_for_unknown_id() {
+        setup();
         let ctx = Ctx::builder("wk", "comp-a").build();
         let mut shared = SharedCtx::new(ctx);
         let unknown: Arc<str> = Arc::from("nonexistent");
@@ -438,6 +530,7 @@ mod tests {
 
     #[test]
     fn set_active_ctx_is_noop_when_already_active() {
+        setup();
         let ctx = Ctx::builder("wk", "comp-a").build();
         let mut shared = SharedCtx::new(ctx);
         let comp_a: Arc<str> = Arc::from("comp-a");
