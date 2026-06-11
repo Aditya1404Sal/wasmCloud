@@ -127,4 +127,5 @@ rules:
     - patch
     - update
     - watch
+  {{- end }}
 {{- end }}
