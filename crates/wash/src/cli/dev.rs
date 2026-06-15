@@ -95,11 +95,21 @@ impl CliCommand for DevCommand {
         // Enable Betty SMTP
         host_builder = host_builder.with_plugin(Arc::new(plugin::smtp::BettySmtp::new()))?;
 
-        // Enable betty-blocks:stream-broker/broker for local multi-entrypoint
-        // stream fan-out and cancellation.
+        // Enable betty-blocks:cancellation-broker/broker for plan-scoped
+        // cancellation. Backed by NATS JetStream KV so the signal spans hosts;
+        // the guests import this interface unconditionally, so it is always
+        // registered.
+        let cancellation_broker_nats_url = dev_config
+            .cancellation_broker_nats_url
+            .as_deref()
+            .unwrap_or("nats://127.0.0.1:4222");
+        let cancellation_broker_nats_client = async_nats::connect(cancellation_broker_nats_url)
+            .await
+            .context("failed to connect to NATS for cancellation-broker plugin")?;
         host_builder = host_builder.with_plugin(Arc::new(
-            plugin::betty_blocks_stream_broker::StreamBroker::default(),
+            plugin::cancellation_broker::CancellationBroker::new(&cancellation_broker_nats_client),
         ))?;
+        debug!(url = %cancellation_broker_nats_url, "cancellation-broker plugin registered with NATS JetStream KV");
 
         // Add blobstore plugin
         if let Some(blobstore_path) = &dev_config.wasi_blobstore_path {

@@ -202,7 +202,7 @@ impl CliCommand for HostCommand {
                 data_nats_client.clone(),
             )))?
             .with_plugin(Arc::new(
-                plugin::betty_blocks_stream_broker::StreamBroker::default(),
+                plugin::cancellation_broker::CancellationBroker::new(&data_nats_client),
             ))?
             .with_plugin(Arc::new(plugin::wasi_keyvalue::NatsKeyValue::new(
                 &data_nats_client,

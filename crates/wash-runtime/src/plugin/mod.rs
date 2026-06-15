@@ -55,7 +55,7 @@ pub mod smtp;
 
 pub mod wasmcloud_messaging;
 
-pub mod betty_blocks_stream_broker;
+pub mod cancellation_broker;
 
 #[cfg(all(feature = "wasi-webgpu", not(target_os = "windows")))]
 pub mod wasi_webgpu;

@@ -49,6 +49,6 @@ world smtp {
     import betty-blocks:smtp/client;
 }
 
-world stream-broker {
-    import betty-blocks:stream-broker/broker@0.1.0;
+world cancellation-broker {
+    import betty-blocks:cancellation-broker/broker@0.2.0;
 }
