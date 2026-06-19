@@ -373,8 +373,8 @@ impl WorkloadMetadata {
             .component_type()
             .exports(self.component.engine())
             .filter_map(|(name, item)| {
-                if matches!(item, ComponentItem::ComponentInstance(_)) {
-                    Some((name.to_string(), item))
+                if matches!(item.ty, ComponentItem::ComponentInstance(_)) {
+                    Some((name.to_string(), item.ty))
                 } else {
                     None
                 }
@@ -411,7 +411,7 @@ impl WorkloadMetadata {
             .component_type()
             .imports(self.component.engine())
         {
-            if let ComponentItem::ComponentInstance(_) = import_item {
+            if let ComponentItem::ComponentInstance(_) = import_item.ty {
                 let interface = WitInterface::from(import_name);
                 let k = interface.instance();
                 imports
@@ -434,7 +434,7 @@ impl WorkloadMetadata {
             .component_type()
             .exports(self.component.engine())
         {
-            if let ComponentItem::ComponentInstance(_) = export_item {
+            if let ComponentItem::ComponentInstance(_) = export_item.ty {
                 let interface = WitInterface::from(export_name);
                 let k = interface.instance();
                 exports
@@ -1052,7 +1052,7 @@ impl ResolvedWorkload {
                 let ty = component.metadata.component.component_type();
                 for (import_name, import_item) in ty.imports(component.metadata.component.engine())
                 {
-                    if matches!(import_item, ComponentItem::ComponentInstance(_))
+                    if matches!(import_item.ty, ComponentItem::ComponentInstance(_))
                         && let Some(exporter_id) = interface_map.get(import_name)
                         && exporter_id != component_id
                     {
@@ -1150,7 +1150,7 @@ impl ResolvedWorkload {
 
         let instance: Arc<RwLock<Option<(String, Instance)>>> = Arc::default();
         for (import_name, import_item) in imports.into_iter() {
-            match import_item {
+            match import_item.ty {
                 ComponentItem::ComponentInstance(import_instance_ty) => {
                     trace!(name = import_name, "processing component instance import");
                     let mut all_components = self.components.write().await;
@@ -1225,7 +1225,7 @@ impl ResolvedWorkload {
                     for (export_name, export_ty) in
                         import_instance_ty.exports(plugin_component.metadata.component.engine())
                     {
-                        match export_ty {
+                        match export_ty.ty {
                             ComponentItem::ComponentFunc(func_ty) => {
                                 let (item, func_idx) = match plugin_component
                                     .metadata
@@ -1315,11 +1315,11 @@ impl ResolvedWorkload {
                                                         let call_pre = pre.clone();
                                                         let call_result = tokio::task::spawn(
                                                             async move {
+                                                                let instance = call_pre
+                                                                    .instantiate_async(&mut store)
+                                                                    .await?;
                                                                 store
                                                                     .run_concurrent(async move |accessor| {
-                                                                        let instance = accessor
-                                                                            .instantiate_async(&call_pre)
-                                                                            .await?;
                                                                         let func = accessor.with(
                                                                             |mut access| -> wasmtime::Result<_> {
                                                                                 instance
@@ -1440,54 +1440,35 @@ impl ResolvedWorkload {
                                                         },
                                                     )?;
 
-                                                    let instance = if let Some(instance) =
-                                                        cached_instance
-                                                    {
-                                                        trace_p3_linked_instance(
-                                                            "cache-hit",
-                                                            plugin_component_id.as_ref(),
-                                                            &store_id,
-                                                            Some(import_name.as_ref()),
-                                                            Some(export_name.as_ref()),
-                                                        );
-                                                        instance
-                                                    } else {
-                                                        let instance = match accessor
-                                                            .instantiate_async(&pre)
-                                                            .await
-                                                        {
-                                                            Ok(instance) => instance,
-                                                            Err(err) => {
-                                                                accessor.with(
-                                                                    |mut access| -> wasmtime::Result<_> {
-                                                                        access
-                                                                            .data_mut()
-                                                                            .set_active_ctx(&prev_id)
-                                                                    },
-                                                                )?;
-                                                                return Err(err);
-                                                            }
-                                                        };
-                                                        exporter_instances
-                                                            .write()
-                                                            .expect(
-                                                                "exporter instance cache poisoned",
-                                                            )
-                                                            .insert(
-                                                                (
-                                                                    plugin_component_id.clone(),
-                                                                    store_id.clone(),
-                                                            ),
-                                                            instance,
-                                                        );
-                                                        trace_p3_linked_instance(
-                                                            "lazy-instantiate",
-                                                            plugin_component_id.as_ref(),
-                                                            &store_id,
-                                                            Some(import_name.as_ref()),
-                                                            Some(export_name.as_ref()),
-                                                        );
-                                                        instance
+                                                    let instance = match cached_instance {
+                                                        Some(instance) => {
+                                                            trace_p3_linked_instance(
+                                                                "cache-hit",
+                                                                plugin_component_id.as_ref(),
+                                                                &store_id,
+                                                                Some(import_name.as_ref()),
+                                                                Some(export_name.as_ref()),
+                                                            );
+                                                            instance
+                                                        }
+                                                        None => {
+                                                            // Official release-46 removed
+                                                            // `Accessor::instantiate_async`, so we can no
+                                                            // longer lazily instantiate on a cache miss. All
+                                                            // entrypoints pre-instantiate linked components,
+                                                            // so a miss here is a bug: restore the caller's
+                                                            // active ctx and error out.
+                                                            accessor.with(
+                                                                |mut access| -> wasmtime::Result<_> {
+                                                                    access
+                                                                        .data_mut()
+                                                                        .set_active_ctx(&prev_id)
+                                                                },
+                                                            )?;
+                                                            return Err(wasmtime::format_err!(
+                                                                "linked component instance '{plugin_component_id}' was not pre-instantiated for this store"
+                                                            ));
+                                                        }
                                                     };
 
                                                     let lower_result = accessor.with(

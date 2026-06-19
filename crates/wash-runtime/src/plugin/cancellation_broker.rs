@@ -137,8 +137,8 @@ impl<'a> bindings::betty_blocks::cancellation_broker::broker::Host for ActiveCtx
 // Async funcs live on `HostWithStore`, which bindgen invokes with an `Accessor`
 // so the body can suspend without holding a store borrow. We extract the cloned
 // `CancelStore` synchronously under `accessor.with(...)`, then await outside it.
-impl bindings::betty_blocks::cancellation_broker::broker::HostWithStore for SharedCtx {
-    async fn wait_cancel<T: 'static>(
+impl<T: 'static> bindings::betty_blocks::cancellation_broker::broker::HostWithStore<T> for SharedCtx {
+    async fn wait_cancel(
         accessor: &wasmtime::component::Accessor<T, Self>,
         plan_id: String,
     ) -> wasmtime::Result<()> {

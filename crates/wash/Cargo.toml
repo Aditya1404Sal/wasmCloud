@@ -64,10 +64,11 @@ wasm-pkg-core = { workspace = true }
 wash-runtime = { workspace = true, features = ["washlet", "oci", "wasi-config", "wasi-logging", "wasi-blobstore", "wasi-keyvalue", "wasmcloud-postgres", "wasi-otel", "wasmcloud-smtp"] }
 wit-component = { workspace = true }
 
-# Enable WebGPU support on non-Windows platforms
-# WebGPU is disabled on Windows due to dependency version conflicts with the windows crate
-[target.'cfg(not(target_os = "windows"))'.dependencies]
-wash-runtime = { workspace = true, features = ["wasi-webgpu"] }
+# NOTE: wasi-webgpu is opt-in (the `wasi-webgpu` feature), not enabled by
+# default. The wasi-gfx-runtime crates are pinned to a wasmtime-45 rev and pull
+# in a second, incompatible `wasmtime`/`wasmtime-wasi-io`; until they ship a
+# release-46-compatible rev, enabling webgpu won't build on this branch's
+# wasmtime 46. (Matches upstream #5258's webgpu-opt-in.)
 
 # `O_NOFOLLOW` for the secret-file-open hardening in `crate::workload`.
 # Unix-only. Windows has no portable equivalent.
