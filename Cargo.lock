@@ -1312,7 +1312,7 @@ dependencies = [
 [[package]]
 name = "cranelift-assembler-x64"
 version = "0.133.0"
-source = "git+https://github.com/ricochet/wasmtime?branch=release-46.0.0-implements#4000b93ad8f2ab07980763c8e5f2901525a3c4cf"
+source = "git+https://github.com/Aditya1404Sal/wasmtime?branch=release-46.0.0-implements-accessor#01b203a9498d34778f563370e7409d63ab72afbb"
 dependencies = [
  "cranelift-assembler-x64-meta 0.133.0",
 ]
@@ -1329,7 +1329,7 @@ dependencies = [
 [[package]]
 name = "cranelift-assembler-x64-meta"
 version = "0.133.0"
-source = "git+https://github.com/ricochet/wasmtime?branch=release-46.0.0-implements#4000b93ad8f2ab07980763c8e5f2901525a3c4cf"
+source = "git+https://github.com/Aditya1404Sal/wasmtime?branch=release-46.0.0-implements-accessor#01b203a9498d34778f563370e7409d63ab72afbb"
 dependencies = [
  "cranelift-srcgen 0.133.0",
 ]
@@ -1347,7 +1347,7 @@ dependencies = [
 [[package]]
 name = "cranelift-bforest"
 version = "0.133.0"
-source = "git+https://github.com/ricochet/wasmtime?branch=release-46.0.0-implements#4000b93ad8f2ab07980763c8e5f2901525a3c4cf"
+source = "git+https://github.com/Aditya1404Sal/wasmtime?branch=release-46.0.0-implements-accessor#01b203a9498d34778f563370e7409d63ab72afbb"
 dependencies = [
  "cranelift-entity 0.133.0",
  "wasmtime-internal-core 46.0.0",
@@ -1367,7 +1367,7 @@ dependencies = [
 [[package]]
 name = "cranelift-bitset"
 version = "0.133.0"
-source = "git+https://github.com/ricochet/wasmtime?branch=release-46.0.0-implements#4000b93ad8f2ab07980763c8e5f2901525a3c4cf"
+source = "git+https://github.com/Aditya1404Sal/wasmtime?branch=release-46.0.0-implements-accessor#01b203a9498d34778f563370e7409d63ab72afbb"
 dependencies = [
  "serde",
  "serde_derive",
@@ -1405,7 +1405,7 @@ dependencies = [
 [[package]]
 name = "cranelift-codegen"
 version = "0.133.0"
-source = "git+https://github.com/ricochet/wasmtime?branch=release-46.0.0-implements#4000b93ad8f2ab07980763c8e5f2901525a3c4cf"
+source = "git+https://github.com/Aditya1404Sal/wasmtime?branch=release-46.0.0-implements-accessor#01b203a9498d34778f563370e7409d63ab72afbb"
 dependencies = [
  "bumpalo",
  "cranelift-assembler-x64 0.133.0",
@@ -1448,7 +1448,7 @@ dependencies = [
 [[package]]
 name = "cranelift-codegen-meta"
 version = "0.133.0"
-source = "git+https://github.com/ricochet/wasmtime?branch=release-46.0.0-implements#4000b93ad8f2ab07980763c8e5f2901525a3c4cf"
+source = "git+https://github.com/Aditya1404Sal/wasmtime?branch=release-46.0.0-implements-accessor#01b203a9498d34778f563370e7409d63ab72afbb"
 dependencies = [
  "cranelift-assembler-x64-meta 0.133.0",
  "cranelift-codegen-shared 0.133.0",
@@ -1466,7 +1466,7 @@ checksum = "c95a8da8be283f49cda7d0ef228c94f10d791e517b27b0c7e282dadd2e79ce45"
 [[package]]
 name = "cranelift-codegen-shared"
 version = "0.133.0"
-source = "git+https://github.com/ricochet/wasmtime?branch=release-46.0.0-implements#4000b93ad8f2ab07980763c8e5f2901525a3c4cf"
+source = "git+https://github.com/Aditya1404Sal/wasmtime?branch=release-46.0.0-implements-accessor#01b203a9498d34778f563370e7409d63ab72afbb"
 
 [[package]]
 name = "cranelift-control"
@@ -1480,7 +1480,7 @@ dependencies = [
 [[package]]
 name = "cranelift-control"
 version = "0.133.0"
-source = "git+https://github.com/ricochet/wasmtime?branch=release-46.0.0-implements#4000b93ad8f2ab07980763c8e5f2901525a3c4cf"
+source = "git+https://github.com/Aditya1404Sal/wasmtime?branch=release-46.0.0-implements-accessor#01b203a9498d34778f563370e7409d63ab72afbb"
 dependencies = [
  "arbitrary",
 ]
@@ -1500,7 +1500,7 @@ dependencies = [
 [[package]]
 name = "cranelift-entity"
 version = "0.133.0"
-source = "git+https://github.com/ricochet/wasmtime?branch=release-46.0.0-implements#4000b93ad8f2ab07980763c8e5f2901525a3c4cf"
+source = "git+https://github.com/Aditya1404Sal/wasmtime?branch=release-46.0.0-implements-accessor#01b203a9498d34778f563370e7409d63ab72afbb"
 dependencies = [
  "cranelift-bitset 0.133.0",
  "serde",
@@ -1523,7 +1523,7 @@ dependencies = [
 [[package]]
 name = "cranelift-frontend"
 version = "0.133.0"
-source = "git+https://github.com/ricochet/wasmtime?branch=release-46.0.0-implements#4000b93ad8f2ab07980763c8e5f2901525a3c4cf"
+source = "git+https://github.com/Aditya1404Sal/wasmtime?branch=release-46.0.0-implements-accessor#01b203a9498d34778f563370e7409d63ab72afbb"
 dependencies = [
  "cranelift-codegen 0.133.0",
  "hashbrown 0.17.0",
@@ -1541,7 +1541,7 @@ checksum = "1ac4e0bc095b2dab2212d1e99d7a74b62afc1485db023f1c0cb34a68758f7bd1"
 [[package]]
 name = "cranelift-isle"
 version = "0.133.0"
-source = "git+https://github.com/ricochet/wasmtime?branch=release-46.0.0-implements#4000b93ad8f2ab07980763c8e5f2901525a3c4cf"
+source = "git+https://github.com/Aditya1404Sal/wasmtime?branch=release-46.0.0-implements-accessor#01b203a9498d34778f563370e7409d63ab72afbb"
 
 [[package]]
 name = "cranelift-native"
@@ -1557,7 +1557,7 @@ dependencies = [
 [[package]]
 name = "cranelift-native"
 version = "0.133.0"
-source = "git+https://github.com/ricochet/wasmtime?branch=release-46.0.0-implements#4000b93ad8f2ab07980763c8e5f2901525a3c4cf"
+source = "git+https://github.com/Aditya1404Sal/wasmtime?branch=release-46.0.0-implements-accessor#01b203a9498d34778f563370e7409d63ab72afbb"
 dependencies = [
  "cranelift-codegen 0.133.0",
  "libc",
@@ -1573,7 +1573,7 @@ checksum = "a3ceab9a53f7d362c89841fbaa8e63e44d47c40e91dc96ee6f777fca5d6b323b"
 [[package]]
 name = "cranelift-srcgen"
 version = "0.133.0"
-source = "git+https://github.com/ricochet/wasmtime?branch=release-46.0.0-implements#4000b93ad8f2ab07980763c8e5f2901525a3c4cf"
+source = "git+https://github.com/Aditya1404Sal/wasmtime?branch=release-46.0.0-implements-accessor#01b203a9498d34778f563370e7409d63ab72afbb"
 
 [[package]]
 name = "crc32fast"
@@ -5383,7 +5383,7 @@ dependencies = [
 [[package]]
 name = "pulley-interpreter"
 version = "46.0.0"
-source = "git+https://github.com/ricochet/wasmtime?branch=release-46.0.0-implements#4000b93ad8f2ab07980763c8e5f2901525a3c4cf"
+source = "git+https://github.com/Aditya1404Sal/wasmtime?branch=release-46.0.0-implements-accessor#01b203a9498d34778f563370e7409d63ab72afbb"
 dependencies = [
  "cranelift-bitset 0.133.0",
  "log",
@@ -5405,7 +5405,7 @@ dependencies = [
 [[package]]
 name = "pulley-macros"
 version = "46.0.0"
-source = "git+https://github.com/ricochet/wasmtime?branch=release-46.0.0-implements#4000b93ad8f2ab07980763c8e5f2901525a3c4cf"
+source = "git+https://github.com/Aditya1404Sal/wasmtime?branch=release-46.0.0-implements-accessor#01b203a9498d34778f563370e7409d63ab72afbb"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -8412,7 +8412,7 @@ dependencies = [
 [[package]]
 name = "wasmtime"
 version = "46.0.0"
-source = "git+https://github.com/ricochet/wasmtime?branch=release-46.0.0-implements#4000b93ad8f2ab07980763c8e5f2901525a3c4cf"
+source = "git+https://github.com/Aditya1404Sal/wasmtime?branch=release-46.0.0-implements-accessor#01b203a9498d34778f563370e7409d63ab72afbb"
 dependencies = [
  "addr2line",
  "async-trait",
@@ -8485,7 +8485,7 @@ dependencies = [
 [[package]]
 name = "wasmtime-environ"
 version = "46.0.0"
-source = "git+https://github.com/ricochet/wasmtime?branch=release-46.0.0-implements#4000b93ad8f2ab07980763c8e5f2901525a3c4cf"
+source = "git+https://github.com/Aditya1404Sal/wasmtime?branch=release-46.0.0-implements-accessor#01b203a9498d34778f563370e7409d63ab72afbb"
 dependencies = [
  "anyhow",
  "cpp_demangle",
@@ -8550,7 +8550,7 @@ dependencies = [
 [[package]]
 name = "wasmtime-internal-component-macro"
 version = "46.0.0"
-source = "git+https://github.com/ricochet/wasmtime?branch=release-46.0.0-implements#4000b93ad8f2ab07980763c8e5f2901525a3c4cf"
+source = "git+https://github.com/Aditya1404Sal/wasmtime?branch=release-46.0.0-implements-accessor#01b203a9498d34778f563370e7409d63ab72afbb"
 dependencies = [
  "anyhow",
  "proc-macro2",
@@ -8570,7 +8570,7 @@ checksum = "47fda091250d7ab839ea51e4d98190b6eee37e9de4ab2462e8fe8465369c1986"
 [[package]]
 name = "wasmtime-internal-component-util"
 version = "46.0.0"
-source = "git+https://github.com/ricochet/wasmtime?branch=release-46.0.0-implements#4000b93ad8f2ab07980763c8e5f2901525a3c4cf"
+source = "git+https://github.com/Aditya1404Sal/wasmtime?branch=release-46.0.0-implements-accessor#01b203a9498d34778f563370e7409d63ab72afbb"
 
 [[package]]
 name = "wasmtime-internal-core"
@@ -8587,7 +8587,7 @@ dependencies = [
 [[package]]
 name = "wasmtime-internal-core"
 version = "46.0.0"
-source = "git+https://github.com/ricochet/wasmtime?branch=release-46.0.0-implements#4000b93ad8f2ab07980763c8e5f2901525a3c4cf"
+source = "git+https://github.com/Aditya1404Sal/wasmtime?branch=release-46.0.0-implements-accessor#01b203a9498d34778f563370e7409d63ab72afbb"
 dependencies = [
  "anyhow",
  "hashbrown 0.17.0",
@@ -8625,7 +8625,7 @@ dependencies = [
 [[package]]
 name = "wasmtime-internal-cranelift"
 version = "46.0.0"
-source = "git+https://github.com/ricochet/wasmtime?branch=release-46.0.0-implements#4000b93ad8f2ab07980763c8e5f2901525a3c4cf"
+source = "git+https://github.com/Aditya1404Sal/wasmtime?branch=release-46.0.0-implements-accessor#01b203a9498d34778f563370e7409d63ab72afbb"
 dependencies = [
  "cfg-if",
  "cranelift-codegen 0.133.0",
@@ -8666,7 +8666,7 @@ dependencies = [
 [[package]]
 name = "wasmtime-internal-fiber"
 version = "46.0.0"
-source = "git+https://github.com/ricochet/wasmtime?branch=release-46.0.0-implements#4000b93ad8f2ab07980763c8e5f2901525a3c4cf"
+source = "git+https://github.com/Aditya1404Sal/wasmtime?branch=release-46.0.0-implements-accessor#01b203a9498d34778f563370e7409d63ab72afbb"
 dependencies = [
  "cc",
  "cfg-if",
@@ -8692,7 +8692,7 @@ dependencies = [
 [[package]]
 name = "wasmtime-internal-jit-debug"
 version = "46.0.0"
-source = "git+https://github.com/ricochet/wasmtime?branch=release-46.0.0-implements#4000b93ad8f2ab07980763c8e5f2901525a3c4cf"
+source = "git+https://github.com/Aditya1404Sal/wasmtime?branch=release-46.0.0-implements-accessor#01b203a9498d34778f563370e7409d63ab72afbb"
 dependencies = [
  "cc",
  "wasmtime-internal-versioned-export-macros 46.0.0",
@@ -8713,7 +8713,7 @@ dependencies = [
 [[package]]
 name = "wasmtime-internal-jit-icache-coherence"
 version = "46.0.0"
-source = "git+https://github.com/ricochet/wasmtime?branch=release-46.0.0-implements#4000b93ad8f2ab07980763c8e5f2901525a3c4cf"
+source = "git+https://github.com/Aditya1404Sal/wasmtime?branch=release-46.0.0-implements-accessor#01b203a9498d34778f563370e7409d63ab72afbb"
 dependencies = [
  "cfg-if",
  "libc",
@@ -8737,7 +8737,7 @@ dependencies = [
 [[package]]
 name = "wasmtime-internal-unwinder"
 version = "46.0.0"
-source = "git+https://github.com/ricochet/wasmtime?branch=release-46.0.0-implements#4000b93ad8f2ab07980763c8e5f2901525a3c4cf"
+source = "git+https://github.com/Aditya1404Sal/wasmtime?branch=release-46.0.0-implements-accessor#01b203a9498d34778f563370e7409d63ab72afbb"
 dependencies = [
  "cfg-if",
  "cranelift-codegen 0.133.0",
@@ -8760,7 +8760,7 @@ dependencies = [
 [[package]]
 name = "wasmtime-internal-versioned-export-macros"
 version = "46.0.0"
-source = "git+https://github.com/ricochet/wasmtime?branch=release-46.0.0-implements#4000b93ad8f2ab07980763c8e5f2901525a3c4cf"
+source = "git+https://github.com/Aditya1404Sal/wasmtime?branch=release-46.0.0-implements-accessor#01b203a9498d34778f563370e7409d63ab72afbb"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -8800,7 +8800,7 @@ dependencies = [
 [[package]]
 name = "wasmtime-internal-wit-bindgen"
 version = "46.0.0"
-source = "git+https://github.com/ricochet/wasmtime?branch=release-46.0.0-implements#4000b93ad8f2ab07980763c8e5f2901525a3c4cf"
+source = "git+https://github.com/Aditya1404Sal/wasmtime?branch=release-46.0.0-implements-accessor#01b203a9498d34778f563370e7409d63ab72afbb"
 dependencies = [
  "anyhow",
  "bitflags",
@@ -8842,7 +8842,7 @@ dependencies = [
 [[package]]
 name = "wasmtime-wasi"
 version = "46.0.0"
-source = "git+https://github.com/ricochet/wasmtime?branch=release-46.0.0-implements#4000b93ad8f2ab07980763c8e5f2901525a3c4cf"
+source = "git+https://github.com/Aditya1404Sal/wasmtime?branch=release-46.0.0-implements-accessor#01b203a9498d34778f563370e7409d63ab72afbb"
 dependencies = [
  "async-trait",
  "bitflags",
@@ -8869,7 +8869,7 @@ dependencies = [
 [[package]]
 name = "wasmtime-wasi-http"
 version = "46.0.0"
-source = "git+https://github.com/ricochet/wasmtime?branch=release-46.0.0-implements#4000b93ad8f2ab07980763c8e5f2901525a3c4cf"
+source = "git+https://github.com/Aditya1404Sal/wasmtime?branch=release-46.0.0-implements-accessor#01b203a9498d34778f563370e7409d63ab72afbb"
 dependencies = [
  "async-trait",
  "bytes",
@@ -8905,7 +8905,7 @@ dependencies = [
 [[package]]
 name = "wasmtime-wasi-io"
 version = "46.0.0"
-source = "git+https://github.com/ricochet/wasmtime?branch=release-46.0.0-implements#4000b93ad8f2ab07980763c8e5f2901525a3c4cf"
+source = "git+https://github.com/Aditya1404Sal/wasmtime?branch=release-46.0.0-implements-accessor#01b203a9498d34778f563370e7409d63ab72afbb"
 dependencies = [
  "async-trait",
  "bytes",
@@ -8917,7 +8917,7 @@ dependencies = [
 [[package]]
 name = "wasmtime-wasi-tls"
 version = "46.0.0"
-source = "git+https://github.com/ricochet/wasmtime?branch=release-46.0.0-implements#4000b93ad8f2ab07980763c8e5f2901525a3c4cf"
+source = "git+https://github.com/Aditya1404Sal/wasmtime?branch=release-46.0.0-implements-accessor#01b203a9498d34778f563370e7409d63ab72afbb"
 dependencies = [
  "bytes",
  "cfg-if",

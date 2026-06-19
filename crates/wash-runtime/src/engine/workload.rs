@@ -115,6 +115,7 @@ struct EphemeralLinkedCall {
     http_handler: Arc<dyn crate::host::http::HostHandler>,
     active: ComponentCtxTemplate,
     linked: Vec<ComponentCtxTemplate>,
+    linked_instances: Vec<(Arc<str>, InstancePre<SharedCtx>)>,
 }
 
 fn type_is_ephemeral_safe(ty: &Type) -> bool {
@@ -1159,6 +1160,7 @@ impl ResolvedWorkload {
                         instance_idx,
                         plugin_ctx_template,
                         linked_ctx_templates,
+                        linked_instances,
                         plugin_engine,
                     ) = {
                         let Some(exporter_component) = interface_map.get(import_name).cloned()
@@ -1173,15 +1175,75 @@ impl ResolvedWorkload {
                             );
                             continue;
                         };
-                        let linked_ctx_templates = all_components
+                        let nested_linked_component_ids = {
+                            let Some(exporter_workload_component) =
+                                all_components.get(&exporter_component)
+                            else {
+                                anyhow::bail!(
+                                    "exporting component '{exporter_component}' for import '{import_name}' not found"
+                                );
+                            };
+                            let mut ids = Vec::<Arc<str>>::new();
+                            for (nested_import_name, nested_import_item) in
+                                exporter_workload_component
+                                    .metadata
+                                    .component
+                                    .component_type()
+                                    .imports(
+                                        exporter_workload_component
+                                            .metadata
+                                            .component
+                                            .engine(),
+                                    )
+                            {
+                                if !matches!(
+                                    nested_import_item.ty,
+                                    ComponentItem::ComponentInstance(_)
+                                ) {
+                                    continue;
+                                }
+                                let Some(nested_component_id) =
+                                    interface_map.get(nested_import_name)
+                                else {
+                                    continue;
+                                };
+                                if nested_component_id.as_ref() == exporter_component.as_ref() {
+                                    continue;
+                                }
+                                if ids.iter().any(|id| {
+                                    id.as_ref() == nested_component_id.as_ref()
+                                }) {
+                                    continue;
+                                }
+                                ids.push(nested_component_id.clone());
+                            }
+                            ids
+                        };
+                        let linked_ctx_templates = nested_linked_component_ids
                             .iter()
-                            .filter(|(component_id, _)| {
-                                component_id.as_ref() != exporter_component.as_ref()
-                            })
-                            .map(|(_, component)| {
-                                ComponentCtxTemplate::from_metadata(&component.metadata)
-                            })
+                            .filter_map(|component_id| all_components.get(component_id))
+                            .map(|component| ComponentCtxTemplate::from_metadata(&component.metadata))
                             .collect::<Vec<_>>();
+                        let linked_instances = nested_linked_component_ids
+                            .iter()
+                            .map(|component_id| {
+                                let component = all_components.get_mut(component_id).ok_or_else(
+                                    || {
+                                        wasmtime::format_err!(
+                                            "linked component '{component_id}' not found"
+                                        )
+                                    },
+                                )?;
+                                component
+                                    .pre_instantiate()
+                                    .map(|pre| (component_id.clone(), pre))
+                            })
+                            .collect::<wasmtime::Result<Vec<_>>>()
+                            .map_err(|e| {
+                                anyhow::anyhow!(
+                                    "failed to pre-instantiate linked components for ephemeral call: {e}"
+                                )
+                            })?;
                         let Some(plugin_component) = all_components.get_mut(&exporter_component)
                         else {
                             anyhow::bail!(
@@ -1204,6 +1266,7 @@ impl ResolvedWorkload {
                             idx,
                             plugin_ctx_template,
                             linked_ctx_templates,
+                            linked_instances,
                             plugin_engine,
                         )
                     };
@@ -1265,6 +1328,7 @@ impl ResolvedWorkload {
                                             http_handler: self.http_handler.clone(),
                                             active: plugin_ctx_template.clone(),
                                             linked: linked_ctx_templates.clone(),
+                                            linked_instances: linked_instances.clone(),
                                         })
                                     } else {
                                         None
@@ -1298,6 +1362,73 @@ impl ResolvedWorkload {
                                                             .active_ctx
                                                             .store_id
                                                             .clone();
+                                                        for (linked_component_id, linked_pre) in
+                                                            &ephemeral_call.linked_instances
+                                                        {
+                                                            let key = (
+                                                                linked_component_id.clone(),
+                                                                store_id.clone(),
+                                                            );
+                                                            if exporter_instances
+                                                                .read()
+                                                                .expect(
+                                                                    "exporter instance cache poisoned",
+                                                                )
+                                                                .contains_key(&key)
+                                                            {
+                                                                trace_p3_linked_instance(
+                                                                    "cache-hit",
+                                                                    linked_component_id.as_ref(),
+                                                                    &store_id,
+                                                                    None,
+                                                                    None,
+                                                                );
+                                                                continue;
+                                                            }
+
+                                                            let prev_component_id = store
+                                                                .data()
+                                                                .active_ctx
+                                                                .component_id
+                                                                .clone();
+                                                            store
+                                                                .data_mut()
+                                                                .set_active_ctx(
+                                                                    linked_component_id,
+                                                                )
+                                                                .map_err(|e| {
+                                                                    wasmtime::format_err!("{e:#}")
+                                                                })?;
+                                                            let instantiate_result = linked_pre
+                                                                .instantiate_async(&mut store)
+                                                                .await;
+                                                            store
+                                                                .data_mut()
+                                                                .set_active_ctx(&prev_component_id)
+                                                                .map_err(|e| {
+                                                                    wasmtime::format_err!("{e:#}")
+                                                                })?;
+                                                            let instance = instantiate_result
+                                                                .map_err(|e| {
+                                                                    wasmtime::format_err!(
+                                                                        "failed to instantiate linked component '{linked_component_id}' in ephemeral store: {e}"
+                                                                    )
+                                                                })?;
+                                                            exporter_instances
+                                                                .write()
+                                                                .expect(
+                                                                    "exporter instance cache poisoned",
+                                                                )
+                                                                .insert(key, instance);
+                                                            trace_p3_linked_instance(
+                                                                "eager-instantiate",
+                                                                linked_component_id.as_ref(),
+                                                                &store_id,
+                                                                None,
+                                                                None,
+                                                            );
+                                                        }
+
                                                         let params_buf = params.to_vec();
                                                         let mut results_buf = vec![
                                                             Val::Bool(false);
@@ -1313,6 +1444,7 @@ impl ResolvedWorkload {
                                                         let call_import_name = import_name.clone();
                                                         let call_export_name = export_name.clone();
                                                         let call_pre = pre.clone();
+                                                        let cleanup_store_id = store_id.clone();
                                                         let call_result = tokio::task::spawn(
                                                             async move {
                                                                 let instance = call_pre
@@ -1360,7 +1492,19 @@ impl ResolvedWorkload {
                                                             wasmtime::format_err!(
                                                                 "ephemeral linked call task failed: {e}"
                                                             )
-                                                        })??;
+                                                        });
+                                                        exporter_instances
+                                                            .write()
+                                                            .expect(
+                                                                "exporter instance cache poisoned",
+                                                            )
+                                                            .retain(
+                                                                |(_, cached_store_id), _| {
+                                                                    cached_store_id
+                                                                        != &cleanup_store_id
+                                                                },
+                                                            );
+                                                        let call_result = call_result??;
 
                                                         for (i, v) in call_result
                                                             .into_iter()
@@ -1452,22 +1596,35 @@ impl ResolvedWorkload {
                                                             instance
                                                         }
                                                         None => {
-                                                            // Official release-46 removed
-                                                            // `Accessor::instantiate_async`, so we can no
-                                                            // longer lazily instantiate on a cache miss. All
-                                                            // entrypoints pre-instantiate linked components,
-                                                            // so a miss here is a bug: restore the caller's
-                                                            // active ctx and error out.
-                                                            accessor.with(
-                                                                |mut access| -> wasmtime::Result<_> {
-                                                                    access
-                                                                        .data_mut()
-                                                                        .set_active_ctx(&prev_id)
-                                                                },
-                                                            )?;
-                                                            return Err(wasmtime::format_err!(
-                                                                "linked component instance '{plugin_component_id}' was not pre-instantiated for this store"
-                                                            ));
+                                                            let instance = accessor
+                                                                .instantiate_async(&pre)
+                                                                .await
+                                                                .map_err(|e| {
+                                                                    wasmtime::format_err!(
+                                                                        "failed to instantiate linked component '{plugin_component_id}' for store '{store_id}': {e}"
+                                                                    )
+                                                                })?;
+                                                            exporter_instances
+                                                                .write()
+                                                                .expect(
+                                                                    "exporter instance cache poisoned",
+                                                                )
+                                                                .insert(
+                                                                    (
+                                                                        plugin_component_id
+                                                                            .clone(),
+                                                                        store_id.clone(),
+                                                                    ),
+                                                                    instance,
+                                                                );
+                                                            trace_p3_linked_instance(
+                                                                "lazy-instantiate",
+                                                                plugin_component_id.as_ref(),
+                                                                &store_id,
+                                                                Some(import_name.as_ref()),
+                                                                Some(export_name.as_ref()),
+                                                            );
+                                                            instance
                                                         }
                                                     };
 

@@ -186,8 +186,8 @@ oci-wasm = { git = "https://github.com/bytecodealliance/rust-oci-wasm", rev = "5
 # Retire this whole block (and the fork branch) once the workspace moves to
 # wasmtime 47, where the feature ships in the stock release.
 [patch."https://github.com/bytecodealliance/wasmtime"]
-wasmtime = { git = "https://github.com/ricochet/wasmtime", branch = "release-46.0.0-implements" }
-wasmtime-wasi = { git = "https://github.com/ricochet/wasmtime", branch = "release-46.0.0-implements" }
-wasmtime-wasi-io = { git = "https://github.com/ricochet/wasmtime", branch = "release-46.0.0-implements" }
-wasmtime-wasi-http = { git = "https://github.com/ricochet/wasmtime", branch = "release-46.0.0-implements" }
-wasmtime-wasi-tls = { git = "https://github.com/ricochet/wasmtime", branch = "release-46.0.0-implements" }
+wasmtime = { git = "https://github.com/Aditya1404Sal/wasmtime", branch = "release-46.0.0-implements-accessor" }
+wasmtime-wasi = { git = "https://github.com/Aditya1404Sal/wasmtime", branch = "release-46.0.0-implements-accessor" }
+wasmtime-wasi-io = { git = "https://github.com/Aditya1404Sal/wasmtime", branch = "release-46.0.0-implements-accessor" }
+wasmtime-wasi-http = { git = "https://github.com/Aditya1404Sal/wasmtime", branch = "release-46.0.0-implements-accessor" }
+wasmtime-wasi-tls = { git = "https://github.com/Aditya1404Sal/wasmtime", branch = "release-46.0.0-implements-accessor" }
