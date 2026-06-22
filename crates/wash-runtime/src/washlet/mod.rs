@@ -439,24 +439,24 @@ async fn workload_start(
                     }
                 };
 
-            let local_resources = match component.local_resources.clone() {
-                Some(lr) => match crate::types::LocalResources::try_from(lr) {
-                    Ok(lr) => lr,
-                    Err(e) => {
-                        return Ok(types::v2::WorkloadStartResponse {
-                            workload_status: Some(types::v2::WorkloadStatus {
-                                workload_id: workload_id.clone(),
-                                workload_state: types::v2::WorkloadState::Error.into(),
-                                message: format!(
-                                    "invalid local_resources for component {}: {e:#}",
-                                    component.name
-                                ),
-                            }),
-                        });
-                    }
-                },
-                None => crate::types::LocalResources::default(),
-            };
+                let local_resources = match component.local_resources.clone() {
+                    Some(lr) => match crate::types::LocalResources::try_from(lr) {
+                        Ok(lr) => lr,
+                        Err(e) => {
+                            return Ok(types::v2::WorkloadStartResponse {
+                                workload_status: Some(types::v2::WorkloadStatus {
+                                    workload_id: workload_id.clone(),
+                                    workload_state: types::v2::WorkloadState::Error.into(),
+                                    message: format!(
+                                        "invalid local_resources for component {}: {e:#}",
+                                        component.name
+                                    ),
+                                }),
+                            });
+                        }
+                    },
+                    None => crate::types::LocalResources::default(),
+                };
 
                 pulled_components.push(crate::types::Component {
                     name: component.name.clone(),
@@ -479,38 +479,38 @@ async fn workload_start(
                 .await
                 {
                     Ok(res) => res,
-                Err(e) => {
-                    return Ok(types::v2::WorkloadStartResponse {
-                        workload_status: Some(types::v2::WorkloadStatus {
-                            workload_id: workload_id.clone(),
-                            workload_state: types::v2::WorkloadState::Error.into(),
-                            message: format!(
-                                "failed to pull component image {}: {}",
-                                component.image, e
-                            ),
-                        }),
-                    });
-                }
-            };
-
-            let local_resources = match component.local_resources.clone() {
-                Some(lr) => match crate::types::LocalResources::try_from(lr) {
-                    Ok(lr) => lr,
                     Err(e) => {
                         return Ok(types::v2::WorkloadStartResponse {
                             workload_status: Some(types::v2::WorkloadStatus {
                                 workload_id: workload_id.clone(),
                                 workload_state: types::v2::WorkloadState::Error.into(),
                                 message: format!(
-                                    "invalid local_resources for component {}: {e:#}",
-                                    component.name
+                                    "failed to pull component image {}: {}",
+                                    component.image, e
                                 ),
                             }),
                         });
                     }
-                },
-                None => crate::types::LocalResources::default(),
-            };
+                };
+
+                let local_resources = match component.local_resources.clone() {
+                    Some(lr) => match crate::types::LocalResources::try_from(lr) {
+                        Ok(lr) => lr,
+                        Err(e) => {
+                            return Ok(types::v2::WorkloadStartResponse {
+                                workload_status: Some(types::v2::WorkloadStatus {
+                                    workload_id: workload_id.clone(),
+                                    workload_state: types::v2::WorkloadState::Error.into(),
+                                    message: format!(
+                                        "invalid local_resources for component {}: {e:#}",
+                                        component.name
+                                    ),
+                                }),
+                            });
+                        }
+                    },
+                    None => crate::types::LocalResources::default(),
+                };
 
                 pulled_components.push(crate::types::Component {
                     name: component.name.clone(),

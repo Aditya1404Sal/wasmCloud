@@ -113,7 +113,8 @@ fn kv_key(plan_id: &str) -> String {
 impl<'a> bindings::betty_blocks::cancellation_broker::broker::Host for ActiveCtx<'a> {
     async fn set_cancel(&mut self, plan_id: String, cancelled: bool) -> wasmtime::Result<()> {
         let store_handle = {
-            let Some(plugin) = self.get_plugin::<CancellationBroker>(PLUGIN_CANCELLATION_BROKER_ID) else {
+            let Some(plugin) = self.get_plugin::<CancellationBroker>(PLUGIN_CANCELLATION_BROKER_ID)
+            else {
                 wasmtime::bail!("CancellationBroker plugin not found in context");
             };
             plugin.inner.clone()
@@ -137,14 +138,17 @@ impl<'a> bindings::betty_blocks::cancellation_broker::broker::Host for ActiveCtx
 // Async funcs live on `HostWithStore`, which bindgen invokes with an `Accessor`
 // so the body can suspend without holding a store borrow. We extract the cloned
 // `CancelStore` synchronously under `accessor.with(...)`, then await outside it.
-impl<T: 'static> bindings::betty_blocks::cancellation_broker::broker::HostWithStore<T> for SharedCtx {
+impl<T: 'static> bindings::betty_blocks::cancellation_broker::broker::HostWithStore<T>
+    for SharedCtx
+{
     async fn wait_cancel(
         accessor: &wasmtime::component::Accessor<T, Self>,
         plan_id: String,
     ) -> wasmtime::Result<()> {
         let store_handle = accessor.with(|mut access| {
             let ctx = access.get();
-            let Some(plugin) = ctx.get_plugin::<CancellationBroker>(PLUGIN_CANCELLATION_BROKER_ID) else {
+            let Some(plugin) = ctx.get_plugin::<CancellationBroker>(PLUGIN_CANCELLATION_BROKER_ID)
+            else {
                 return Err(wasmtime::Error::msg(
                     "CancellationBroker plugin not found in context",
                 ));
