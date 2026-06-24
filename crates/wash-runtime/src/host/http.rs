@@ -1232,19 +1232,9 @@ async fn invoke_component_handler(
     // Check if this component targets WASIP3 and dispatch accordingly
     #[cfg(feature = "wasip3")]
     if crate::engine::targets_wasip3_http(instance_pre.component()) {
-        let store_id = store.data().active_ctx.store_id.clone();
-        let cleanup_workload = workload_handle.clone();
-        let cleanup_store_id = store_id.clone();
-        let resp = crate::host::http_p3::handle_component_request_p3(
-            store,
-            instance_pre,
-            req,
-            fuel_meter,
-            Box::new(move || {
-                cleanup_workload.clear_exporter_instances_for_store(&cleanup_store_id);
-            }),
-        )
-        .await;
+        let resp =
+            crate::host::http_p3::handle_component_request_p3(store, instance_pre, req, fuel_meter)
+                .await;
         let resp = resp?;
         // Convert P3 response to a compatible HyperOutgoingBody response
         let (parts, body) = resp.into_parts();
