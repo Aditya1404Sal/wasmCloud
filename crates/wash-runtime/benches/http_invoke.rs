@@ -114,6 +114,7 @@ async fn start_warm_host(flavor: Flavor) -> anyhow::Result<WarmHost> {
                 // both fields.
                 pool_size: 0,
                 max_invocations: 0,
+                is_precompiled: false,
             }],
             host_interfaces: http_host_interfaces(flavor_host_header(flavor)),
             volumes: vec![],

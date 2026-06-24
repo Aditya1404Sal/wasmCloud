@@ -25,18 +25,21 @@
 mod common;
 
 use std::{
+    future::Future,
     net::SocketAddr,
+    pin::Pin,
     sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
     },
+    task::{Context, Poll},
     time::{Duration, Instant},
 };
 
-use anyhow::Context as _;
+use bytes::Bytes;
 use common::Flavor;
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use http_body_util::BodyExt;
+use http_body_util::{BodyExt, combinators::UnsyncBoxBody};
 use hyper::body::Incoming;
 use hyper_util::{
     rt::{TokioExecutor, TokioIo, TokioTimer},
@@ -44,15 +47,20 @@ use hyper_util::{
 };
 use tokio::{net::TcpListener, runtime::Runtime, sync::oneshot, task::JoinHandle};
 use wasmtime::{
-    Engine, Store,
-    component::{Component, Linker, ResourceTable},
+    Engine, Store, StoreContextMut,
+    component::{Component, GuestTaskId, Linker, ResourceTable},
 };
 use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 use wasmtime_wasi_http::{
     WasiHttpCtx,
-    handler::{HandlerState, Proxy, ProxyHandler, ProxyPre as HandlerProxyPre, StoreBundle},
-    p2::body::HyperOutgoingBody,
+    handler::{
+        HandlerState, Instance, ProxyHandler, ProxyPre, ShouldAccept, ViewFn, WorkerExpiration,
+        WorkerState, WorkerStatus,
+    },
 };
+
+// Response body produced by `ProxyHandler::handle`.
+type RespBody = UnsyncBoxBody<Bytes, wasmtime::Error>;
 
 // Defaults lifted from wasmtime-cli/src/commands/serve.rs.
 const DEFAULT_WASIP3_MAX_INSTANCE_REUSE_COUNT: usize = 128;
@@ -98,7 +106,6 @@ impl wasmtime_wasi_http::p2::WasiHttpView for Ctx {
     }
 }
 
-#[cfg(feature = "wasip3")]
 impl wasmtime_wasi_http::p3::WasiHttpView for Ctx {
     fn http(&mut self) -> wasmtime_wasi_http::p3::WasiHttpCtxView<'_> {
         wasmtime_wasi_http::p3::WasiHttpCtxView {
@@ -134,7 +141,6 @@ fn build_engine() -> anyhow::Result<Engine> {
     pool.total_tables(100);
     pool.total_component_instances(100);
     cfg.allocation_strategy(wasmtime::InstanceAllocationStrategy::Pooling(pool));
-    #[cfg(feature = "wasip3")]
     cfg.wasm_component_model_async(true);
     Ok(Engine::new(&cfg)?)
 }
@@ -143,185 +149,162 @@ fn build_linker(engine: &Engine) -> anyhow::Result<Linker<Ctx>> {
     let mut linker: Linker<Ctx> = Linker::new(engine);
     wasmtime_wasi::p2::add_to_linker_async(&mut linker)?;
     wasmtime_wasi_http::p2::add_only_http_to_linker_async(&mut linker)?;
-    #[cfg(feature = "wasip3")]
-    {
-        wasmtime_wasi::p3::add_to_linker(&mut linker)?;
-        wasmtime_wasi_http::p3::add_to_linker(&mut linker)?;
-    }
+    wasmtime_wasi::p3::add_to_linker(&mut linker)?;
+    wasmtime_wasi_http::p3::add_to_linker(&mut linker)?;
     Ok(linker)
 }
 
 // ---------------------------------------------------------------------------
-// HandlerState  - tells ProxyHandler how to produce Stores and bound reuse
+// Worker policy  - WorkerExpiration + WorkerState mirror wasmtime serve.
+// ---------------------------------------------------------------------------
+
+/// Decides when an idle/active worker should be dropped. `request_timeout` of
+/// `Duration::MAX` means a request never expires (what we want for a bench).
+struct Expiration {
+    idle_timeout: Duration,
+    request_timeout: Duration,
+    sleep: Pin<Box<tokio::time::Sleep>>,
+}
+
+impl WorkerExpiration for Expiration {
+    fn poll(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        status: WorkerStatus,
+        start: Instant,
+    ) -> Poll<()> {
+        // `Self` is `Unpin` (only `Pin<Box<Sleep>>` + `Duration` fields), so
+        // we can take a `&mut Self` and pin-project through the boxed sleep.
+        let me = self.get_mut();
+        let timeout = match status {
+            WorkerStatus::Idle => me.idle_timeout,
+            WorkerStatus::Requests | WorkerStatus::PostReturn => me.request_timeout,
+        };
+        if let Some(deadline) = start.checked_add(timeout) {
+            let deadline = deadline.into();
+            if deadline != me.sleep.deadline() {
+                me.sleep.as_mut().reset(deadline);
+            }
+            me.sleep.as_mut().poll(cx)
+        } else {
+            // `start + Duration::MAX` overflows: never expire.
+            Poll::Pending
+        }
+    }
+}
+
+/// Instance-reuse policy + per-request hooks.
+struct Worker {
+    max_instance_reuse_count: usize,
+    max_instance_concurrent_reuse_count: usize,
+    request_timeout: Duration,
+}
+
+impl WorkerState for Worker {
+    type StoreData = Ctx;
+    type RequestId = u64;
+
+    fn should_accept_request(&self, concurrent_count: usize, total_count: usize) -> ShouldAccept {
+        if total_count >= self.max_instance_reuse_count {
+            ShouldAccept::Never
+        } else if concurrent_count >= self.max_instance_concurrent_reuse_count {
+            ShouldAccept::No
+        } else {
+            ShouldAccept::Yes
+        }
+    }
+
+    fn on_request_start(
+        &self,
+        _store: StoreContextMut<'_, Ctx>,
+        _id: u64,
+        _task: GuestTaskId,
+    ) -> Pin<Box<dyn Future<Output = ()> + 'static + Send + Sync>> {
+        // Resolving this future expires the request; `Duration::MAX` means it
+        // never does, so the guest always gets to produce a response.
+        Box::pin(tokio::time::sleep(self.request_timeout))
+    }
+
+    fn drop(&self, store: Store<Ctx>, result: Result<(), wasmtime::Error>) {
+        if let Err(error) = result {
+            eprintln!("[wasmtime_serve bench] worker error: {error:?}");
+        }
+        drop(store);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// HandlerState  - tells ProxyHandler how to instantiate workers + bound reuse.
 // ---------------------------------------------------------------------------
 
 struct State {
     engine: Engine,
+    instance: ProxyPre<Ctx>,
     max_instance_reuse_count: usize,
     max_instance_concurrent_reuse_count: usize,
+    request_timeout: Duration,
+    idle_timeout: Duration,
+    next_request_id: AtomicU64,
+}
+
+impl State {
+    fn view(&self) -> ViewFn<Ctx> {
+        match &self.instance {
+            ProxyPre::P2(_) => ViewFn::P2(wasmtime_wasi_http::p2::WasiHttpView::http),
+            ProxyPre::P3(_) => ViewFn::P3(wasmtime_wasi_http::p3::WasiHttpView::http),
+        }
+    }
 }
 
 impl HandlerState for State {
     type StoreData = Ctx;
+    type WorkerExpiration = Expiration;
+    type WorkerState = Worker;
 
-    fn new_store(&self, _req_id: Option<u64>) -> wasmtime::Result<StoreBundle<Ctx>> {
-        let store = Store::new(&self.engine, Ctx::new());
-        Ok(StoreBundle {
+    async fn instantiate(&self) -> wasmtime::Result<Instance<Ctx, Expiration, Worker>> {
+        let mut store = Store::new(&self.engine, Ctx::new());
+        let proxy = self.instance.instantiate_async(&mut store).await?;
+        Ok(Instance {
             store,
-            write_profile: Box::new(|_| ()),
+            proxy,
+            view: self.view(),
+            expiration: Expiration {
+                idle_timeout: self.idle_timeout,
+                request_timeout: self.request_timeout,
+                sleep: Box::pin(tokio::time::sleep(Duration::MAX)),
+            },
+            state: Worker {
+                max_instance_reuse_count: self.max_instance_reuse_count,
+                max_instance_concurrent_reuse_count: self.max_instance_concurrent_reuse_count,
+                request_timeout: self.request_timeout,
+            },
         })
     }
-
-    fn request_timeout(&self) -> Duration {
-        Duration::MAX
-    }
-
-    fn idle_instance_timeout(&self) -> Duration {
-        // Short enough that idle workers don't linger across bench groups,
-        // long enough that it never fires mid-run.
-        Duration::from_secs(60)
-    }
-
-    fn max_instance_reuse_count(&self) -> usize {
-        self.max_instance_reuse_count
-    }
-
-    fn max_instance_concurrent_reuse_count(&self) -> usize {
-        self.max_instance_concurrent_reuse_count
-    }
-
-    fn handle_worker_error(&self, error: wasmtime::Error) {
-        eprintln!("[wasmtime_serve bench] worker error: {error:?}");
-    }
 }
 
 // ---------------------------------------------------------------------------
-// Request dispatch  - mirrors wasmtime-cli/src/commands/serve.rs::handle_request
+// Request dispatch  - ProxyHandler::handle drives the whole P2/P3 + reuse path.
 // ---------------------------------------------------------------------------
-
-type P2Response = Result<
-    hyper::Response<HyperOutgoingBody>,
-    wasmtime_wasi_http::p2::bindings::http::types::ErrorCode,
->;
-type P3Response =
-    hyper::Response<http_body_util::combinators::UnsyncBoxBody<bytes::Bytes, wasmtime::Error>>;
-
-enum Sender {
-    P2(oneshot::Sender<P2Response>),
-    P3(oneshot::Sender<P3Response>),
-}
-
-enum Receiver {
-    P2(oneshot::Receiver<P2Response>),
-    P3(oneshot::Receiver<P3Response>),
-}
 
 async fn handle_request(
     handler: ProxyHandler<State>,
     req: hyper::Request<Incoming>,
-) -> anyhow::Result<hyper::Response<HyperOutgoingBody>> {
-    let req_id = handler.next_req_id();
+) -> wasmtime::Result<hyper::Response<RespBody>> {
+    use wasmtime_wasi_http::p3::bindings::http::types::ErrorCode;
 
-    let (tx, rx) = match handler.instance_pre() {
-        HandlerProxyPre::P2(_) => {
-            let (tx, rx) = oneshot::channel();
-            (Sender::P2(tx), Receiver::P2(rx))
-        }
-        HandlerProxyPre::P3(_) => {
-            let (tx, rx) = oneshot::channel();
-            (Sender::P3(tx), Receiver::P3(rx))
-        }
-    };
+    let request_id = handler
+        .state()
+        .next_request_id
+        .fetch_add(1, Ordering::Relaxed);
 
-    handler.spawn(
-        if handler.state().max_instance_reuse_count() == 1 {
-            Some(req_id)
-        } else {
-            None
-        },
-        Box::new(move |accessor, proxy| {
-            Box::pin(async move {
-                let result: wasmtime::Result<()> = match proxy {
-                    Proxy::P2(proxy) => {
-                        let Sender::P2(tx) = tx else { unreachable!() };
-                        let setup: wasmtime::Result<_> = accessor.with(move |mut store| {
-                            let req = wasmtime_wasi_http::p2::WasiHttpView::http(store.data_mut())
-                                .new_incoming_request(
-                                    wasmtime_wasi_http::p2::bindings::http::types::Scheme::Http,
-                                    req,
-                                )?;
-                            let out = wasmtime_wasi_http::p2::WasiHttpView::http(store.data_mut())
-                                .new_response_outparam(tx)?;
-                            wasmtime::error::Ok((req, out))
-                        });
-                        let (req, out) = match setup {
-                            Ok(v) => v,
-                            Err(e) => return eprintln!("[{req_id}] setup: {e:?}"),
-                        };
-                        proxy
-                            .wasi_http_incoming_handler()
-                            .call_handle(accessor, req, out)
-                            .await
-                    }
-                    Proxy::P3(proxy) => {
-                        let Sender::P3(tx) = tx else { unreachable!() };
-                        use wasmtime_wasi_http::p3::bindings::http::types::{ErrorCode, Request};
+    // Map the incoming hyper body into the error type `handler::Request` wants.
+    let req = req.map(|body| {
+        body.map_err(ErrorCode::from_hyper_request_error)
+            .map_err(wasmtime_wasi_http::handler::ErrorCode::from)
+            .boxed_unsync()
+    });
 
-                        let (parts, body) = req.into_parts();
-                        let body = body.map_err(ErrorCode::from_hyper_request_error);
-                        let req = hyper::Request::from_parts(parts, body);
-                        let (request, request_io_result) = Request::from_http(req);
-
-                        let res = match proxy.handle(accessor, request).await {
-                            Ok(Ok(r)) => r,
-                            Ok(Err(code)) => {
-                                return eprintln!("[{req_id}] handler err: {code:?}");
-                            }
-                            Err(e) => return eprintln!("[{req_id}] trap: {e:?}"),
-                        };
-
-                        let res =
-                            accessor.with(|mut store| res.into_http(&mut store, request_io_result));
-                        let res = match res {
-                            Ok(r) => r,
-                            Err(e) => return eprintln!("[{req_id}] into_http: {e:?}"),
-                        };
-
-                        let res = res.map(|body| body.map_err(|e| e.into()).boxed_unsync());
-                        let _ = tx.send(res);
-                        Ok(())
-                    }
-                };
-                if let Err(e) = result {
-                    eprintln!("[{req_id}] :: {e:?}");
-                }
-            })
-        }),
-    );
-
-    match rx {
-        Receiver::P2(rx) => {
-            let resp = rx
-                .await
-                .context("guest never invoked response-outparam::set")?;
-            Ok(resp.map_err(wasmtime::Error::from)?)
-        }
-        Receiver::P3(rx) => {
-            let resp = rx.await?;
-            let (parts, body) = resp.into_parts();
-            // Collect and re-wrap so the outer response body type matches the
-            // P2 path. For the minimal fixtures this is cheap (tiny payload).
-            let body = body
-                .collect()
-                .await
-                .map_err(|e| anyhow::anyhow!("collect p3 body: {e:?}"))?
-                .to_bytes();
-            let body: HyperOutgoingBody = http_body_util::Full::new(body)
-                .map_err(|never| match never {})
-                .boxed_unsync();
-            Ok(hyper::Response::from_parts(parts, body))
-        }
-    }
+    handler.handle(request_id, req).await
 }
 
 // ---------------------------------------------------------------------------
@@ -343,25 +326,25 @@ impl Server {
 
         // Wrap InstancePre in the right handler::ProxyPre variant.
         let handler_pre = match flavor {
-            Flavor::P2 => HandlerProxyPre::P2(
-                wasmtime_wasi_http::handler::p2::bindings::ProxyPre::new(instance_pre)?,
-            ),
-            #[cfg(feature = "wasip3")]
-            Flavor::P3 => HandlerProxyPre::P3(wasmtime_wasi_http::p3::bindings::ServicePre::new(
+            Flavor::P2 => ProxyPre::P2(wasmtime_wasi_http::p2::bindings::ProxyPre::new(
                 instance_pre,
             )?),
-            #[cfg(not(feature = "wasip3"))]
-            Flavor::P3 => anyhow::bail!("wasip3 feature disabled"),
+            Flavor::P3 => ProxyPre::P3(wasmtime_wasi_http::p3::bindings::ServicePre::new(
+                instance_pre,
+            )?),
         };
 
-        let handler = ProxyHandler::new(
-            State {
-                engine,
-                max_instance_reuse_count: max_instance_reuse(flavor),
-                max_instance_concurrent_reuse_count: max_concurrent_reuse(flavor),
-            },
-            handler_pre,
-        );
+        let handler = ProxyHandler::new(State {
+            engine,
+            instance: handler_pre,
+            max_instance_reuse_count: max_instance_reuse(flavor),
+            max_instance_concurrent_reuse_count: max_concurrent_reuse(flavor),
+            request_timeout: Duration::MAX,
+            // Short enough that idle workers don't linger across bench groups,
+            // long enough that it never fires mid-run.
+            idle_timeout: Duration::from_secs(60),
+            next_request_id: AtomicU64::new(0),
+        });
 
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let addr = listener.local_addr()?;
@@ -426,8 +409,8 @@ impl Drop for Server {
     }
 }
 
-fn error_response(status: u16) -> hyper::Response<HyperOutgoingBody> {
-    let body: HyperOutgoingBody = http_body_util::Empty::<bytes::Bytes>::new()
+fn error_response(status: u16) -> hyper::Response<RespBody> {
+    let body: RespBody = http_body_util::Empty::<Bytes>::new()
         .map_err(|never| match never {})
         .boxed_unsync();
     hyper::Response::builder()

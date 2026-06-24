@@ -4,10 +4,7 @@ use std::{
     collections::{HashMap, HashSet},
     ops::{Deref, DerefMut},
     path::PathBuf,
-    sync::{
-        Arc, OnceLock,
-        atomic::{AtomicU64, Ordering},
-    },
+    sync::{Arc, OnceLock},
     time::Duration,
 };
 
@@ -45,47 +42,6 @@ type BoundPluginWithInterfaces = (
 );
 
 type ExporterInstanceKey = (Arc<str>, String);
-
-static P3_LINKED_LAZY_INSTANTIATIONS: AtomicU64 = AtomicU64::new(0);
-static P3_LINKED_EAGER_INSTANTIATIONS: AtomicU64 = AtomicU64::new(0);
-static P3_LINKED_CACHE_HITS: AtomicU64 = AtomicU64::new(0);
-
-fn p3_instance_trace_enabled() -> bool {
-    std::env::var("WASH_P3_INSTANCE_TRACE")
-        .map(|value| matches!(value.as_str(), "1" | "true" | "yes" | "on"))
-        .unwrap_or(false)
-}
-
-fn trace_p3_linked_instance(
-    action: &'static str,
-    component_id: &str,
-    store_id: &str,
-    import_name: Option<&str>,
-    export_name: Option<&str>,
-) {
-    if !p3_instance_trace_enabled() {
-        return;
-    }
-
-    let total = match action {
-        "lazy-instantiate" => P3_LINKED_LAZY_INSTANTIATIONS.fetch_add(1, Ordering::Relaxed) + 1,
-        "eager-instantiate" => P3_LINKED_EAGER_INSTANTIATIONS.fetch_add(1, Ordering::Relaxed) + 1,
-        "cache-hit" => P3_LINKED_CACHE_HITS.fetch_add(1, Ordering::Relaxed) + 1,
-        _ => 0,
-    };
-
-    tracing::info!(
-        target: "wash_runtime::p3_instance_trace",
-        kind = "linked",
-        action,
-        component_id,
-        store_id,
-        import_name = import_name.unwrap_or(""),
-        export_name = export_name.unwrap_or(""),
-        total,
-        "P3 instance trace"
-    );
-}
 
 #[derive(Clone)]
 struct ComponentCtxTemplate {
@@ -308,16 +264,9 @@ async fn invoke_ephemeral_linked_export(
         if inv
             .exporter_instances
             .read()
-            .expect("exporter instance cache poisoned")
+            .unwrap_or_else(|e| e.into_inner())
             .contains_key(&key)
         {
-            trace_p3_linked_instance(
-                "cache-hit",
-                linked_component_id.as_ref(),
-                &store_id,
-                None,
-                None,
-            );
             continue;
         }
 
@@ -338,26 +287,12 @@ async fn invoke_ephemeral_linked_export(
         })?;
         inv.exporter_instances
             .write()
-            .expect("exporter instance cache poisoned")
+            .unwrap_or_else(|e| e.into_inner())
             .insert(key, instance);
-        trace_p3_linked_instance(
-            "eager-instantiate",
-            linked_component_id.as_ref(),
-            &store_id,
-            None,
-            None,
-        );
     }
 
     let params_buf = params.to_vec();
     let mut results_buf = vec![Val::Bool(false); results.len()];
-    trace_p3_linked_instance(
-        "ephemeral-instantiate",
-        inv.plugin_component_id.as_ref(),
-        &store_id,
-        Some(inv.import_name.as_ref()),
-        Some(inv.export_name.as_ref()),
-    );
     let call_import_name = inv.import_name.clone();
     let call_export_name = inv.export_name.clone();
     let call_pre = inv.pre.clone();
@@ -392,7 +327,7 @@ async fn invoke_ephemeral_linked_export(
     .map_err(|e| wasmtime::format_err!("ephemeral linked call task failed: {e}"));
     inv.exporter_instances
         .write()
-        .expect("exporter instance cache poisoned")
+        .unwrap_or_else(|e| e.into_inner())
         .retain(|(_, cached_store_id), _| cached_store_id != &cleanup_store_id);
     let call_result = call_result??;
 
@@ -425,16 +360,16 @@ async fn invoke_shared_store_linked_export(
             let prev_id = access.data_mut().active_ctx.component_id.clone();
             access.data_mut().set_active_ctx(&inv.plugin_component_id)?;
 
-            let result = (|| {
+            let result = {
                 let store_id = access.data_mut().active_ctx.store_id.clone();
                 let cached_instance = inv
                     .exporter_instances
                     .read()
-                    .expect("exporter instance cache poisoned")
+                    .unwrap_or_else(|e| e.into_inner())
                     .get(&(inv.plugin_component_id.clone(), store_id.clone()))
                     .cloned();
                 Ok((store_id, cached_instance))
-            })();
+            };
 
             if result.is_err() {
                 access.data_mut().set_active_ctx(&prev_id)?;
@@ -444,16 +379,7 @@ async fn invoke_shared_store_linked_export(
         })?;
 
     let instance = match cached_instance {
-        Some(instance) => {
-            trace_p3_linked_instance(
-                "cache-hit",
-                inv.plugin_component_id.as_ref(),
-                &store_id,
-                Some(inv.import_name.as_ref()),
-                Some(inv.export_name.as_ref()),
-            );
-            instance
-        }
+        Some(instance) => instance,
         None => {
             let instance = accessor.instantiate_async(&inv.pre).await.map_err(|e| {
                 wasmtime::format_err!(
@@ -463,18 +389,11 @@ async fn invoke_shared_store_linked_export(
             })?;
             inv.exporter_instances
                 .write()
-                .expect("exporter instance cache poisoned")
+                .unwrap_or_else(|e| e.into_inner())
                 .insert(
                     (inv.plugin_component_id.clone(), store_id.clone()),
                     instance,
                 );
-            trace_p3_linked_instance(
-                "lazy-instantiate",
-                inv.plugin_component_id.as_ref(),
-                &store_id,
-                Some(inv.import_name.as_ref()),
-                Some(inv.export_name.as_ref()),
-            );
             instance
         }
     };
@@ -565,17 +484,10 @@ async fn invoke_linked_sync_export(
     let instance = if let Some(instance) = inv
         .exporter_instances
         .read()
-        .expect("exporter instance cache poisoned")
+        .unwrap_or_else(|e| e.into_inner())
         .get(&(inv.plugin_component_id.clone(), store_id.clone()))
         .cloned()
     {
-        trace_p3_linked_instance(
-            "cache-hit",
-            inv.plugin_component_id.as_ref(),
-            &store_id,
-            Some(inv.import_name.as_ref()),
-            Some(inv.export_name.as_ref()),
-        );
         instance
     } else {
         let existing_instance = inv.instance.read().await;
@@ -583,26 +495,12 @@ async fn invoke_linked_sync_export(
             && id == store_id
         {
             drop(existing_instance);
-            trace_p3_linked_instance(
-                "cache-hit",
-                inv.plugin_component_id.as_ref(),
-                &store_id,
-                Some(inv.import_name.as_ref()),
-                Some(inv.export_name.as_ref()),
-            );
             instance
         } else {
             // Likely unnecessary, but explicit drop of the read lock
             let new_instance = inv.pre.instantiate_async(&mut store).await?;
             drop(existing_instance);
             *inv.instance.write().await = Some((store_id, new_instance));
-            trace_p3_linked_instance(
-                "lazy-instantiate",
-                inv.plugin_component_id.as_ref(),
-                store.data().active_ctx.store_id.as_ref(),
-                Some(inv.import_name.as_ref()),
-                Some(inv.export_name.as_ref()),
-            );
             new_instance
         }
     };
@@ -1255,7 +1153,7 @@ impl ResolvedWorkload {
 
                 exporter_instances
                     .write()
-                    .expect("exporter instance cache poisoned")
+                    .unwrap_or_else(|e| e.into_inner())
                     .retain(|(_, cached_store_id), _| cached_store_id != &store_id);
             });
 
@@ -1304,7 +1202,7 @@ impl ResolvedWorkload {
     pub(crate) fn clear_exporter_instances_for_store(&self, store_id: &str) {
         self.exporter_instances
             .write()
-            .expect("exporter instance cache poisoned")
+            .unwrap_or_else(|e| e.into_inner())
             .retain(|(_, cached_store_id), _| cached_store_id != store_id);
     }
 
@@ -1320,16 +1218,9 @@ impl ResolvedWorkload {
             if self
                 .exporter_instances
                 .read()
-                .expect("exporter instance cache poisoned")
+                .unwrap_or_else(|e| e.into_inner())
                 .contains_key(&key)
             {
-                trace_p3_linked_instance(
-                    "cache-hit",
-                    linked_component_id.as_ref(),
-                    &store_id,
-                    None,
-                    None,
-                );
                 continue;
             }
 
@@ -1346,15 +1237,8 @@ impl ResolvedWorkload {
 
             self.exporter_instances
                 .write()
-                .expect("exporter instance cache poisoned")
+                .unwrap_or_else(|e| e.into_inner())
                 .insert(key, instance);
-            trace_p3_linked_instance(
-                "eager-instantiate",
-                linked_component_id.as_ref(),
-                &store_id,
-                None,
-                None,
-            );
         }
 
         Ok(())
@@ -2440,13 +2324,13 @@ impl UnresolvedWorkload {
         if !shared_store_plugins.is_empty() {
             for component in self.components.values_mut() {
                 for (plugin_id, plugin) in &shared_store_plugins {
-                    component.metadata.add_plugin(*plugin_id, plugin.clone());
+                    component.metadata.add_plugin(plugin_id, plugin.clone());
                 }
             }
 
             if let Some(service) = &mut self.service {
                 for (plugin_id, plugin) in &shared_store_plugins {
-                    service.metadata.add_plugin(*plugin_id, plugin.clone());
+                    service.metadata.add_plugin(plugin_id, plugin.clone());
                 }
             }
         }

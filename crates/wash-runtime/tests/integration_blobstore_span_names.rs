@@ -95,6 +95,7 @@ async fn wasi_blobstore_handlers_emit_namespaced_spans() -> Result<()> {
                 },
                 pool_size: 1,
                 max_invocations: 100,
+                is_precompiled: false,
             }],
             host_interfaces: vec![
                 WitInterface {

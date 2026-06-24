@@ -13,7 +13,7 @@ use bindings::{
             blobstore::{create_container, get_container},
             types::OutgoingValue,
         },
-        config::store::get_all,
+        config::store::{get, get_all},
         http::{
             outgoing_handler::{OutgoingRequest, RequestOptions, handle},
             types::{
@@ -108,10 +108,11 @@ fn log_runtime_config() -> Result<()> {
 }
 
 fn make_outgoing_request() -> Result<String> {
+    let authority = outgoing_authority();
     log(
         Level::Info,
         "",
-        "Making outgoing HTTP request to http://example.com",
+        &format!("Making outgoing HTTP request to http://{authority}"),
     );
 
     let request = OutgoingRequest::new(Fields::new());
@@ -119,7 +120,7 @@ fn make_outgoing_request() -> Result<String> {
         .set_scheme(Some(&Scheme::Http))
         .map_err(|_| anyhow::anyhow!("Failed to set HTTP scheme"))?;
     request
-        .set_authority(Some("example.com"))
+        .set_authority(Some(&authority))
         .map_err(|_| anyhow::anyhow!("Failed to set authority"))?;
     request
         .set_path_with_query(Some("/"))
@@ -180,10 +181,25 @@ fn make_outgoing_request() -> Result<String> {
     log(
         Level::Info,
         "",
-        &format!("Retrieved {} bytes from example.com", body_data.len()),
+        &format!("Retrieved {} bytes from {authority}", body_data.len()),
     );
 
     Ok(body_string)
+}
+
+fn outgoing_authority() -> String {
+    match get("outgoing_authority") {
+        Ok(Some(value)) if !value.trim().is_empty() => value,
+        Ok(_) => "example.com".to_string(),
+        Err(e) => {
+            log(
+                Level::Warn,
+                "",
+                &format!("Failed to read outgoing_authority config: {e:?}; using example.com"),
+            );
+            "example.com".to_string()
+        }
+    }
 }
 
 fn store_response_in_blobstore(response_body: &str) -> Result<()> {

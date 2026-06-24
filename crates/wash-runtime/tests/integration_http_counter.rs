@@ -5,7 +5,11 @@
 
 use anyhow::{Context, Result};
 use std::{collections::HashMap, time::Duration};
-use tokio::time::timeout;
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::TcpListener,
+    time::timeout,
+};
 
 use wash_runtime::{host::HostApi, types::LocalResources};
 
@@ -15,6 +19,39 @@ use common::{
 };
 
 const HTTP_COUNTER_WASM: &[u8] = include_bytes!("wasm/http_counter.wasm");
+
+async fn start_local_outbound_server() -> Result<String> {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .context("failed to bind local outbound fixture server")?;
+    let authority = listener
+        .local_addr()
+        .context("failed to read local outbound fixture server addr")?
+        .to_string();
+
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                let mut buf = [0; 1024];
+                let _ = socket.read(&mut buf).await;
+
+                let body = b"http-counter fixture response";
+                let headers = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = socket.write_all(headers.as_bytes()).await;
+                let _ = socket.write_all(body).await;
+                let _ = socket.shutdown().await;
+            });
+        }
+    });
+
+    Ok(authority)
+}
 
 fn http_counter_request(
     host_header: &str,
@@ -36,6 +73,7 @@ async fn test_http_counter_integration() -> Result<()> {
         .init();
 
     let (addr, host) = start_host_with_dev_router("127.0.0.1:0").await?;
+    let outbound_authority = start_local_outbound_server().await?;
 
     let req = http_counter_request(
         "foo",
@@ -45,11 +83,11 @@ async fn test_http_counter_integration() -> Result<()> {
             config: HashMap::from([
                 ("test_key".to_string(), "test_value".to_string()),
                 ("counter_enabled".to_string(), "true".to_string()),
+                ("outgoing_authority".to_string(), outbound_authority.clone()),
             ]),
             environment: HashMap::new(),
             volume_mounts: vec![],
-            // http-counter calls example.com
-            allowed_hosts: vec!["example.com".parse().unwrap()].into(),
+            allowed_hosts: vec![outbound_authority.parse().unwrap()].into(),
         },
     );
 

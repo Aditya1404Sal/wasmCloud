@@ -267,10 +267,7 @@ impl<'a> Host for ActiveCtx<'a> {
         // to avoid holding a sync lock across async suspension points (deadlock).
         let transport_data = {
             let Some(mut shared_transport) = plugin.transport_pool.get_mut(&connection_key) else {
-                return Ok(Err(format!(
-                    "SMTP transport '{}' not found",
-                    connection_key
-                )));
+                return Ok(Err(format!("SMTP transport '{connection_key}' not found")));
             };
             shared_transport.last_used = BettySmtp::get_timestamp();
             shared_transport.clone()
