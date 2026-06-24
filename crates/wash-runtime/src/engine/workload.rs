@@ -965,7 +965,7 @@ impl ResolvedWorkload {
                                                 )
                                                 .await
                                                 .map_err(|e| wasmtime::format_err!(
-                                                    "function call timed out after 30 seconds: {e}",
+                                                    "function call timed out after {} seconds: {e}", CALL_TIMEOUT.as_secs(),
                                                 ))??;
 
                                                 trace!(
