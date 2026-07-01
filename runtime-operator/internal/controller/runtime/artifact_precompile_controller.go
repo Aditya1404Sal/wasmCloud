@@ -73,8 +73,8 @@ func (r *PrecompileReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		return ctrl.Result{}, nil
 	}
 
-	if err, done := r.handleImageChange(ctx, &a, desired); done {
-		return ctrl.Result{}, err
+	if res, err, done := r.handleImageChange(ctx, &a, desired); done {
+		return res, err
 	}
 
 	if err := r.Create(ctx, desired); err != nil && !apierrors.IsAlreadyExists(err) {
@@ -274,13 +274,9 @@ func (r *PrecompileReconciler) handleFailedJob(
 	return ctrl.Result{}, r.Status().Update(ctx, a)
 }
 
-// handleImageChange reconciles an existing precompile Job against the desired
-// spec. It returns (err, done): done=true means the caller should stop and
-// return err. The Job is always created in the Artifact's namespace, so there
-// is no requeue Result to propagate.
 func (r *PrecompileReconciler) handleImageChange(
 	ctx context.Context, a *runtimev1alpha1.Artifact, desired *batchv1.Job,
-) (error, bool) {
+) (ctrl.Result, error, bool) {
 	var existing batchv1.Job
 	err := r.Get(ctx, types.NamespacedName{
 		Name: desired.Name, Namespace: desired.Namespace,
@@ -288,22 +284,22 @@ func (r *PrecompileReconciler) handleImageChange(
 	switch {
 	case err == nil:
 		if existing.DeletionTimestamp != nil {
-			return nil, true
+			return ctrl.Result{}, nil, true
 		}
 		if !argsMatch(&existing, desired) {
 			if delErr := r.Delete(ctx, &existing,
 				client.PropagationPolicy(metav1.DeletePropagationBackground),
 				client.GracePeriodSeconds(0),
 			); delErr != nil && !apierrors.IsNotFound(delErr) {
-				return delErr, true
+				return ctrl.Result{}, delErr, true
 			}
 			a.Status.Precompiled = nil
-			return r.Status().Update(ctx, a), true
+			return ctrl.Result{}, r.Status().Update(ctx, a), true
 		}
-		return nil, false
+		return ctrl.Result{}, nil, false
 	case !apierrors.IsNotFound(err):
-		return err, true
+		return ctrl.Result{}, err, true
 	default:
-		return nil, false
+		return ctrl.Result{}, nil, false
 	}
 }

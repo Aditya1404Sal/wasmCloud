@@ -567,10 +567,12 @@ pub(crate) async fn invoke_linked_sync_export(
             func.call_async(&mut store, &params_buf, &mut results_buf),
         )
         .await
-        .map_err(|e| wasmtime::format_err!(
-            "function call timed out after {} seconds: {e}",
-            CALL_TIMEOUT.as_secs()
-        ))??;
+        .map_err(|e| {
+            wasmtime::format_err!(
+                "function call timed out after {} seconds: {e}",
+                CALL_TIMEOUT.as_secs()
+            )
+        })??;
 
         lift_results(store, results_buf, results)?;
         trace!(name = %inv.import_name, fn_name = %inv.export_name, "invoked dynamic export");

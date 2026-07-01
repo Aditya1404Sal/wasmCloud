@@ -16,7 +16,7 @@ use wash_runtime::{
     wit::WitInterface,
 };
 
-const SMTP_DEMO_WASM: &[u8] = include_bytes!("fixtures/smtp_demo.wasm");
+const SMTP_DEMO_WASM: &[u8] = include_bytes!("wasm/smtp_demo.wasm");
 
 async fn find_available_port() -> Result<u16> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
@@ -43,7 +43,9 @@ fn create_workload_request(name: &str, host_header: &str) -> WorkloadStartReques
                     config: HashMap::new(),
                     environment: HashMap::new(),
                     volume_mounts: vec![],
-                    allowed_hosts: Default::default(),
+                    // Allow loopback egress so the component can fetch attachments from
+                    // the test's local HTTP server (outgoing HTTP is deny-by-default).
+                    allowed_hosts: ["127.0.0.1".parse().expect("valid allowed host")].into(),
                 },
                 pool_size: 1,
                 max_invocations: 100,

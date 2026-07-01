@@ -18,6 +18,7 @@ members = [
     "keyvalue-counter",
     "keyvalue-implements",
     "postgres-implements",
+    "smtp-demo",
     # P3 fixtures (wasm32-wasip1 + reactor adapter)
     "http-handler-p3",
     "http-blobstore-p3",
@@ -47,3 +48,6 @@ wstd = "0.6"
 wasmcloud-component = "0.2.0"
 wgpu = { git = "https://github.com/wasi-gfx/wgpu.git", rev = "898122bf2cace048e63f065181a86459edb28205", default-features = false, features = ["wasi", "wgsl"] }
 wit-bindgen = "0.58.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+waki = "0.5.1"

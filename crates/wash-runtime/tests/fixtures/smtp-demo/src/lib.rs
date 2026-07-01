@@ -4,6 +4,7 @@ use wstd::http::{Body, Client, Request};
 
 mod bindings {
     wit_bindgen::generate!({
+        world: "smtp-demo",
         generate_all,
     });
 }

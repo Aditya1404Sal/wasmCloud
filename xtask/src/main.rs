@@ -94,6 +94,7 @@ const P2_FIXTURES: &[&str] = &[
     "keyvalue-counter",
     "keyvalue-implements",
     "postgres-implements",
+    "smtp-demo",
 ];
 
 const P3_FIXTURES: &[&str] = &[

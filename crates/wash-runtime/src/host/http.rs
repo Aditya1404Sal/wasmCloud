@@ -1140,11 +1140,9 @@ async fn handle_http_request<T: Router>(
                 .await
             {
                 Ok(mut resp) => {
-                    resp.headers_mut().insert(
-                        TRACE_ID_HEADER,
-                        hyper::header::HeaderValue::from_str(&trace_id)
-                            .expect("uuid hex is always a valid header value"),
-                    );
+                    if let Ok(trace_header) = hyper::header::HeaderValue::from_str(&trace_id) {
+                        resp.headers_mut().insert(TRACE_ID_HEADER, trace_header);
+                    }
                     resp
                 }
                 Err(e) => {

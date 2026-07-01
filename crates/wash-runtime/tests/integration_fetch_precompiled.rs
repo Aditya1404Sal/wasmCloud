@@ -116,4 +116,3 @@ async fn fetch_precompiled_via(nats_url: &str, url: &str) -> Result<Vec<u8>> {
     }
     fetch_precompiled::fetch(url).await
 }
-
