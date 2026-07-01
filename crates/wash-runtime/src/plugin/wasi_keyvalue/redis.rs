@@ -11,7 +11,7 @@ use std::sync::Arc;
 const PLUGIN_KEYVALUE_ID: &str = "wasi-keyvalue";
 use crate::engine::ctx::{ActiveCtx, SharedCtx, extract_active_ctx};
 use crate::engine::workload::WorkloadItem;
-use crate::plugin::HostPlugin;
+use crate::plugin::{HostPlugin, WitInterfaces};
 use crate::wit::{WitInterface, WitWorld};
 use futures::StreamExt;
 use redis::AsyncCommands;
@@ -96,11 +96,8 @@ impl<'a> bindings::wasi::keyvalue::store::Host for ActiveCtx<'a> {
         &mut self,
         identifier: String,
     ) -> wasmtime::Result<Result<Resource<BucketHandle>, StoreError>> {
-        let Some(plugin) = self.get_plugin::<RedisKeyValue>(PLUGIN_KEYVALUE_ID) else {
-            return Ok(Err(StoreError::Other(
-                "keyvalue plugin not available".to_string(),
-            )));
-        };
+        let plugin = self.try_get_plugin::<RedisKeyValue>(PLUGIN_KEYVALUE_ID)?;
+
         plugin.record_operation("open");
 
         let conn = match plugin.client.get_multiplexed_async_connection().await {
@@ -131,11 +128,8 @@ impl<'a> bindings::wasi::keyvalue::store::HostBucket for ActiveCtx<'a> {
         bucket: Resource<BucketHandle>,
         key: String,
     ) -> wasmtime::Result<Result<Option<Vec<u8>>, StoreError>> {
-        let Some(plugin) = self.get_plugin::<RedisKeyValue>(PLUGIN_KEYVALUE_ID) else {
-            return Ok(Err(StoreError::Other(
-                "keyvalue plugin not available".to_string(),
-            )));
-        };
+        let plugin = self.try_get_plugin::<RedisKeyValue>(PLUGIN_KEYVALUE_ID)?;
+
         plugin.record_operation("get");
 
         let bucket_handle = self.table.get(&bucket)?;
@@ -158,11 +152,8 @@ impl<'a> bindings::wasi::keyvalue::store::HostBucket for ActiveCtx<'a> {
         key: String,
         value: Vec<u8>,
     ) -> wasmtime::Result<Result<(), StoreError>> {
-        let Some(plugin) = self.get_plugin::<RedisKeyValue>(PLUGIN_KEYVALUE_ID) else {
-            return Ok(Err(StoreError::Other(
-                "keyvalue plugin not available".to_string(),
-            )));
-        };
+        let plugin = self.try_get_plugin::<RedisKeyValue>(PLUGIN_KEYVALUE_ID)?;
+
         plugin.record_operation("set");
 
         let bucket_handle = self.table.get(&bucket)?;
@@ -184,11 +175,8 @@ impl<'a> bindings::wasi::keyvalue::store::HostBucket for ActiveCtx<'a> {
         bucket: Resource<BucketHandle>,
         key: String,
     ) -> wasmtime::Result<Result<(), StoreError>> {
-        let Some(plugin) = self.get_plugin::<RedisKeyValue>(PLUGIN_KEYVALUE_ID) else {
-            return Ok(Err(StoreError::Other(
-                "keyvalue plugin not available".to_string(),
-            )));
-        };
+        let plugin = self.try_get_plugin::<RedisKeyValue>(PLUGIN_KEYVALUE_ID)?;
+
         plugin.record_operation("delete");
 
         let bucket_handle = self.table.get(&bucket)?;
@@ -210,11 +198,8 @@ impl<'a> bindings::wasi::keyvalue::store::HostBucket for ActiveCtx<'a> {
         bucket: Resource<BucketHandle>,
         key: String,
     ) -> wasmtime::Result<Result<bool, StoreError>> {
-        let Some(plugin) = self.get_plugin::<RedisKeyValue>(PLUGIN_KEYVALUE_ID) else {
-            return Ok(Err(StoreError::Other(
-                "keyvalue plugin not available".to_string(),
-            )));
-        };
+        let plugin = self.try_get_plugin::<RedisKeyValue>(PLUGIN_KEYVALUE_ID)?;
+
         plugin.record_operation("exists");
 
         let bucket_handle = self.table.get(&bucket)?;
@@ -236,11 +221,8 @@ impl<'a> bindings::wasi::keyvalue::store::HostBucket for ActiveCtx<'a> {
         bucket: Resource<BucketHandle>,
         cursor: Option<u64>,
     ) -> wasmtime::Result<Result<KeyResponse, StoreError>> {
-        let Some(plugin) = self.get_plugin::<RedisKeyValue>(PLUGIN_KEYVALUE_ID) else {
-            return Ok(Err(StoreError::Other(
-                "keyvalue plugin not available".to_string(),
-            )));
-        };
+        let plugin = self.try_get_plugin::<RedisKeyValue>(PLUGIN_KEYVALUE_ID)?;
+
         plugin.record_operation("list_keys");
 
         let bucket_handle = self.table.get(&bucket)?;
@@ -285,7 +267,7 @@ impl<'a> bindings::wasi::keyvalue::store::HostBucket for ActiveCtx<'a> {
 
     async fn drop(&mut self, rep: Resource<BucketHandle>) -> wasmtime::Result<()> {
         tracing::debug!(
-            workload_id = self.id,
+            workload_id = &*self.workload_id,
             resource_id = ?rep,
             "Dropping bucket resource"
         );
@@ -305,11 +287,8 @@ impl<'a> bindings::wasi::keyvalue::atomics::Host for ActiveCtx<'a> {
         key: String,
         delta: u64,
     ) -> wasmtime::Result<Result<u64, StoreError>> {
-        let Some(plugin) = self.get_plugin::<RedisKeyValue>(PLUGIN_KEYVALUE_ID) else {
-            return Ok(Err(StoreError::Other(
-                "keyvalue plugin not available".to_string(),
-            )));
-        };
+        let plugin = self.try_get_plugin::<RedisKeyValue>(PLUGIN_KEYVALUE_ID)?;
+
         plugin.record_operation("increment");
 
         let bucket_handle = self.table.get(&bucket)?;
@@ -337,11 +316,8 @@ impl<'a> bindings::wasi::keyvalue::batch::Host for ActiveCtx<'a> {
         bucket: Resource<BucketHandle>,
         keys: Vec<String>,
     ) -> wasmtime::Result<Result<Vec<Option<(String, Vec<u8>)>>, StoreError>> {
-        let Some(plugin) = self.get_plugin::<RedisKeyValue>(PLUGIN_KEYVALUE_ID) else {
-            return Ok(Err(StoreError::Other(
-                "keyvalue plugin not available".to_string(),
-            )));
-        };
+        let plugin = self.try_get_plugin::<RedisKeyValue>(PLUGIN_KEYVALUE_ID)?;
+
         plugin.record_operation("get_many");
 
         let bucket_handle = self.table.get(&bucket)?;
@@ -376,11 +352,8 @@ impl<'a> bindings::wasi::keyvalue::batch::Host for ActiveCtx<'a> {
         bucket: Resource<BucketHandle>,
         key_values: Vec<(String, Vec<u8>)>,
     ) -> wasmtime::Result<Result<(), StoreError>> {
-        let Some(plugin) = self.get_plugin::<RedisKeyValue>(PLUGIN_KEYVALUE_ID) else {
-            return Ok(Err(StoreError::Other(
-                "keyvalue plugin not available".to_string(),
-            )));
-        };
+        let plugin = self.try_get_plugin::<RedisKeyValue>(PLUGIN_KEYVALUE_ID)?;
+
         plugin.record_operation("set_many");
 
         let bucket_handle = self.table.get(&bucket)?;
@@ -410,11 +383,8 @@ impl<'a> bindings::wasi::keyvalue::batch::Host for ActiveCtx<'a> {
         bucket: Resource<BucketHandle>,
         keys: Vec<String>,
     ) -> wasmtime::Result<Result<(), StoreError>> {
-        let Some(plugin) = self.get_plugin::<RedisKeyValue>(PLUGIN_KEYVALUE_ID) else {
-            return Ok(Err(StoreError::Other(
-                "keyvalue plugin not available".to_string(),
-            )));
-        };
+        let plugin = self.try_get_plugin::<RedisKeyValue>(PLUGIN_KEYVALUE_ID)?;
+
         plugin.record_operation("delete_many");
 
         let bucket_handle = self.table.get(&bucket)?;
@@ -461,14 +431,10 @@ impl HostPlugin for RedisKeyValue {
     async fn on_workload_item_bind<'a>(
         &self,
         component_handle: &mut WorkloadItem<'a>,
-        interfaces: std::collections::HashSet<crate::wit::WitInterface>,
+        interfaces: WitInterfaces<'_>,
     ) -> anyhow::Result<()> {
         // Check if any of the interfaces are wasi:keyvalue related
-        let has_keyvalue = interfaces
-            .iter()
-            .any(|i| i.namespace == "wasi" && i.package == "keyvalue");
-
-        if !has_keyvalue {
+        if !interfaces.contains("wasi", "keyvalue", &[]) {
             tracing::warn!(
                 "WasiKeyvalue plugin requested for non-wasi:keyvalue interface(s): {:?}",
                 interfaces
@@ -503,7 +469,7 @@ impl HostPlugin for RedisKeyValue {
     async fn on_workload_unbind(
         &self,
         workload_id: &str,
-        _interfaces: std::collections::HashSet<crate::wit::WitInterface>,
+        _interfaces: WitInterfaces<'_>,
     ) -> anyhow::Result<()> {
         tracing::debug!("WasiKeyvalue plugin unbound from workload '{workload_id}'");
 

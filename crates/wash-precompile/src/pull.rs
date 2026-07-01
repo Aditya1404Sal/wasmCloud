@@ -36,7 +36,8 @@ pub async fn fetch(reference: &str) -> Result<Vec<u8>> {
         .data
         .clone();
 
-    Ok(bytes)
+    // BettyBlocks: oci-client's layer `.data` is now `bytes::Bytes` after upstream's dep bump; convert to Vec<u8>.
+    Ok(bytes.to_vec())
 }
 
 fn resolve_auth(registry: &str) -> RegistryAuth {

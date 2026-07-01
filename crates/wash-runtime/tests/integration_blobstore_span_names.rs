@@ -93,6 +93,7 @@ async fn wasi_blobstore_handlers_emit_namespaced_spans() -> Result<()> {
                     volume_mounts: vec![],
                     allowed_hosts: Default::default(),
                 },
+                is_precompiled: false,
                 pool_size: 1,
                 max_invocations: 100,
             }],

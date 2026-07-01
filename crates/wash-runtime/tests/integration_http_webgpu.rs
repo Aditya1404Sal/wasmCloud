@@ -9,7 +9,11 @@
 //! Note: This is a basic integration test that verifies plugin loading and host functionality.
 //! Full component binding and request routing would require proper WIT interface configuration.
 //!
-#![cfg(feature = "wasi-webgpu")]
+#![cfg(all(
+    feature = "wasi-webgpu",
+    not(target_os = "windows"),
+    not(target_arch = "s390x")
+))]
 
 use anyhow::{Context, Result};
 use std::{collections::HashMap, sync::Arc, time::Duration};
@@ -77,6 +81,7 @@ async fn test_http_webgpu_integration() -> Result<()> {
                     volume_mounts: vec![],
                     allowed_hosts: Default::default(),
                 },
+                is_precompiled: false,
                 pool_size: 1,
                 max_invocations: 100,
             }],

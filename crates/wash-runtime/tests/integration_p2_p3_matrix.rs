@@ -8,7 +8,6 @@
 //! - Mixed P2/P3 components in same workload
 //! - P2 regression with P3 engine enabled
 
-#![cfg(feature = "wasip3")]
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use anyhow::{Context, Result};
@@ -47,7 +46,6 @@ const P2_CALLEE_WASM: &[u8] = include_bytes!("wasm/inter_component_call_callee.w
 
 fn engine_with_p3() -> Engine {
     Engine::builder()
-        .with_wasip3(true)
         .build()
         .expect("failed to build engine with wasip3")
 }
@@ -72,6 +70,7 @@ async fn test_p3_http_handler_serves_request() -> Result<()> {
                 digest: None,
                 bytes: bytes::Bytes::from_static(HTTP_HANDLER_P3_WASM),
                 local_resources: LocalResources::default(),
+                is_precompiled: false,
                 pool_size: 1,
                 max_invocations: 100,
             }],
@@ -124,6 +123,7 @@ async fn test_p3_http_blobstore() -> Result<()> {
                 digest: None,
                 bytes: bytes::Bytes::from_static(HTTP_BLOBSTORE_P3_WASM),
                 local_resources: LocalResources::default(),
+                is_precompiled: false,
                 pool_size: 1,
                 max_invocations: 100,
             }],
@@ -179,6 +179,7 @@ async fn test_p3_http_concurrent_requests() -> Result<()> {
                 digest: None,
                 bytes: bytes::Bytes::from_static(HTTP_HANDLER_P3_WASM),
                 local_resources: LocalResources::default(),
+                is_precompiled: false,
                 pool_size: 1,
                 max_invocations: 100,
             }],
@@ -309,6 +310,7 @@ async fn test_p3_caller_p2_middleware_p2_callee() -> Result<()> {
                     digest: None,
                     bytes: bytes::Bytes::from_static(P3_CALLER_WASM),
                     local_resources: LocalResources::default(),
+                    is_precompiled: false,
                     pool_size: 1,
                     max_invocations: 100,
                 },
@@ -317,6 +319,7 @@ async fn test_p3_caller_p2_middleware_p2_callee() -> Result<()> {
                     digest: None,
                     bytes: bytes::Bytes::from_static(P2_MIDDLEWARE_WASM),
                     local_resources: LocalResources::default(),
+                    is_precompiled: false,
                     pool_size: 1,
                     max_invocations: 100,
                 },
@@ -325,6 +328,7 @@ async fn test_p3_caller_p2_middleware_p2_callee() -> Result<()> {
                     digest: None,
                     bytes: bytes::Bytes::from_static(P2_CALLEE_WASM),
                     local_resources: LocalResources::default(),
+                    is_precompiled: false,
                     pool_size: 1,
                     max_invocations: 100,
                 },
@@ -383,6 +387,7 @@ async fn test_p2_caller_p2_middleware_p3_callee() -> Result<()> {
                     digest: None,
                     bytes: bytes::Bytes::from_static(P2_CALLER_WASM),
                     local_resources: LocalResources::default(),
+                    is_precompiled: false,
                     pool_size: 1,
                     max_invocations: 100,
                 },
@@ -391,6 +396,7 @@ async fn test_p2_caller_p2_middleware_p3_callee() -> Result<()> {
                     digest: None,
                     bytes: bytes::Bytes::from_static(P2_MIDDLEWARE_WASM),
                     local_resources: LocalResources::default(),
+                    is_precompiled: false,
                     pool_size: 1,
                     max_invocations: 100,
                 },
@@ -399,6 +405,7 @@ async fn test_p2_caller_p2_middleware_p3_callee() -> Result<()> {
                     digest: None,
                     bytes: bytes::Bytes::from_static(P3_CALLEE_WASM),
                     local_resources: LocalResources::default(),
+                    is_precompiled: false,
                     pool_size: 1,
                     max_invocations: 100,
                 },
@@ -453,6 +460,7 @@ async fn test_p3_caller_p2_middleware_p3_callee() -> Result<()> {
                     digest: None,
                     bytes: bytes::Bytes::from_static(P3_CALLER_WASM),
                     local_resources: LocalResources::default(),
+                    is_precompiled: false,
                     pool_size: 1,
                     max_invocations: 100,
                 },
@@ -461,6 +469,7 @@ async fn test_p3_caller_p2_middleware_p3_callee() -> Result<()> {
                     digest: None,
                     bytes: bytes::Bytes::from_static(P2_MIDDLEWARE_WASM),
                     local_resources: LocalResources::default(),
+                    is_precompiled: false,
                     pool_size: 1,
                     max_invocations: 100,
                 },
@@ -469,6 +478,7 @@ async fn test_p3_caller_p2_middleware_p3_callee() -> Result<()> {
                     digest: None,
                     bytes: bytes::Bytes::from_static(P3_CALLEE_WASM),
                     local_resources: LocalResources::default(),
+                    is_precompiled: false,
                     pool_size: 1,
                     max_invocations: 100,
                 },
@@ -529,6 +539,7 @@ async fn test_all_p3_workload() -> Result<()> {
                 digest: None,
                 bytes: bytes::Bytes::from_static(HTTP_BLOBSTORE_P3_WASM),
                 local_resources: LocalResources::default(),
+                is_precompiled: false,
                 pool_size: 1,
                 max_invocations: 100,
             }],
@@ -592,6 +603,7 @@ async fn test_p2_regression_with_p3_enabled() -> Result<()> {
                     // http-counter calls example.com
                     allowed_hosts: vec!["example.com".parse().unwrap()].into(),
                 },
+                is_precompiled: false,
                 pool_size: 1,
                 max_invocations: 100,
             }],

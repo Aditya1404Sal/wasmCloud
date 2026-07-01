@@ -1,6 +1,6 @@
 //! Integration test for HTTP + NatsBlobstore round-trip
 //!
-//! Requires Docker. Gated behind `NATS_INTEGRATION_TESTS=1` so CI can opt in.
+//! Requires Docker (NATS); marked `#[ignore]`, run with `cargo test --include-ignored`.
 //!
 //! Uses testcontainers to spin up a NATS server with JetStream, then validates
 //! that the http-blobstore fixture component can write data through NatsBlobstore
@@ -118,9 +118,9 @@ async fn setup() -> Result<TestHarness> {
                     ]
                     .into_iter()
                     .collect(),
-                    version: Some(
-                        semver::Version::parse("0.2.0-draft").expect("valid semver version"),
-                    ),
+                    version: Some(semver::Version::parse("0.2.0-draft").map_err(|e| {
+                        anyhow::anyhow!("invalid blobstore interface version: {e}")
+                    })?),
                     config: {
                         let mut config = HashMap::new();
                         config.insert("buckets".to_string(), "my-container-real".to_string());
@@ -156,12 +156,8 @@ impl TestHarness {
 }
 
 #[tokio::test]
+#[ignore = "requires Docker (NATS); run with `cargo test --include-ignored`"]
 async fn test_nats_blobstore_roundtrip() -> Result<()> {
-    if std::env::var("NATS_INTEGRATION_TESTS").unwrap_or_default() != "1" {
-        eprintln!("Skipping NATS integration test (set NATS_INTEGRATION_TESTS=1 to enable)");
-        return Ok(());
-    }
-
     let harness = setup().await?;
 
     let test_data = "Hello from NATS blobstore integration test!";

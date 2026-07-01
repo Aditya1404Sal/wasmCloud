@@ -10,11 +10,6 @@ on:
     tags:
       - "v*"
   workflow_dispatch:
-    inputs:
-      is_release:
-        description: "Treat this run as a release: run canary-binaries, gate as if Cargo.toml had bumped. Use when re-releasing a SHA whose Cargo.toml is already at the target version, or when finalizing a release whose train run failed."
-        type: boolean
-        default: false
 
 defaults:
   run:
@@ -44,8 +39,9 @@ jobs:
       pull-requests: read
     outputs:
       relevant: ${{ steps.filter.outputs.relevant }}
+      workflow: ${{ steps.filter.outputs.workflow }}
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
       - uses: dorny/paths-filter@fbd0ab8f3e69293af611ebaee6363fc25e6d187d # v4.0.1
@@ -64,59 +60,8 @@ jobs:
               - 'runtime-operator/test/e2e/**'
               - 'charts/runtime-operator/**'
               - 'deploy/kind/kind-config.yaml'
-
-  # Detect whether this commit bumps the workspace version — the signal
-  # that "this is a release." Compare `[workspace.package].version` at
-  # HEAD against HEAD~1. workflow_dispatch can override via `is_release`
-  # input (e.g., re-releases where Cargo.toml is already at the target
-  # version, or finalizing a release whose train run failed).
-  release-detect:
-    needs:
-      - changes
-    if: always() && (needs.changes.result == 'skipped' || needs.changes.outputs.relevant == 'true')
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    outputs:
-      is_release: ${{ steps.detect.outputs.is_release }}
-      version: ${{ steps.detect.outputs.version }}
-    steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-        with:
-          fetch-depth: 2
-          persist-credentials: false
-      - name: Detect workspace version bump
-        id: detect
-        env:
-          INPUT_IS_RELEASE: ${{ inputs.is_release }}
-        run: |
-          set -euo pipefail
-          read_ws_version() {
-            local src="$1"
-            if [[ "${src}" == "HEAD" ]]; then
-              cat Cargo.toml
-            else
-              git show "${src}:Cargo.toml"
-            fi | awk -F'"' '
-              /^\[workspace\.package\]/ { in_pkg = 1; next }
-              /^\[/ && !/^\[workspace\.package\]/ { in_pkg = 0 }
-              in_pkg && /^version = "/ { print $2; exit }
-            '
-          }
-          CUR=$(read_ws_version HEAD)
-          PREV=$(read_ws_version HEAD~1 2>/dev/null || true)
-          if [[ "${INPUT_IS_RELEASE}" == "true" ]]; then
-            echo "workflow_dispatch with is_release=true — treating as release"
-            echo "is_release=true" >> "${GITHUB_OUTPUT}"
-            echo "version=${CUR}" >> "${GITHUB_OUTPUT}"
-          elif [[ -n "${CUR}" && "${CUR}" != "${PREV}" ]]; then
-            echo "version bump detected: ${PREV:-<none>} → ${CUR}"
-            echo "is_release=true" >> "${GITHUB_OUTPUT}"
-            echo "version=${CUR}" >> "${GITHUB_OUTPUT}"
-          else
-            echo "no version bump (HEAD=${CUR}, HEAD~1=${PREV:-<none>}) — not a release"
-            echo "is_release=false" >> "${GITHUB_OUTPUT}"
-          fi
+            workflow:
+              - '.github/workflows/wash.yml'
 
   check:
     needs:
@@ -135,7 +80,7 @@ jobs:
           - windows-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
       - name: Free disk space
@@ -171,20 +116,30 @@ jobs:
       - name: Test
         env:
           RUST_BACKTRACE: "1"
-          OCI_INTEGRATION_TESTS: ${{ matrix.os == 'ubuntu-latest' && '1' || '' }}
-          NATS_INTEGRATION_TESTS: ${{ matrix.os == 'ubuntu-latest' && '1' || '' }}
         run: |
           cargo test --workspace
-      - name: Test with wasip3
+      - name: Test with wasi-tls + wasm_component_model_implements
+        env:
+          RUST_BACKTRACE: "1"
         run: |
-          cargo test -p wash-runtime --features wasip3
-      - name: Test with wasi-tls + wasip3
+          cargo test -p wash-runtime --features wasi-tls,wasm_component_model_implements
+      # Docker/registry-backed `#[ignore]` integration tests, Linux only: the
+      # macOS/Windows hosted runners have no Docker daemon (and macOS can't get
+      # one — no nested virtualization). `-- --ignored` runs ONLY the ignored
+      # tests, once. Scoped to the crates we gate this way (wash-runtime + wash's
+      # OCI suite) so it doesn't pull in the pre-existing network-only wit tests
+      # in `crates/wash/tests/integration_wit.rs`.
+      - name: Integration tests (Docker/registry, Linux only)
+        if: matrix.os == 'ubuntu-latest'
+        env:
+          RUST_BACKTRACE: "1"
         run: |
-          cargo test -p wash-runtime --features wasi-tls,wasip3
+          cargo test -p wash-runtime --features wasm_component_model_implements,wasi-tls -- --ignored
+          cargo test -p wash --test integration_oci -- --ignored
       - name: Build benchmarks
         if: matrix.os == 'ubuntu-latest'
         run: |
-          cargo bench -p wash-runtime --features wasip3 --no-run
+          cargo bench -p wash-runtime --no-run
 
   lint:
     needs:
@@ -196,7 +151,7 @@ jobs:
       contents: read
     steps:
       - name: Checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
       - name: Free disk space
@@ -212,7 +167,11 @@ jobs:
           rust-toolchain: nightly
           rust-components: rustfmt
       - name: Install cargo-machete
-        uses: taiki-e/install-action@873c7452cadb7c034694a1282227095d93fbdf92 # v2.79.14
+        uses: taiki-e/install-action@b8cecb83565409bcc297b2df6e77f030b2a468d5 # v2.82.0
+        env:
+          # Authenticate the action's GitHub API calls so they aren't throttled
+          # by the 60/hr anonymous per-IP limit shared across hosted runners.
+          GITHUB_TOKEN: ${{ github.token }}
         with:
           tool: cargo-machete@0.8.0
       - name: Format
@@ -220,7 +179,7 @@ jobs:
           cargo +nightly fmt -- --check
       - name: Lint
         run: |
-          cargo clippy --workspace --features wasip3,wasi-tls
+          cargo clippy --workspace --features wasm_component_model_implements,wasi-tls
       - name: Lint anyhow context message casing
         run: |
           # anyhow `.context()` / `.with_context()` strings are error messages,
@@ -265,7 +224,7 @@ jobs:
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
       - name: Login to ghcr.io
@@ -286,6 +245,12 @@ jobs:
         with:
           context: .
           outputs: type=docker,dest=/tmp/wash-image.tar,name=localhost/wasmcloud-wash:e2e
+          # Build the e2e host with `(implements ..)` multiplexing enabled so the
+          # implements spec's named keyvalue imports resolve. Only this e2e
+          # tarball gets the feature; the published canary build below stays on
+          # default features.
+          build-args: |
+            CARGO_FEATURES=wasm_component_model_implements
           # head_ref on PRs (the source branch, shared across re-pushes
           # and across PRs from the same branch); falls back to ref_name
           # on main pushes ("main"). Always falls back to the main scope
@@ -356,7 +321,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
       - uses: ./.github/actions/setup-go
@@ -385,6 +350,7 @@ jobs:
           # Exercise the messaging spec — this is the regression test for
           # #5074 and is the whole reason the gate exists.
           MESSAGING_E2E_IMAGE: ghcr.io/wasmcloud/components/messaging-echo-rust:0.1.0
+          IMPLEMENTS_E2E_IMAGE: ghcr.io/wasmcloud/components/keyvalue-implements:0.1.0
           PROMETHEUS_INSTALL_SKIP: "true"
           CERT_MANAGER_INSTALL_SKIP: "true"
           KIND_CLUSTER_NAME: wasmcloud-e2e
@@ -406,11 +372,9 @@ jobs:
 
   gate:
     needs:
-      - release-detect
       - check
       - lint
       - wash-image
-      - wash-image-wasip3
       - runtime-operator-e2e
       - canary-publish
       - canary-binaries
@@ -422,7 +386,6 @@ jobs:
           RESULTS: ${{ toJSON(needs.*.result) }}
           CANARY_PUBLISH_RESULT: ${{ needs.canary-publish.result }}
           CANARY_BINARIES_RESULT: ${{ needs.canary-binaries.result }}
-          IS_RELEASE: ${{ needs.release-detect.outputs.is_release }}
           REF: ${{ github.ref }}
         run: |
           set -euo pipefail
@@ -434,10 +397,10 @@ jobs:
             echo "canary-publish result=${CANARY_PUBLISH_RESULT} on main push; expected success" >&2
             exit 1
           fi
-          # Release commits must also build per-target binaries that
+          # Main pushes must also build the per-target binaries that
           # release-tag.yml attaches to the GH Release.
-          if [[ "${IS_RELEASE}" == "true" ]] && [[ "${CANARY_BINARIES_RESULT}" != "success" ]]; then
-            echo "canary-binaries result=${CANARY_BINARIES_RESULT} on release commit; expected success" >&2
+          if [[ "${REF}" == "refs/heads/main" ]] && [[ "${CANARY_BINARIES_RESULT}" != "success" ]]; then
+            echo "canary-binaries result=${CANARY_BINARIES_RESULT} on main push; expected success" >&2
             exit 1
           fi
 
@@ -472,7 +435,7 @@ jobs:
       contents: write
       packages: write
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
       - name: Download digests
@@ -527,56 +490,28 @@ jobs:
         env:
           STEPS_META_OUTPUTS_VERSION: ${{ steps.meta.outputs.version }}
 
-  # wasip3 image variant. Builds wash with the `wasip3,wasi-tls` features
-  # (WASI Preview 3 compiled in) and publishes it as `canary-wasip3` /
-  # `sha-<full-sha>-wasip3`.
-  wash-image-wasip3:
-    needs:
-      - changes
-      - runtime-operator-e2e
-    if: |
-      always() &&
-      (needs.changes.result == 'skipped' || needs.changes.outputs.relevant == 'true') &&
-      (((github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main')) &&
-      needs.runtime-operator-e2e.result == 'success'
-    permissions:
-      contents: write
-      packages: write
-    uses: ./.github/workflows/docker-build-push.yml
-    with:
-      image: ghcr.io/wasmcloud/wash
-      build-args: |
-        CARGO_FEATURES=wasip3,wasi-tls
-      # Push (and the manifest merge) only on main; PRs build to validate.
-      push: ${{ github.event_name != 'pull_request' }}
-      push-by-digest: ${{ github.event_name != 'pull_request' }}
-      tags: |
-        type=raw,value=canary-wasip3
-        type=sha,format=long,prefix=sha-,suffix=-wasip3
-
-  # Canary matrix binary build. Runs on every release commit on main —
-  # detected by `release-detect` as a Cargo.toml workspace version bump
-  # vs the parent commit — so release-tag.yml can promote the exact
-  # bytes that the canary CI tested instead of rebuilding on tag.
-  # Skipped for non-release main pushes to avoid burning ~7 runners on
-  # every commit. Manual fallback: `gh workflow run wash.yml --ref main
-  # -f is_release=true`.
+  # Canary matrix binary build. Runs on every push to main so each commit
+  # exercises the full per-target matrix (including the s390x/musl cross
+  # builds that the regular `check`/`lint` jobs don't cover), and so
+  # release-tag.yml can promote the exact bytes that the canary CI tested
+  # instead of rebuilding on tag.
   canary-binaries:
-    # Fires whenever `release-detect` says this is a release commit —
-    # detected via Cargo.toml workspace version bump (HEAD vs HEAD~1)
-    # or forced via `workflow_dispatch` input. `always()` breaks the
-    # skipped-`changes` propagation; the explicit per-need success
-    # gates restore the default `success()` check.
+    # Fires on every main push and on `workflow_dispatch`, plus on PRs that
+    # edit this workflow so a newly added build target is validated before
+    # merge rather than only after it lands on main. `always()` breaks the
+    # skipped-`changes` propagation; the explicit per-need success gates
+    # restore the default `success()` check.
     if: |
       always() &&
-      needs.release-detect.outputs.is_release == 'true' &&
-      (github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
-      github.ref == 'refs/heads/main' &&
       needs.check.result == 'success' &&
       needs.lint.result == 'success' &&
-      needs.runtime-operator-e2e.result == 'success'
+      needs.runtime-operator-e2e.result == 'success' &&
+      (
+        ((github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main') ||
+        (github.event_name == 'pull_request' && needs.changes.outputs.workflow == 'true')
+      )
     needs:
-      - release-detect
+      - changes
       - check
       - lint
       - runtime-operator-e2e
@@ -636,7 +571,7 @@ jobs:
             bin: wash.exe
     steps:
       - name: Checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
 
@@ -664,6 +599,10 @@ jobs:
           echo "SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)" >> "${GITHUB_ENV}"
 
       - name: Build binary (${{ matrix.target }})
+        env:
+          # Retry transient crates.io download failures (e.g. SSL eof) more
+          # aggressively than cargo's default of 3.
+          CARGO_NET_RETRY: "10"
         run: |
           ${{ matrix.buildCommand }} --release --target ${{ matrix.buildTarget || matrix.target }}
           cp target/${{ matrix.target }}/release/${{ matrix.bin }} ${{ matrix.artifact }}

@@ -1,19 +1,21 @@
 #![deny(clippy::all)]
-//! # WASI KeyValue Memory Plugin
+//! # WASI KeyValue Filesystem Plugin
 //!
-//! This module implements `wasi:keyvalue@0.2.0-draft` interfaces using
-//! Filesystem  as the backend storage.
+//! Implements `wasi:keyvalue@0.2.0-draft` over the local filesystem. The actual
+//! storage lives in the shared [`FsKvStore`](super::fs_store::FsKvStore) — this
+//! module is the host-binding adapter (the unnamed/default `wasi:keyvalue`
+//! instance); the multiplexed `FilesystemBackend` is the other adapter.
 
 use std::collections::HashSet;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 
 const PLUGIN_KEYVALUE_ID: &str = "wasi-keyvalue";
 use crate::engine::ctx::{ActiveCtx, SharedCtx, extract_active_ctx};
 use crate::engine::workload::WorkloadItem;
-use crate::plugin::{HostPlugin, lock_root};
+use crate::plugin::wasi_keyvalue::fs_store::{FsKvError, FsKvStore};
+use crate::plugin::{HostPlugin, WitInterfaces};
 use crate::wit::{WitInterface, WitWorld};
-use futures::StreamExt;
 use tracing::instrument;
 use wasmtime::component::Resource;
 
@@ -31,15 +33,26 @@ mod bindings {
 
 use bindings::wasi::keyvalue::store::{Error as StoreError, KeyResponse};
 
-/// Resource representation for a bucket (key-value store)
-pub struct BucketHandle {
-    root: PathBuf,
+/// Map a shared-store error to the WIT `store::Error`.
+fn to_store_error(e: FsKvError) -> StoreError {
+    match e {
+        FsKvError::InvalidIdentifier => {
+            StoreError::Other("invalid keyvalue identifier".to_string())
+        }
+        FsKvError::Io(e) => StoreError::Other(format!("Filesystem error: {e}")),
+    }
 }
 
-/// Filesystem-based keyvalue plugin
+/// Resource representation for a bucket: its identifier (a subdirectory of the
+/// store root, resolved per-op by [`FsKvStore`]).
+pub struct BucketHandle {
+    id: String,
+}
+
+/// Filesystem-based keyvalue plugin.
 #[derive(Clone)]
 pub struct FilesystemKeyValue {
-    root: PathBuf,
+    store: FsKvStore,
     metrics: Arc<WasiKeyvalueMetrics>,
 }
 
@@ -62,7 +75,7 @@ impl FilesystemKeyValue {
         let meter = opentelemetry::global::meter("wasi-keyvalue");
         let metrics = WasiKeyvalueMetrics::new(&meter);
         Self {
-            root: root.as_ref().to_path_buf(),
+            store: FsKvStore::new(root),
             metrics: Arc::new(metrics),
         }
     }
@@ -83,28 +96,14 @@ impl<'a> bindings::wasi::keyvalue::store::Host for ActiveCtx<'a> {
         &mut self,
         identifier: String,
     ) -> wasmtime::Result<Result<Resource<BucketHandle>, StoreError>> {
-        let Some(plugin) = self.get_plugin::<FilesystemKeyValue>(PLUGIN_KEYVALUE_ID) else {
-            return Ok(Err(StoreError::Other(
-                "keyvalue plugin not available".to_string(),
-            )));
-        };
+        let plugin = self.try_get_plugin::<FilesystemKeyValue>(PLUGIN_KEYVALUE_ID)?;
         plugin.record_operation("open");
 
-        let Ok(path) = lock_root(&plugin.root, &identifier) else {
-            return Ok(Err(StoreError::Other(
-                "invalid bucket identifier".to_string(),
-            )));
-        };
-
-        if std::fs::create_dir_all(&path).is_err() {
-            return Ok(Err(StoreError::Other(
-                "failed to create bucket directory".to_string(),
-            )));
+        if let Err(e) = plugin.store.create_bucket(&identifier).await {
+            return Ok(Err(to_store_error(e)));
         }
 
-        let bucket = BucketHandle { root: path };
-
-        let resource = self.table.push(bucket)?;
+        let resource = self.table.push(BucketHandle { id: identifier })?;
         Ok(Ok(resource))
     }
 }
@@ -117,27 +116,11 @@ impl<'a> bindings::wasi::keyvalue::store::HostBucket for ActiveCtx<'a> {
         bucket: Resource<BucketHandle>,
         key: String,
     ) -> wasmtime::Result<Result<Option<Vec<u8>>, StoreError>> {
-        let Some(plugin) = self.get_plugin::<FilesystemKeyValue>(PLUGIN_KEYVALUE_ID) else {
-            return Ok(Err(StoreError::Other(
-                "keyvalue plugin not available".to_string(),
-            )));
-        };
+        let plugin = self.try_get_plugin::<FilesystemKeyValue>(PLUGIN_KEYVALUE_ID)?;
         plugin.record_operation("get");
 
-        let bucket_handle = self.table.get(&bucket)?;
-        let Ok(path) = lock_root(&bucket_handle.root, &key) else {
-            return Ok(Err(StoreError::Other("invalid key identifier".to_string())));
-        };
-
-        let entry = match tokio::fs::read(path).await {
-            Ok(entry) => Some(entry.to_vec()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-            Err(e) => {
-                return Ok(Err(StoreError::Other(format!("Filesystem error: {e}"))));
-            }
-        };
-
-        Ok(Ok(entry))
+        let id = self.table.get(&bucket)?.id.clone();
+        Ok(plugin.store.get(&id, &key).await.map_err(to_store_error))
     }
 
     #[instrument(name = "wasi.keyvalue.set", skip(self, bucket, value))]
@@ -147,26 +130,15 @@ impl<'a> bindings::wasi::keyvalue::store::HostBucket for ActiveCtx<'a> {
         key: String,
         value: Vec<u8>,
     ) -> wasmtime::Result<Result<(), StoreError>> {
-        let Some(plugin) = self.get_plugin::<FilesystemKeyValue>(PLUGIN_KEYVALUE_ID) else {
-            return Ok(Err(StoreError::Other(
-                "keyvalue plugin not available".to_string(),
-            )));
-        };
+        let plugin = self.try_get_plugin::<FilesystemKeyValue>(PLUGIN_KEYVALUE_ID)?;
         plugin.record_operation("set");
 
-        let bucket_handle = self.table.get(&bucket)?;
-
-        let Ok(path) = lock_root(&bucket_handle.root, &key) else {
-            return Ok(Err(StoreError::Other("invalid key identifier".to_string())));
-        };
-
-        match tokio::fs::write(path, value).await {
-            Ok(_) => Ok(Ok(())),
-            Err(e) => {
-                tracing::error!("Filesystem error setting key: {}", e);
-                Ok(Err(StoreError::Other(format!("Filesystem error: {e}"))))
-            }
-        }
+        let id = self.table.get(&bucket)?.id.clone();
+        Ok(plugin
+            .store
+            .set(&id, &key, &value)
+            .await
+            .map_err(to_store_error))
     }
 
     #[instrument(name = "wasi.keyvalue.delete", skip(self, bucket))]
@@ -175,25 +147,11 @@ impl<'a> bindings::wasi::keyvalue::store::HostBucket for ActiveCtx<'a> {
         bucket: Resource<BucketHandle>,
         key: String,
     ) -> wasmtime::Result<Result<(), StoreError>> {
-        let Some(plugin) = self.get_plugin::<FilesystemKeyValue>(PLUGIN_KEYVALUE_ID) else {
-            return Ok(Err(StoreError::Other(
-                "keyvalue plugin not available".to_string(),
-            )));
-        };
+        let plugin = self.try_get_plugin::<FilesystemKeyValue>(PLUGIN_KEYVALUE_ID)?;
         plugin.record_operation("delete");
 
-        let bucket_handle = self.table.get(&bucket)?;
-        let Ok(path) = lock_root(&bucket_handle.root, &key) else {
-            return Ok(Err(StoreError::Other("invalid key identifier".to_string())));
-        };
-
-        match tokio::fs::remove_file(path).await {
-            Ok(_) => Ok(Ok(())),
-            Err(e) => {
-                tracing::error!("Filesystem error deleting key: {}", e);
-                Ok(Err(StoreError::Other(format!("Filesystem error: {e}"))))
-            }
-        }
+        let id = self.table.get(&bucket)?.id.clone();
+        Ok(plugin.store.delete(&id, &key).await.map_err(to_store_error))
     }
 
     #[instrument(name = "wasi.keyvalue.exists", skip(self, bucket))]
@@ -202,25 +160,11 @@ impl<'a> bindings::wasi::keyvalue::store::HostBucket for ActiveCtx<'a> {
         bucket: Resource<BucketHandle>,
         key: String,
     ) -> wasmtime::Result<Result<bool, StoreError>> {
-        let Some(plugin) = self.get_plugin::<FilesystemKeyValue>(PLUGIN_KEYVALUE_ID) else {
-            return Ok(Err(StoreError::Other(
-                "keyvalue plugin not available".to_string(),
-            )));
-        };
+        let plugin = self.try_get_plugin::<FilesystemKeyValue>(PLUGIN_KEYVALUE_ID)?;
         plugin.record_operation("exists");
 
-        let bucket_handle = self.table.get(&bucket)?;
-
-        let Ok(path) = lock_root(&bucket_handle.root, &key) else {
-            return Ok(Err(StoreError::Other("invalid key identifier".to_string())));
-        };
-
-        // directories are not valid keys
-        if path.is_dir() {
-            return Ok(Ok(false));
-        }
-
-        Ok(Ok(path.exists()))
+        let id = self.table.get(&bucket)?.id.clone();
+        Ok(plugin.store.exists(&id, &key).await.map_err(to_store_error))
     }
 
     #[instrument(name = "wasi.keyvalue.list_keys", skip(self, bucket))]
@@ -229,54 +173,23 @@ impl<'a> bindings::wasi::keyvalue::store::HostBucket for ActiveCtx<'a> {
         bucket: Resource<BucketHandle>,
         cursor: Option<u64>,
     ) -> wasmtime::Result<Result<KeyResponse, StoreError>> {
-        let Some(plugin) = self.get_plugin::<FilesystemKeyValue>(PLUGIN_KEYVALUE_ID) else {
-            return Ok(Err(StoreError::Other(
-                "keyvalue plugin not available".to_string(),
-            )));
-        };
+        let plugin = self.try_get_plugin::<FilesystemKeyValue>(PLUGIN_KEYVALUE_ID)?;
         plugin.record_operation("list_keys");
 
-        let bucket_handle = self.table.get(&bucket)?;
-
-        let mut keys_iter = match tokio::fs::read_dir(&bucket_handle.root).await {
-            Ok(i) => i,
-            Err(e) => {
-                tracing::error!("Filesystem error getting key: {}", e);
-                return Ok(Err(StoreError::Other(format!("Filesystem error: {e}"))));
-            }
-        };
-
-        let mut resp = KeyResponse {
-            keys: vec![],
-            cursor: None,
-        };
-
-        let cursor_skip = cursor.unwrap_or(0) as usize;
-        let mut cursor_done = cursor_skip;
-
-        while let Ok(Some(key)) = keys_iter.next_entry().await {
-            // skip keys until we reach the cursor
-            if cursor_done != 0 {
-                cursor_done -= 1;
-                continue;
-            }
-
-            // if we have reached the batch size, set the cursor and break
-            if resp.keys.len() >= LIST_KEYS_BATCH_SIZE {
-                resp.cursor = Some(cursor_skip as u64 + LIST_KEYS_BATCH_SIZE as u64);
-                break;
-            }
-
-            resp.keys
-                .push(key.file_name().to_string_lossy().to_string());
+        let id = self.table.get(&bucket)?.id.clone();
+        match plugin
+            .store
+            .list_keys(&id, cursor, LIST_KEYS_BATCH_SIZE)
+            .await
+        {
+            Ok((keys, cursor)) => Ok(Ok(KeyResponse { keys, cursor })),
+            Err(e) => Ok(Err(to_store_error(e))),
         }
-
-        Ok(Ok(resp))
     }
 
     async fn drop(&mut self, rep: Resource<BucketHandle>) -> wasmtime::Result<()> {
         tracing::debug!(
-            workload_id = self.id,
+            workload_id = &*self.workload_id,
             resource_id = ?rep,
             "Dropping bucket resource"
         );
@@ -294,36 +207,15 @@ impl<'a> bindings::wasi::keyvalue::atomics::Host for ActiveCtx<'a> {
         key: String,
         delta: u64,
     ) -> wasmtime::Result<Result<u64, StoreError>> {
-        let Some(plugin) = self.get_plugin::<FilesystemKeyValue>(PLUGIN_KEYVALUE_ID) else {
-            return Ok(Err(StoreError::Other(
-                "keyvalue plugin not available".to_string(),
-            )));
-        };
+        let plugin = self.try_get_plugin::<FilesystemKeyValue>(PLUGIN_KEYVALUE_ID)?;
         plugin.record_operation("increment");
 
-        let bucket_handle = self.table.get(&bucket)?;
-        let Ok(path) = lock_root(&bucket_handle.root, &key) else {
-            return Ok(Err(StoreError::Other("invalid key identifier".to_string())));
-        };
-
-        let current_value = match tokio::fs::read_to_string(&path).await {
-            Ok(entry) => entry.trim().parse::<u64>().unwrap_or(0),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
-            Err(e) => {
-                tracing::error!("Filesystem error getting key entry: {}", e);
-                return Ok(Err(StoreError::Other(format!("Filesystem error: {e}"))));
-            }
-        };
-
-        let new_value = current_value + delta;
-
-        match tokio::fs::write(&path, new_value.to_string()).await {
-            Ok(_) => Ok(Ok(new_value)),
-            Err(e) => {
-                tracing::error!("Filesystem error putting key: {}", e);
-                Ok(Err(StoreError::Other(format!("Filesystem error: {e}"))))
-            }
-        }
+        let id = self.table.get(&bucket)?.id.clone();
+        Ok(plugin
+            .store
+            .increment(&id, &key, delta)
+            .await
+            .map_err(to_store_error))
     }
 }
 
@@ -336,40 +228,17 @@ impl<'a> bindings::wasi::keyvalue::batch::Host for ActiveCtx<'a> {
         bucket: Resource<BucketHandle>,
         keys: Vec<String>,
     ) -> wasmtime::Result<Result<Vec<Option<(String, Vec<u8>)>>, StoreError>> {
-        let Some(plugin) = self.get_plugin::<FilesystemKeyValue>(PLUGIN_KEYVALUE_ID) else {
-            return Ok(Err(StoreError::Other(
-                "keyvalue plugin not available".to_string(),
-            )));
-        };
+        let plugin = self.try_get_plugin::<FilesystemKeyValue>(PLUGIN_KEYVALUE_ID)?;
         plugin.record_operation("get_many");
 
-        let bucket_handle = self.table.get(&bucket)?;
-
-        let values = futures::stream::FuturesOrdered::from_iter(keys.iter().map(|key| async {
-            let Ok(path) = lock_root(&bucket_handle.root, key) else {
-                return Err(StoreError::Other("invalid key identifier".to_string()));
-            };
-            match tokio::fs::read(path).await {
-                Ok(entry) => Ok(Some((key.clone(), entry.to_vec()))),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-                Err(e) => {
-                    tracing::error!("JetStream error getting key: {}", e);
-                    Err(StoreError::Other(format!("JetStream error: {e}")))
-                }
-            }
-        }))
-        .collect::<Vec<_>>()
-        .await;
-
-        // Remove the outer Result, propagate the first error if any
-        let mut result = Vec::with_capacity(values.len());
-        for entry in values {
-            match entry {
-                Ok(v) => result.push(v),
-                Err(e) => return Ok(Err(e)),
+        let id = self.table.get(&bucket)?.id.clone();
+        let mut result = Vec::with_capacity(keys.len());
+        for key in keys {
+            match plugin.store.get(&id, &key).await {
+                Ok(value) => result.push(value.map(|v| (key, v))),
+                Err(e) => return Ok(Err(to_store_error(e))),
             }
         }
-
         Ok(Ok(result))
     }
 
@@ -379,39 +248,15 @@ impl<'a> bindings::wasi::keyvalue::batch::Host for ActiveCtx<'a> {
         bucket: Resource<BucketHandle>,
         key_values: Vec<(String, Vec<u8>)>,
     ) -> wasmtime::Result<Result<(), StoreError>> {
-        let Some(plugin) = self.get_plugin::<FilesystemKeyValue>(PLUGIN_KEYVALUE_ID) else {
-            return Ok(Err(StoreError::Other(
-                "keyvalue plugin not available".to_string(),
-            )));
-        };
+        let plugin = self.try_get_plugin::<FilesystemKeyValue>(PLUGIN_KEYVALUE_ID)?;
         plugin.record_operation("set_many");
 
-        let bucket_handle = self.table.get(&bucket)?;
-
-        let values = futures::stream::FuturesOrdered::from_iter(key_values.iter().map(
-            |(key, value)| async {
-                let Ok(path) = lock_root(&bucket_handle.root, key) else {
-                    return Err(StoreError::Other("invalid key identifier".to_string()));
-                };
-                match tokio::fs::write(path, value.to_vec()).await {
-                    Ok(_) => Ok(()),
-                    Err(e) => {
-                        tracing::error!("JetStream error putting key: {}", e);
-                        Err(StoreError::Other(format!("JetStream error: {e}")))
-                    }
-                }
-            },
-        ))
-        .collect::<Vec<_>>()
-        .await;
-
-        // Remove the outer Result, propagate the first error if any
-        for entry in values {
-            if let Err(e) = entry {
-                return Ok(Err(e));
+        let id = self.table.get(&bucket)?.id.clone();
+        for (key, value) in key_values {
+            if let Err(e) = plugin.store.set(&id, &key, &value).await {
+                return Ok(Err(to_store_error(e)));
             }
         }
-
         Ok(Ok(()))
     }
 
@@ -421,37 +266,15 @@ impl<'a> bindings::wasi::keyvalue::batch::Host for ActiveCtx<'a> {
         bucket: Resource<BucketHandle>,
         keys: Vec<String>,
     ) -> wasmtime::Result<Result<(), StoreError>> {
-        let Some(plugin) = self.get_plugin::<FilesystemKeyValue>(PLUGIN_KEYVALUE_ID) else {
-            return Ok(Err(StoreError::Other(
-                "keyvalue plugin not available".to_string(),
-            )));
-        };
+        let plugin = self.try_get_plugin::<FilesystemKeyValue>(PLUGIN_KEYVALUE_ID)?;
         plugin.record_operation("delete_many");
 
-        let bucket_handle = self.table.get(&bucket)?;
-
-        let values = futures::stream::FuturesOrdered::from_iter(keys.iter().map(|key| async {
-            let Ok(path) = lock_root(&bucket_handle.root, key) else {
-                return Err(StoreError::Other("invalid key identifier".to_string()));
-            };
-            match tokio::fs::remove_file(path).await {
-                Ok(_) => Ok(()),
-                Err(e) => {
-                    tracing::error!("JetStream error deleting key: {}", e);
-                    Err(StoreError::Other(format!("JetStream error: {e}")))
-                }
-            }
-        }))
-        .collect::<Vec<_>>()
-        .await;
-
-        // Remove the outer Result, propagate the first error if any
-        for entry in values {
-            if let Err(e) = entry {
-                return Ok(Err(e));
+        let id = self.table.get(&bucket)?.id.clone();
+        for key in keys {
+            if let Err(e) = plugin.store.delete(&id, &key).await {
+                return Ok(Err(to_store_error(e)));
             }
         }
-
         Ok(Ok(()))
     }
 }
@@ -472,14 +295,10 @@ impl HostPlugin for FilesystemKeyValue {
     async fn on_workload_item_bind<'a>(
         &self,
         component_handle: &mut WorkloadItem<'a>,
-        interfaces: std::collections::HashSet<crate::wit::WitInterface>,
+        interfaces: WitInterfaces<'_>,
     ) -> anyhow::Result<()> {
         // Check if any of the interfaces are wasi:keyvalue related
-        let has_keyvalue = interfaces
-            .iter()
-            .any(|i| i.namespace == "wasi" && i.package == "keyvalue");
-
-        if !has_keyvalue {
+        if !interfaces.contains("wasi", "keyvalue", &[]) {
             tracing::warn!(
                 "WasiKeyvalue plugin requested for non-wasi:keyvalue interface(s): {:?}",
                 interfaces
@@ -514,7 +333,7 @@ impl HostPlugin for FilesystemKeyValue {
     async fn on_workload_unbind(
         &self,
         workload_id: &str,
-        _interfaces: std::collections::HashSet<crate::wit::WitInterface>,
+        _interfaces: WitInterfaces<'_>,
     ) -> anyhow::Result<()> {
         tracing::debug!("WasiKeyvalue plugin unbound from workload '{workload_id}'");
 

@@ -14,7 +14,7 @@ use crate::{
         ctx::{ActiveCtx, SharedCtx, extract_active_ctx},
         workload::WorkloadItem,
     },
-    plugin::HostPlugin,
+    plugin::{HostPlugin, WitInterfaces},
     wit::{WitInterface, WitWorld},
 };
 
@@ -170,6 +170,8 @@ impl BettySmtp {
 }
 
 #[async_trait::async_trait]
+// BettyBlocks: SMTP host plugin. The trait method signatures below were adapted to upstream's
+// updated HostPlugin trait (`WitInterfaces<'_>` instead of `HashSet<WitInterface>`) during the upstream merge.
 impl HostPlugin for BettySmtp {
     fn id(&self) -> &'static str {
         BETTYBLOCKS_SMTP_PLUGIN_ID
@@ -185,7 +187,7 @@ impl HostPlugin for BettySmtp {
     async fn on_workload_item_bind<'a>(
         &self,
         item: &mut WorkloadItem<'a>,
-        interfaces: std::collections::HashSet<crate::wit::WitInterface>,
+        interfaces: WitInterfaces<'_>,
     ) -> anyhow::Result<()> {
         let has_smtp = interfaces
             .iter()
@@ -220,20 +222,23 @@ impl HostPlugin for BettySmtp {
     async fn on_workload_unbind(
         &self,
         workload_id: &str,
-        _interfaces: HashSet<crate::wit::WitInterface>,
+        _interfaces: WitInterfaces<'_>,
     ) -> anyhow::Result<()> {
         tracing::debug!("BettySmtp plugin unbound from workload '{workload_id}'");
         Ok(())
     }
 }
 
+// BettyBlocks: SMTP `Host` bindings. Plugin lookups below use `try_get_plugin` — upstream changed
+// `get_plugin` to return `Arc<T>` (panics if absent); `try_get_plugin` preserves the graceful fallback.
 impl<'a> Host for ActiveCtx<'a> {
     async fn connect(
         &mut self,
         credentials: Credentials,
     ) -> wasmtime::Result<Result<String, String>> {
-        let Some(plugin) = self.get_plugin::<BettySmtp>(BETTYBLOCKS_SMTP_PLUGIN_ID) else {
-            return Ok(Err("SMTP plugin not available".to_string()));
+        let plugin = match self.try_get_plugin::<BettySmtp>(BETTYBLOCKS_SMTP_PLUGIN_ID) {
+            Ok(plugin) => plugin,
+            Err(_) => return Ok(Err("SMTP plugin not available".to_string())),
         };
 
         let connection_key = match plugin.get_or_create_transport(&credentials).await {
@@ -258,8 +263,9 @@ impl<'a> Host for ActiveCtx<'a> {
         connection_key: String,
         message: Message,
     ) -> wasmtime::Result<Result<SendResult, String>> {
-        let Some(plugin) = self.get_plugin::<BettySmtp>(BETTYBLOCKS_SMTP_PLUGIN_ID) else {
-            return Ok(Err("SMTP plugin not available".to_string()));
+        let plugin = match self.try_get_plugin::<BettySmtp>(BETTYBLOCKS_SMTP_PLUGIN_ID) {
+            Ok(plugin) => plugin,
+            Err(_) => return Ok(Err("SMTP plugin not available".to_string())),
         };
         plugin.cleanup_stale_transports();
 
@@ -407,8 +413,9 @@ impl<'a> Host for ActiveCtx<'a> {
     }
 
     async fn disconnect(&mut self, connection_key: String) -> wasmtime::Result<Result<(), String>> {
-        let Some(plugin) = self.get_plugin::<BettySmtp>(BETTYBLOCKS_SMTP_PLUGIN_ID) else {
-            return Ok(Err("SMTP plugin not available".to_string()));
+        let plugin = match self.try_get_plugin::<BettySmtp>(BETTYBLOCKS_SMTP_PLUGIN_ID) {
+            Ok(plugin) => plugin,
+            Err(_) => return Ok(Err("SMTP plugin not available".to_string())),
         };
 
         if plugin.transport_pool.remove(&connection_key).is_some() {

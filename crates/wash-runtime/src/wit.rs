@@ -50,46 +50,23 @@ impl WitWorld {
     /// different than [`WitWorld::includes`] because it considers that in one
     /// [`WitInterface`] there may be both imports and exports.
     pub fn includes_bidirectional(&self, interface: &WitInterface) -> bool {
-        let import_match = self.imports.iter().find(|i| {
-            if let Some(v) = &interface.version
-                && let Some(ov) = &i.version
-                && v != ov
-            {
-                return false;
-            }
-            i.namespace == interface.namespace && i.package == interface.package
-        });
-
-        let export_match = self.exports.iter().find(|e| {
-            // If both interfaces specify a version, they must match
-            if let Some(v) = &interface.version
-                && let Some(ov) = &e.version
-                && v != ov
-            {
-                return false;
-            }
-            e.namespace == interface.namespace && e.package == interface.package
-        });
-
-        // Ensure the interfaces are covered by either the import or export match
-        for i in &interface.interfaces {
-            // Interface satisfied by import
-            if let Some(im) = &import_match
-                && im.interfaces.contains(i)
-            {
-                continue;
-            }
-            // Interface satisfied by export
-            if let Some(em) = &export_match
-                && em.interfaces.contains(i)
-            {
-                continue;
-            }
-
-            return false;
-        }
-
-        true
+        // Each requested interface must be covered by *some* import or export of
+        // the same package (see [`WitInterface::same_package`]). The label/name
+        // is intentionally ignored for checking "does the world use this
+        // namespace:package interface", and label routing is resolved later
+        // during plugin binding. A package can spread its interfaces across
+        // multiple entries (e.g. `wasmcloud:postgres` imports `types` unnamed and
+        // `query` under several labels), so check every entry per interface
+        // rather than binding to the first package match.
+        interface.interfaces.iter().all(|i| {
+            self.imports
+                .iter()
+                .any(|im| interface.same_package(im) && im.interfaces.contains(i))
+                || self
+                    .exports
+                    .iter()
+                    .any(|ex| interface.same_package(ex) && ex.interfaces.contains(i))
+        })
     }
 
     /// Checks if a guest world (imports) can be satisfied by a host world (exports).
@@ -192,6 +169,23 @@ impl WitInterface {
         true
     }
 
+    /// Returns `true` if `other` belongs to the same `namespace:package` at a
+    /// compatible version. Equal when both specify a version;
+    /// if either omits a version, any version is considered compatible.
+    pub fn same_package(&self, other: &WitInterface) -> bool {
+        if self.namespace != other.namespace || self.package != other.package {
+            return false;
+        }
+        // If both interfaces specify a version, they must match.
+        if let Some(v) = &self.version
+            && let Some(ov) = &other.version
+            && v != ov
+        {
+            return false;
+        }
+        true
+    }
+
     /// Checks if this interface contains (is a superset of) another interface.
     ///
     /// This method is used to determine if a plugin or component that provides
@@ -202,20 +196,12 @@ impl WitInterface {
     ///
     /// # Returns
     /// `true` if:
-    /// - The namespace and package match exactly
-    /// - If this interface has a version, it must match the other's version
+    /// - The namespace and package match at a compatible version (see
+    ///   [`WitInterface::same_package`])
+    /// - If both interfaces specify a name, they match
     /// - The other's interfaces are a subset of this interface's interfaces
     pub fn contains(&self, other: &WitInterface) -> bool {
-        // Namespace and package must match
-        if self.namespace != other.namespace || self.package != other.package {
-            return false;
-        }
-
-        // If both interfaces specify a version, they must match
-        if let Some(v) = &self.version
-            && let Some(ov) = &other.version
-            && v != ov
-        {
+        if !self.same_package(other) {
             return false;
         }
 
@@ -846,5 +832,34 @@ mod tests {
         // Same name should produce the same hash
         iface1.name = Some("cache".to_string());
         assert_eq!(hash(&iface1), hash(&iface2));
+    }
+
+    #[test]
+    fn includes_bidirectional_covers_multi_interface_package() {
+        // A package whose interfaces are split across several imports — one
+        // unnamed `types` plus two `(implements ..)`-labeled `query` imports —
+        // mirrors a multiplexed `wasmcloud:postgres` guest. Every interface must
+        // resolve regardless of `imports` (a HashSet) iteration order.
+        let types = create_interface_with_version("wasmcloud", "postgres", &["types"], "0.1.1");
+        let mut query_a =
+            create_interface_with_version("wasmcloud", "postgres", &["query"], "0.1.1");
+        query_a.name = Some("team-a".to_string());
+        let mut query_b =
+            create_interface_with_version("wasmcloud", "postgres", &["query"], "0.1.1");
+        query_b.name = Some("team-b".to_string());
+
+        let world = WitWorld {
+            imports: HashSet::from([types, query_a.clone(), query_b.clone()]),
+            exports: HashSet::new(),
+        };
+
+        // Both labeled query interfaces are part of the world even though a
+        // different `types` import shares the package.
+        assert!(world.includes_bidirectional(&query_a));
+        assert!(world.includes_bidirectional(&query_b));
+        // An interface the package does not provide is still rejected.
+        let prepared =
+            create_interface_with_version("wasmcloud", "postgres", &["prepared"], "0.1.1");
+        assert!(!world.includes_bidirectional(&prepared));
     }
 }

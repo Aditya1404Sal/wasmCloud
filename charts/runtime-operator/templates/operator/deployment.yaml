@@ -24,6 +24,9 @@ spec:
         {{- toYaml . | nindent 8 }}
       {{- end }}
     spec:
+      automountServiceAccountToken: {{ .Values.operator.automountServiceAccountToken }}
+      securityContext:
+        {{- toYaml .Values.operator.podSecurityContext | nindent 8 }}
       {{- if $.Values.global.tls.enabled }}
       volumes:
         - name: operator-cert
@@ -36,7 +39,7 @@ spec:
         - name: runtime-operator
           image: {{ if $registry }}{{ printf "%s/%s" $registry .Values.operator.image.repository }}{{ else }}{{ .Values.operator.image.repository }}{{ end }}:{{ .Values.operator.image.tag | default .Chart.AppVersion }}
           args:
-            - "-nats-url=nats://nats.{{ .Release.Namespace }}.svc.cluster.local:4222"
+            - "-nats-url={{ include "runtime-operator.schedulerNatsUrl" . }}"
             {{- if $.Values.global.tls.enabled }}
             - "-nats-ca=/operator-cert/ca.crt"
             - "-nats-client-cert=/operator-cert/tls.crt"
@@ -49,6 +52,7 @@ spec:
             - "-host-namespaces={{ . }}"
             {{- end }}
             - "-allow-shared-hosts={{ .Values.operator.allowSharedHosts }}"
+            # BettyBlocks: precompile-controller args (retained in upstream merge; -leader-elect/extraArgs below are upstream's).
             {{- if .Values.operator.precompile.enabled }}
             - "-precompile-worker-image={{ if $precompileRegistry }}{{ printf "%s/%s" $precompileRegistry .Values.operator.precompile.image.repository }}{{ else }}{{ .Values.operator.precompile.image.repository }}{{ end }}:{{ .Values.operator.precompile.image.tag | default .Chart.AppVersion }}"
             - "-precompile-artifact-base-url={{ .Values.operator.precompile.artifactBaseURL }}"
@@ -57,11 +61,24 @@ spec:
             {{- else }}
             - "-disable-precompile-controller"
             {{- end }}
+            # Always leader-gate the operator. Harmless at the default
+            # replicas: 1, and required if replicas is ever raised.
+            - "-leader-elect"
+            {{- with .Values.operator.extraArgs }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
           env:
             - name: OPERATOR_NAMESPACE
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.namespace
+            {{- with .Values.operator.env }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          {{- with .Values.operator.envFrom }}
+          envFrom:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
           imagePullPolicy: {{ .Values.operator.image.pull_policy }}
           {{- if $.Values.global.tls.enabled }}
           volumeMounts:
@@ -69,6 +86,8 @@ spec:
               mountPath: /operator-cert
               readOnly: true
           {{- end }}
+          resources:
+            {{- toYaml .Values.operator.resources | nindent 12 }}
           ports:
             - name: health
               containerPort: 8082
@@ -87,9 +106,7 @@ spec:
             initialDelaySeconds: 5
             periodSeconds: 10
           securityContext:
-            capabilities:
-              drop:
-                - NET_RAW
+            {{- toYaml .Values.operator.securityContext | nindent 12 }}
       dnsPolicy: ClusterFirst
       restartPolicy: Always
       terminationGracePeriodSeconds: 0

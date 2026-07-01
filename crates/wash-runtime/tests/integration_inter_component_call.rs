@@ -29,7 +29,9 @@ use wash_runtime::{
         HostApi, HostBuilder,
         http::{DevRouter, HttpServer},
     },
-    plugin::{HostPlugin, wasi_config::DynamicConfig, wasi_keyvalue::InMemoryKeyValue},
+    plugin::{
+        HostPlugin, WitInterfaces, wasi_config::DynamicConfig, wasi_keyvalue::InMemoryKeyValue,
+    },
     types::{Component, LocalResources, Workload, WorkloadStartRequest},
     wit::{WitInterface, WitWorld},
 };
@@ -61,7 +63,7 @@ pub struct PerComponentInfo {
 #[derive(Default)]
 pub struct CustomLogging {
     tracker: Mutex<HashMap<String, PerComponentInfo>>,
-    prev_ctx_id: Mutex<Option<String>>,
+    prev_ctx_id: Mutex<Option<Arc<str>>>,
 }
 
 impl<'a> bindings::wasi::logging::logging::Host for ActiveCtx<'a> {
@@ -71,9 +73,7 @@ impl<'a> bindings::wasi::logging::logging::Host for ActiveCtx<'a> {
         context: String,
         message: String,
     ) -> wasmtime::Result<()> {
-        let plugin = self
-            .get_plugin::<CustomLogging>("logging")
-            .ok_or_else(|| wasmtime::format_err!("failed to get plugin"))?;
+        let plugin = self.try_get_plugin::<CustomLogging>("logging")?;
 
         let per_component_info = plugin
             .tracker
@@ -94,12 +94,12 @@ impl<'a> bindings::wasi::logging::logging::Host for ActiveCtx<'a> {
         *plugin.prev_ctx_id.lock().await = Some(self.id.clone());
 
         match level {
-            Level::Critical => tracing::error!(id = &self.id, context, "{message}"),
-            Level::Error => tracing::error!(id = &self.id, context, "{message}"),
-            Level::Warn => tracing::warn!(id = &self.id, context, "{message}"),
-            Level::Info => tracing::info!(id = &self.id, context, "{message}"),
-            Level::Debug => tracing::debug!(id = &self.id, context, "{message}"),
-            Level::Trace => tracing::trace!(id = &self.id, context, "{message}"),
+            Level::Critical => tracing::error!(id = &*self.id, context, "{message}"),
+            Level::Error => tracing::error!(id = &*self.id, context, "{message}"),
+            Level::Warn => tracing::warn!(id = &*self.id, context, "{message}"),
+            Level::Info => tracing::info!(id = &*self.id, context, "{message}"),
+            Level::Debug => tracing::debug!(id = &*self.id, context, "{message}"),
+            Level::Trace => tracing::trace!(id = &*self.id, context, "{message}"),
         }
         Ok(())
     }
@@ -121,18 +121,10 @@ impl HostPlugin for CustomLogging {
     async fn on_workload_item_bind<'a>(
         &self,
         workload_handle: &mut WorkloadItem<'a>,
-        interfaces: std::collections::HashSet<wash_runtime::wit::WitInterface>,
+        interfaces: WitInterfaces<'_>,
     ) -> anyhow::Result<()> {
-        // Ensure exactly one interface: "wasi:logging/logging"
-        let mut iter = interfaces.iter();
-        let Some(interface) = iter.next() else {
-            anyhow::bail!("No interfaces provided; expected wasi:logging/logging");
-        };
-        if iter.next().is_some()
-            || interface.namespace != "wasi"
-            || interface.package != "logging"
-            || !interface.interfaces.contains("logging")
-        {
+        // Ensure the expected interface is present: "wasi:logging/logging"
+        if !interfaces.contains("wasi", "logging", &["logging"]) {
             anyhow::bail!(
                 "Expected exactly one interface: wasi:logging/logging, got: {interfaces:?}"
             );

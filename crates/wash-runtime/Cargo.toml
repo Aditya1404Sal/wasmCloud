@@ -37,7 +37,8 @@ path = "src/lib.rs"
 workspace = true
 
 [features]
-default = ["wasi-config", "wasi-logging", "wasi-blobstore", "wasi-keyvalue", "wasmcloud-postgres", "washlet", "wasi-otel", "wasmcloud-smtp"]
+# BettyBlocks: `wasmcloud-smtp` kept in defaults across the upstream merge (`wasi-webgpu` is upstream's addition).
+default = ["wasi-config", "wasi-logging", "wasi-blobstore", "wasi-keyvalue", "wasmcloud-postgres", "washlet", "wasi-otel", "wasi-webgpu", "wasmcloud-smtp"]
 oci = ["dep:oci-client", "dep:oci-wasm", "dep:docker_credential", "dep:sha2", "dep:wit-component"]
 wasi-otel = []
 washlet = ["oci"]
@@ -45,6 +46,8 @@ wasi-config = []
 wasi-logging = []
 wasi-blobstore = []
 wasi-keyvalue = []
+# Component-model `(implements ..)` / `named_imports` multiplexing
+wasm_component_model_implements = []
 wasi-webgpu = ["dep:wasi-webgpu-wasmtime", "dep:wasi-graphics-context-wasmtime"]
 wasmcloud-postgres = [
     "dep:tokio-postgres", "dep:tokio-postgres-rustls",
@@ -53,13 +56,9 @@ wasmcloud-postgres = [
     "dep:bit-vec", "dep:cidr", "dep:geo-types",
     "dep:ulid",
 ]
+# BettyBlocks: SMTP host-plugin feature (retained in upstream merge).
 wasmcloud-smtp = ["dep:html2text", "dep:lettre"]
-wasip3 = [
-    "wasmtime-wasi/p3",
-    "wasmtime-wasi-http/p3",
-    "wasmtime-wasi-http/component-model-async",
-]
-wasi-tls = ["dep:wasmtime-wasi-tls", "wasip3"]
+wasi-tls = ["dep:wasmtime-wasi-tls"]
 
 [dependencies]
 anyhow = { workspace = true }
@@ -84,10 +83,10 @@ uuid = { workspace = true, features = ["v4"] }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["sync", "net", "macros"] }
 tracing = { workspace = true }
-wasmtime = { workspace = true, features = ["anyhow", "component-model", "component-model-async", "winch", "pooling-allocator", "gc", "gc-null"] }
-wasmtime-wasi = { workspace = true }
+wasmtime = { workspace = true, features = ["anyhow", "component-model", "component-model-async", "cranelift", "pooling-allocator", "gc", "gc-null", "threads"] }
+wasmtime-wasi = { workspace = true, features = ["p3"] }
 wasmtime-wasi-io = { workspace = true }
-wasmtime-wasi-http = { workspace = true, features = ["default-send-request", "p2"] }
+wasmtime-wasi-http = { workspace = true, features = ["default-send-request", "p2", "p3", "component-model-async"] }
 wasmtime-wasi-tls = { workspace = true, optional = true, features = ["p3", "rustls"] }
 cap-net-ext = { workspace = true }
 cap-std = { workspace = true }
@@ -120,12 +119,10 @@ opentelemetry-http = { workspace = true }
 # Otel dependencies (optional, behind 'wasi-otel' feature)
 opentelemetry-otlp = { workspace = true, features = ["grpc-tonic","http-proto", "trace", "metrics", "logs"] }
 opentelemetry-semantic-conventions = { workspace = true, features = ["semconv_experimental"] }
-wasi-graphics-context-wasmtime = { git = "https://github.com/wasi-gfx/wasi-gfx-runtime.git", rev = "24ac92e1a2fff283b2326a8607dd9b96c302237d", optional = true }
-wasi-webgpu-wasmtime = { git = "https://github.com/wasi-gfx/wasi-gfx-runtime.git", rev = "24ac92e1a2fff283b2326a8607dd9b96c302237d", optional = true }
 
 # OCI dependencies (optional, behind 'oci' feature)
 docker_credential = { workspace = true, optional = true }
-oci-client = { workspace = true, optional = true, features = ["rustls-tls", "rustls-tls-native-roots"] }
+oci-client = { workspace = true, optional = true, features = ["rustls-tls"] }
 oci-wasm = { workspace = true, optional = true, features = ["rustls-tls"] }
 sha2 = { workspace = true, optional = true }
 wit-component = { workspace = true, optional = true }
@@ -149,6 +146,14 @@ lettre = { version = "0.11", default-features = false, features = ["tokio1", "to
 url = { workspace = true }
 webpki-roots = { workspace = true }
 
+# wasi-webgpu dependencies (optional, behind 'wasi-webgpu' feature). Pulled in
+# only on platforms where the `wasi_webgpu` plugin module compiles: wgpu-hal
+# fails to build on Windows and s390x, so the deps are gated to match the
+# `#[cfg]` on `plugin::wasi_webgpu`.
+[target.'cfg(all(not(target_os = "windows"), not(target_arch = "s390x")))'.dependencies]
+wasi-graphics-context-wasmtime = { git = "https://github.com/wasi-gfx/wasi-gfx-runtime.git", rev = "301716b5591bc6e08eca852b936fc8a17dea5379", optional = true }
+wasi-webgpu-wasmtime = { git = "https://github.com/wasi-gfx/wasi-gfx-runtime.git", rev = "301716b5591bc6e08eca852b936fc8a17dea5379", optional = true }
+
 # Proto codegen only. Wasm fixtures are built by `cargo xtask
 # build-fixtures` (see /xtask), which owns wit-component and the WASI
 # adapter provider.
@@ -161,7 +166,10 @@ pbjson-build = { workspace = true, default-features = true }
 tokio = { workspace = true, features = ["full"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
-reqwest = { workspace = true }
+# `stream` (bytes_stream / Body::wrap_stream) is used by the blobstore
+# integration tests; enable it explicitly rather than relying on another dep
+# transitively turning it on (oci-client 0.17 no longer does).
+reqwest = { workspace = true, features = ["stream"] }
 wat = { workspace = true, features = ["component-model"] }
 bytes = { workspace = true }
 http-body-util = { workspace = true }
@@ -180,20 +188,16 @@ gungraun = "0.19.1"
 [[bench]]
 name = "http_invoke"
 harness = false
-required-features = ["wasip3"]
 
 [[bench]]
 name = "gungraun"
 harness = false
-required-features = ["wasip3"]
 
 [[bench]]
 name = "wasmtime_baseline"
 harness = false
-required-features = ["wasip3"]
 
 [[bench]]
 name = "wasmtime_serve"
 harness = false
-required-features = ["wasip3"]
 

@@ -91,6 +91,9 @@ const P2_FIXTURES: &[&str] = &[
     "inter-component-call-callee",
     "inter-component-call-middleware",
     "http-allowed-hosts",
+    "keyvalue-counter",
+    "keyvalue-implements",
+    "postgres-implements",
 ];
 
 const P3_FIXTURES: &[&str] = &[
@@ -101,6 +104,14 @@ const P3_FIXTURES: &[&str] = &[
     "tls-echo-client-p3",
     "inter-component-call-p3-caller",
     "inter-component-call-p3-callee",
+    "stream-producer-p3",
+    "stream-consumer-p3",
+    "stream-pacer-p3",
+    "res-producer-p3",
+    "res-sink-p3",
+    "res-caller-p3",
+    "ephemeral-callee-p3",
+    "ephemeral-caller-p3",
 ];
 
 // Fixtures with local-only WIT worlds (no wasi imports). Copying shared
@@ -267,6 +278,11 @@ fn componentize(core_module: &[u8], adapter: &[u8]) -> Result<Vec<u8>> {
 /// of a single bundled `package.wit`.
 fn copy_shared_wit_deps(shared_wit_dir: &Path, fixture_dir: &Path) -> Result<()> {
     let deps_dir = fixture_dir.join("wit/deps");
+    // Clear stale deps before re-staging
+    if deps_dir.exists() {
+        fs::remove_dir_all(&deps_dir)
+            .with_context(|| format!("failed to clear stale {}", deps_dir.display()))?;
+    }
     fs::create_dir_all(&deps_dir)?;
 
     for entry in fs::read_dir(shared_wit_dir)

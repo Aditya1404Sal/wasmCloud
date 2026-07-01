@@ -188,19 +188,23 @@ impl CliCommand for WitCommand {
     }
 }
 
-/// Validate a WIT package reference follows the convention: namespace:package/interface
+/// Validate a WIT package reference follows the convention:
+/// `namespace:package` or `namespace:package/interface`, optionally with `@version`
 fn validate_interface_ref(package: &str) -> Result<()> {
     let name_part = package.split('@').next().unwrap_or(package);
 
-    if !name_part.contains(':') {
+    let Some((namespace, rest)) = name_part.split_once(':') else {
         bail!(
-            "Invalid package format '{name_part}': must be in 'namespace:package/interface' format (e.g., 'wasi:http/types')"
+            "Invalid package format '{name_part}': must be in 'namespace:package' or 'namespace:package/interface' format (e.g., 'wasi:http' or 'wasi:http/types')"
         );
-    }
+    };
 
-    if !name_part.contains('/') {
+    // The package name is everything before an optional '/'
+    let pkg_name = rest.split('/').next().unwrap_or(rest);
+
+    if namespace.is_empty() || pkg_name.is_empty() {
         bail!(
-            "Invalid package format '{name_part}': must include interface name in 'namespace:package/interface' format (e.g., 'wasi:http/types')"
+            "Invalid package format '{name_part}': namespace and package name must be non-empty (e.g., 'wasi:http' or 'wasi:http/types')"
         );
     }
 
@@ -275,6 +279,83 @@ async fn find_world_wit_file(wit_dir: &std::path::Path) -> Result<std::path::Pat
          Create a world.wit file or ensure a .wit file contains a world definition",
         wit_dir.display()
     )
+}
+
+fn insert_import_into_world(content: &str, import_line: &str) -> Result<String> {
+    let lines: Vec<&str> = content.lines().collect();
+    let mut new_lines = Vec::new();
+    let mut inserted = false;
+    let mut pending_world = false;
+    let mut world_indent = String::new();
+
+    for (i, line) in lines.iter().enumerate() {
+        let trimmed = line.trim();
+
+        if trimmed.starts_with("world ") {
+            pending_world = true;
+            if trimmed.contains('{') {
+                pending_world = false;
+                let next_indent = lines
+                    .get(i + 1)
+                    .map(|next_line| next_line.len() - next_line.trim_start().len())
+                    .unwrap_or(4);
+                world_indent = " ".repeat(next_indent.max(4));
+            }
+        } else if pending_world && trimmed.starts_with('{') {
+            pending_world = false;
+            let next_indent = lines
+                .get(i + 1)
+                .map(|next_line| next_line.len() - next_line.trim_start().len())
+                .unwrap_or(4);
+            world_indent = " ".repeat(next_indent.max(4));
+        } else if pending_world && !trimmed.is_empty() && !trimmed.starts_with("//") {
+            pending_world = false;
+        }
+
+        new_lines.push((*line).to_string());
+
+        if inserted || world_indent.is_empty() {
+            continue;
+        }
+
+        if trimmed.starts_with("import ") {
+            let remaining_lines = lines.get(i + 1..).unwrap_or_default();
+            let has_more_imports = remaining_lines
+                .iter()
+                .take_while(|l| !l.trim().starts_with('}'))
+                .any(|l| l.trim().starts_with("import "));
+
+            if !has_more_imports {
+                new_lines.push(format!("{world_indent}{import_line}"));
+                inserted = true;
+            }
+        } else if trimmed.starts_with('{')
+            || (trimmed.starts_with("world ") && trimmed.ends_with('{'))
+        {
+            let has_imports = lines
+                .get(i + 1..)
+                .unwrap_or_default()
+                .iter()
+                .take_while(|l| !l.trim().starts_with('}'))
+                .any(|l| l.trim().starts_with("import "));
+
+            if !has_imports {
+                new_lines.push(format!("{world_indent}{import_line}"));
+                inserted = true;
+            }
+        }
+    }
+
+    if !inserted {
+        bail!("Could not find a world block in world.wit to add the import");
+    }
+
+    let mut new_content = new_lines.join("\n");
+    if content.ends_with('\n') {
+        new_content.push('\n');
+    }
+
+    Ok(new_content)
 }
 
 /// Handle `wash wit fetch`
@@ -517,84 +598,10 @@ async fn handle_add(ctx: &CliContext, package: &str, config: &Config) -> Result<
         ));
     }
 
-    // Add the import inside the world block
-    let lines: Vec<&str> = content.lines().collect();
-    let mut new_lines = Vec::new();
-    let mut inserted = false;
-    let mut in_world = false;
-    let mut world_indent = String::new();
-
-    for (i, line) in lines.iter().enumerate() {
-        let trimmed = line.trim();
-
-        // Detect when we enter a world block
-        if trimmed.starts_with("world ") && trimmed.contains('{') {
-            in_world = true;
-            // Detect indentation level by looking at next non-empty line
-            if let Some(next_line) = lines.get(i + 1) {
-                let next_trimmed = next_line.trim_start();
-                let indent_len = next_line.len() - next_trimmed.len();
-                world_indent = " ".repeat(indent_len.max(4)); // Default to 4 spaces if no indent detected
-            } else {
-                world_indent = "    ".to_string(); // Default 4 spaces
-            }
-        }
-
-        new_lines.push(line.to_string());
-
-        // Insert the import inside the world block
-        if in_world && !inserted {
-            // Check if this line is an import statement inside the world
-            if trimmed.starts_with("import ") {
-                // Check if this is the last import in the world block
-                let remaining_lines = lines.get(i + 1..).unwrap_or_default();
-                let has_more_imports = remaining_lines
-                    .iter()
-                    .take_while(|l| !l.trim().starts_with('}')) // Stop at closing brace
-                    .any(|l| l.trim().starts_with("import "));
-
-                if !has_more_imports {
-                    // Insert after the last import
-                    new_lines.push(format!("{world_indent}{import_line}"));
-                    inserted = true;
-                }
-            } else if trimmed.starts_with("world ") && trimmed.ends_with('{') {
-                // World block just opened, and there are no imports yet
-                // Check if there are any existing imports in the world
-                let has_imports = lines
-                    .get(i + 1..)
-                    .unwrap_or_default()
-                    .iter()
-                    .take_while(|l| !l.trim().starts_with('}'))
-                    .any(|l| l.trim().starts_with("import "));
-
-                if !has_imports {
-                    // No imports yet, insert as first line in world block
-                    new_lines.push(format!("{world_indent}{import_line}"));
-                    inserted = true;
-                }
-            }
-        }
-
-        // Detect when we exit the world block
-        if in_world && trimmed == "}" {
-            in_world = false;
-        }
-    }
-
-    // If we still haven't inserted, there might not be a world block
-    if !inserted {
-        return Ok(CommandOutput::error(
-            "Could not find a world block in world.wit to add the import".to_string(),
-            None,
-        ));
-    }
-
-    let mut new_content = new_lines.join("\n");
-    // Preserve trailing newline if original content had one
-    if content.ends_with('\n') {
-        new_content.push('\n');
-    }
+    let new_content = match insert_import_into_world(&content, &import_line) {
+        Ok(content) => content,
+        Err(e) => return Ok(CommandOutput::error(e.to_string(), None)),
+    };
 
     // Write the updated content
     tokio::fs::write(&world_wit_path, &new_content)
@@ -672,7 +679,9 @@ async fn handle_remove(_ctx: &CliContext, package: &str, config: &Config) -> Res
                     .unwrap_or(after_import)
                     .trim();
 
-                if package_part == package {
+                // Strip version from user input so "wasi:http@0.2.0" matches "import wasi:http@0.2.0;"
+                let package_name_only = package.split('@').next().unwrap_or(package);
+                if package_part == package_name_only {
                     removed = true;
                     continue; // Skip this line
                 }
@@ -1015,6 +1024,55 @@ world example {
         assert!(
             found_import_inside,
             "Import should be inside the world block"
+        );
+    }
+
+    #[test]
+    fn test_insert_import_into_world_with_same_line_open_brace() {
+        let content = r#"package test:component@0.1.0;
+
+world example {
+}
+"#;
+
+        let updated = insert_import_into_world(content, "import wasi:http@0.2.0;")
+            .expect("insert should succeed");
+
+        assert!(updated.contains("    import wasi:http@0.2.0;"));
+    }
+
+    #[test]
+    fn test_insert_import_into_world_with_next_line_open_brace() {
+        let content = r#"package test:component@0.1.0;
+
+world example
+{
+}
+"#;
+
+        let updated = insert_import_into_world(content, "import wasi:http@0.2.0;")
+            .expect("insert should succeed");
+
+        assert!(updated.contains("{\n    import wasi:http@0.2.0;\n}"));
+    }
+
+    #[test]
+    fn test_insert_import_into_world_with_next_line_open_brace_and_existing_imports() {
+        let content = r#"package test:component@0.1.0;
+
+world example
+{
+    import wasi:config/store@0.2.0-draft;
+}
+"#;
+
+        let updated = insert_import_into_world(content, "import wasi:http@0.2.0;")
+            .expect("insert should succeed");
+
+        assert!(
+            updated.contains(
+                "    import wasi:config/store@0.2.0-draft;\n    import wasi:http@0.2.0;\n}"
+            )
         );
     }
 
@@ -1591,6 +1649,71 @@ world example {
         assert_eq!(
             import_count, 2,
             "Should find 2 imports, ignoring commented one"
+        );
+    }
+
+    #[test]
+    fn test_validate_interface_ref_package_only() {
+        // Package-level references (no interface) must be accepted
+        assert!(validate_interface_ref("wasi:http").is_ok());
+        assert!(validate_interface_ref("wasi:http@0.2.0").is_ok());
+        assert!(validate_interface_ref("wasi:keyvalue").is_ok());
+    }
+
+    #[test]
+    fn test_validate_interface_ref_with_interface() {
+        // Interface-level references must still be accepted
+        assert!(validate_interface_ref("wasi:http/types").is_ok());
+        assert!(validate_interface_ref("wasi:http/types@0.2.0").is_ok());
+        assert!(validate_interface_ref("wasi:http/incoming-handler@0.2.0").is_ok());
+    }
+
+    #[test]
+    fn test_validate_interface_ref_invalid() {
+        // Missing namespace separator
+        assert!(validate_interface_ref("http").is_err());
+        assert!(validate_interface_ref("http/types").is_err());
+        // Empty namespace or package name
+        assert!(validate_interface_ref(":http").is_err());
+        assert!(validate_interface_ref("wasi:").is_err());
+        assert!(validate_interface_ref(":/").is_err());
+    }
+
+    #[tokio::test]
+    async fn test_remove_with_version_in_argument() {
+        let (_temp, _project_dir, wit_dir) = setup_test_project().await;
+        let world_wit_path = wit_dir.join("world.wit");
+
+        let content =
+            "package test:component@0.1.0;\n\nworld example {\n    import wasi:http@0.2.0;\n}\n";
+        fs::write(&world_wit_path, content).expect("failed to write world.wit");
+
+        let config = Config {
+            wit: Some(crate::wit::WitConfig {
+                wit_dir: Some(wit_dir.clone()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let ctx = CliContext::builder().build().await.unwrap();
+
+        // Removing with an explicit version should work: "wasi:http@0.2.0" matches
+        // "import wasi:http@0.2.0;" by stripping the version before comparing.
+        let output = handle_remove(&ctx, "wasi:http@0.2.0", &config)
+            .await
+            .expect("handle_remove should not return Err");
+
+        assert!(
+            output.is_success(),
+            "removing wasi:http@0.2.0 should succeed when 'import wasi:http@0.2.0;' is present"
+        );
+
+        let new_content = tokio::fs::read_to_string(&world_wit_path)
+            .await
+            .expect("failed to read world.wit");
+        assert!(
+            !new_content.contains("import wasi:http"),
+            "import should have been removed"
         );
     }
 }

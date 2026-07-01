@@ -9,7 +9,6 @@
 //! - `sockets/host_udp_p3.rs`: HostUdpSocketWithStore send/receive
 //! - `sockets/mod.rs`: add_p3_to_linker, error code mapping
 
-#![cfg(feature = "wasip3")]
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use anyhow::{Context, Result};
@@ -25,7 +24,6 @@ const SOCKET_TEST_P3_WASM: &[u8] = include_bytes!("wasm/socket_test_p3.wasm");
 
 fn engine_with_p3() -> Engine {
     Engine::builder()
-        .with_wasip3(true)
         .build()
         .expect("failed to build engine with wasip3")
 }
@@ -87,6 +85,7 @@ async fn test_p3_socket_component_initialization() -> Result<()> {
             digest: None,
             bytes: bytes::Bytes::from_static(SOCKET_TEST_P3_WASM),
             local_resources: Default::default(),
+            is_precompiled: false,
             pool_size: 1,
             max_invocations: 10,
         }],

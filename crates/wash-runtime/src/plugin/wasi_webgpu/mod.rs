@@ -9,7 +9,7 @@ const WASI_WEBGPU_ID: &str = "wasi-webgpu";
 
 use crate::{
     engine::{ctx::SharedCtx, workload::WorkloadItem},
-    plugin::HostPlugin,
+    plugin::{HostPlugin, WitInterfaces},
     wit::{WitInterface, WitWorld},
 };
 
@@ -84,10 +84,7 @@ impl wasi_webgpu_wasmtime::MainThreadSpawner for UiThreadSpawner {
 impl wasi_webgpu_wasmtime::WasiWebGpuView for SharedCtx {
     #[allow(clippy::expect_used)] // Trait doesn't return Result; plugin is registered at startup
     fn instance(&self) -> Arc<wasi_webgpu_wasmtime::reexports::wgpu_core::global::Global> {
-        let plugin = self
-            .active_ctx
-            .get_plugin::<WebGpu>(WASI_WEBGPU_ID)
-            .expect("WebGpu plugin should be registered");
+        let plugin = self.active_ctx.get_plugin::<WebGpu>(WASI_WEBGPU_ID);
         Arc::clone(&plugin.gpu)
     }
 
@@ -115,14 +112,10 @@ impl HostPlugin for WebGpu {
     async fn on_workload_item_bind<'a>(
         &self,
         component_handle: &mut WorkloadItem<'a>,
-        interfaces: std::collections::HashSet<crate::wit::WitInterface>,
+        interfaces: WitInterfaces<'_>,
     ) -> anyhow::Result<()> {
         // Check if any of the interfaces are wasi:webgpu related
-        let has_webgpu = interfaces
-            .iter()
-            .any(|i| i.namespace == "wasi" && i.package == "webgpu");
-
-        if !has_webgpu {
+        if !interfaces.contains("wasi", "webgpu", &[]) {
             tracing::warn!(
                 "WasiWebgpu plugin requested for non-wasi:webgpu interface(s): {:?}",
                 interfaces

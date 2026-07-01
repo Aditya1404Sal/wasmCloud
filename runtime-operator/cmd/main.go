@@ -134,7 +134,8 @@ func main() {
 		&precompileArtifactBaseURL,
 		"precompile-artifact-base-url",
 		"",
-		"Scheme-qualified URL prefix where precompiled .cwasm bytes are written (e.g. nats://precompiled-artifacts). Required when precompile controller is enabled.",
+		"Scheme-qualified URL prefix where precompiled .cwasm bytes are written "+
+			"(e.g. nats://precompiled-artifacts). Required when precompile controller is enabled.",
 	)
 	flag.StringVar(
 		&precompileTarget,

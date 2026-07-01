@@ -27,7 +27,7 @@ use tokio::sync::RwLock;
 use opentelemetry_otlp::{LogExporter, MetricExporter, SpanExporter};
 
 use crate::engine::ctx::{ActiveCtx, SharedCtx, extract_active_ctx};
-use crate::plugin::{HostPlugin, WorkloadItem, WorkloadTracker};
+use crate::plugin::{HostPlugin, WitInterfaces, WorkloadItem, WorkloadTracker};
 use crate::wit::{WitInterface, WitWorld};
 
 const WASI_OTEL_ID: &str = "wasi-otel";
@@ -211,7 +211,7 @@ impl HostPlugin for WasiOtel {
     async fn on_workload_item_bind<'a>(
         &self,
         component_handle: &mut WorkloadItem<'a>,
-        _interfaces: HashSet<WitInterface>,
+        _interfaces: WitInterfaces<'_>,
     ) -> anyhow::Result<()> {
         // Add all wasi:otel interfaces to linker
         bindings::wasi::otel::types::add_to_linker::<_, SharedCtx>(
@@ -257,7 +257,7 @@ impl HostPlugin for WasiOtel {
     async fn on_workload_unbind(
         &self,
         workload_id: &str,
-        _interfaces: HashSet<WitInterface>,
+        _interfaces: WitInterfaces<'_>,
     ) -> anyhow::Result<()> {
         self.tracker
             .write()
@@ -295,7 +295,7 @@ impl<'a> bindings::wasi::otel::logs::Host for ActiveCtx<'a> {
         data: bindings::wasi::otel::logs::LogRecord,
     ) -> wasmtime::Result<()> {
         tracing::info!(?data, "emitting log record");
-        if let Some(plugin) = self.ctx.get_plugin::<WasiOtel>(WASI_OTEL_ID) {
+        if let Ok(plugin) = self.ctx.try_get_plugin::<WasiOtel>(WASI_OTEL_ID) {
             let service_name = plugin.config.service_name.clone();
             let provider = plugin.logger_provider.read().await;
 
@@ -316,7 +316,7 @@ impl<'a> bindings::wasi::otel::metrics::Host for ActiveCtx<'a> {
         &mut self,
         resource_metrics: bindings::wasi::otel::metrics::ResourceMetrics,
     ) -> wasmtime::Result<Result<(), bindings::wasi::otel::metrics::Error>> {
-        if let Some(plugin) = self.ctx.get_plugin::<WasiOtel>(WASI_OTEL_ID) {
+        if let Ok(plugin) = self.ctx.try_get_plugin::<WasiOtel>(WASI_OTEL_ID) {
             // Summarize incoming metrics for logging
             let summary = summarize_resource_metrics(&resource_metrics);
             tracing::info!(
@@ -398,7 +398,7 @@ impl<'a> bindings::wasi::otel::tracing::Host for ActiveCtx<'a> {
         &mut self,
         span_data: bindings::wasi::otel::tracing::SpanData,
     ) -> wasmtime::Result<()> {
-        if let Some(plugin) = self.ctx.get_plugin::<WasiOtel>(WASI_OTEL_ID) {
+        if let Ok(plugin) = self.ctx.try_get_plugin::<WasiOtel>(WASI_OTEL_ID) {
             let summary = summarize_span_data(&span_data);
             tracing::info!(
                 name = %summary.name,

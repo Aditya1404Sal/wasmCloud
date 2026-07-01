@@ -2,16 +2,22 @@ package runtime
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"maps"
 	"strconv"
 	"time"
 
+	"github.com/go-logr/logr"
 	"google.golang.org/protobuf/encoding/protojson"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
 
 	"go.wasmcloud.dev/runtime-operator/v2/api/condition"
 	"go.wasmcloud.dev/runtime-operator/v2/pkg/wasmbus"
@@ -28,6 +34,7 @@ const (
 	// the host finalizer can fan out to assigned workloads without
 	// scanning every Workload in the cluster.
 	workloadByHostIDIndex = "status.hostId"
+	statusUnknown         = "unknown"
 )
 
 // HostReconciler reconciles a Host object
@@ -149,6 +156,22 @@ func (r *HostReconciler) finalize(ctx context.Context, host *runtimev1alpha1.Hos
 	return nil
 }
 
+// deleteUnresponsiveHost is the reconcile post-hook: a Host whose Ready
+// condition has resolved to a definite not-ready (neither True nor Unknown)
+// is deleted, and its finalizer cleans up assigned workloads. While Ready is
+// still Unknown the host is left in place so a recovering host is not deleted
+// out from under in-flight heartbeats.
+func (r *HostReconciler) deleteUnresponsiveHost(ctx context.Context, host *runtimev1alpha1.Host) error {
+	if host.Status.AllTrue(condition.TypeReady) {
+		return nil
+	}
+	if host.Status.AnyUnknown(condition.TypeReady) {
+		return nil
+	}
+	// Delete unresponsive host; the finalizer will clean up assigned workloads.
+	return r.Delete(ctx, host)
+}
+
 // SetupWithManager sets up the controller with the Manager.
 // +kubebuilder:rbac:groups=runtime.wasmcloud.dev,resources=hosts,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=runtime.wasmcloud.dev,resources=hosts/status,verbs=get;update;patch
@@ -165,23 +188,7 @@ func (r *HostReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	reconciler.SetCondition(runtimev1alpha1.HostConditionReporting, r.reconcileReporting)
 	reconciler.SetCondition(condition.TypeReady, r.reconcileReady)
 
-	reconciler.AddPostHook(func(ctx context.Context, host *runtimev1alpha1.Host) error {
-		if host.Status.AllTrue(condition.TypeReady) {
-			return nil
-		}
-		if host.Status.AnyUnknown(condition.TypeReady) {
-			return nil
-		}
-		logger := ctrl.LoggerFrom(ctx)
-		logger.Info("deleting unresponsive host",
-			"hostName", host.Name,
-			"hostID", host.HostID,
-			"lastSeen", host.Status.LastSeen.Time,
-			"unreachableDuration", time.Since(host.Status.LastSeen.Time).Round(time.Second),
-		)
-		// Delete unresponsive host; the finalizer will clean up assigned workloads.
-		return r.Delete(ctx, host)
-	})
+	reconciler.AddPostHook(r.deleteUnresponsiveHost)
 
 	r.reconciler = reconciler
 
@@ -213,7 +220,7 @@ func (r *HostReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	}
 
 	return ctrl.NewControllerManagedBy(mgr).
-		For(&runtimev1alpha1.Host{}).
+		For(&runtimev1alpha1.Host{}, builder.WithPredicates(predicate.GenerationChangedPredicate{})).
 		Named("workload-host").
 		Complete(r)
 }
@@ -236,70 +243,114 @@ func (h *hostStatusUpdater) Start(ctx context.Context) error {
 	log := ctrl.LoggerFrom(ctx).WithName("host-status-updater")
 
 	subscription.Handle(func(msg *wasmbus.Message) {
-		var req runtimev2.HostHeartbeat
-		if err := protojson.Unmarshal(msg.Data, &req); err != nil {
-			logger.Error(err, "failed to decode heartbeat message",
-				"natsSubject", msg.Subject,
-				"rawDataLen", len(msg.Data),
-			)
-			return
-		}
-
-		// Every Host object lives in the operator's own namespace. Tenant
-		// attribution is recorded on the Host's Environment field,
-		// populated verbatim from req.Environment — the heartbeat is the
-		// source of truth and is not validated against cluster state.
-		host := &runtimev1alpha1.Host{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      req.FriendlyName,
-				Namespace: h.operatorNamespace,
-			},
-		}
-
-		// CreateOrUpdate handles spec and metadata (labels, HostID, Hostname,
-		// HTTPPort). The mutate func sets these fields so they are applied on
-		// both create and update paths (c.Get overwrites the pre-populated
-		// struct for existing objects).
-		result, err := controllerutil.CreateOrUpdate(ctx, h.client, host, func() error {
-			host.Labels = req.GetLabels()
-			host.HostID = req.Id
-			host.Hostname = req.Hostname
-			host.HTTPPort = req.HttpPort
-			host.Environment = req.GetEnvironment()
-			return nil
-		})
-		if err != nil {
-			logger.Error(err, "failed to create or update host resource",
-				"hostName", req.FriendlyName,
-				"hostID", req.Id,
-				"hostname", req.Hostname,
-			)
-			return
-		}
-
-		if result == controllerutil.OperationResultCreated {
-			logger.Info("host discovered via heartbeat",
-				"hostName", req.FriendlyName,
-				"hostID", req.Id,
-				"hostname", req.Hostname,
-				"version", req.Version,
-				"startedAt", req.StartedAt.AsTime(),
-			)
-		}
-
-		// Status is a separate subresource; c.Update() (used by CreateOrUpdate)
-		// silently ignores status fields. Use Status().Patch() to persist
-		// LastSeen without conflicting with concurrent metadata changes (e.g.
-		// the ConditionedReconciler adding a finalizer between CreateOrUpdate
-		// and this call).
-		base := host.DeepCopy()
-		host.Status.LastSeen = metav1.Now()
-		if err := h.client.Status().Patch(ctx, host, client.MergeFrom(base)); err != nil {
-			log.Error(err, "failed to update Host status", "host", req.FriendlyName, "hostID", req.Id)
-		}
+		h.handleHeartbeat(ctx, log, msg.Data)
 	})
 
 	<-ctx.Done()
 	logger.Info("stopping host status updater")
 	return subscription.Drain()
+}
+
+// handleHeartbeat decodes a single heartbeat payload and reconciles the
+// corresponding Host: it applies spec/metadata via Server-Side Apply only when
+// the heartbeat differs from the stored object, then always refreshes the
+// status subresource so LastSeen advances even when the spec is unchanged.
+func (h *hostStatusUpdater) handleHeartbeat(ctx context.Context, log logr.Logger, data []byte) {
+	var req runtimev2.HostHeartbeat
+	if err := protojson.Unmarshal(data, &req); err != nil {
+		log.Error(err, "failed to decode heartbeat message")
+		return
+	}
+
+	// Every Host object lives in the operator's own namespace. Tenant
+	// attribution is recorded on the Host's Environment field,
+	// populated verbatim from req.Environment — the heartbeat is the
+	// source of truth and is not validated against cluster state.
+	//
+	// Upsert spec and metadata with Server-Side Apply in case the object was
+	// updated by another process, and the cache is stale.
+	host := &runtimev1alpha1.Host{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: runtimev1alpha1.GroupVersion.String(),
+			Kind:       "Host",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      req.FriendlyName,
+			Namespace: h.operatorNamespace,
+			Labels:    req.GetLabels(),
+		},
+		HostID:      req.Id,
+		Hostname:    req.Hostname,
+		HTTPPort:    req.HttpPort,
+		Environment: req.GetEnvironment(),
+	}
+	// Read the current state from the cache to see if the values in the heartbeat changed.
+	existing := &runtimev1alpha1.Host{}
+	getErr := h.client.Get(ctx,
+		types.NamespacedName{Name: req.FriendlyName, Namespace: h.operatorNamespace},
+		existing)
+	if getErr != nil && !apierrors.IsNotFound(getErr) {
+		log.Error(getErr, "failed to read Host resource", "host", req.FriendlyName, "hostID", req.Id)
+		return
+	}
+
+	if apierrors.IsNotFound(getErr) || hostSpecChanged(existing, host) {
+		// adding a nolint check to allow for client.apply, as the Host CRD
+		// would need to have an ApplyConfiguration generated for it, and thus a
+		// new CRD version would be required.
+		if err := h.client.Patch(ctx, host, client.Apply, //nolint:staticcheck
+			client.FieldOwner("host-status-updater"), client.ForceOwnership); err != nil {
+			log.Error(err, "failed to apply Host resource", "host", req.FriendlyName, "hostID", req.Id)
+			return
+		}
+	}
+
+	// Patching the status subresource to update the LastSeen timestamp in case
+	// the other fields reported are not yet available (such as system/OS information).
+	statusPatch, err := hostStatusPatch(&host.Status)
+	if err != nil {
+		log.Error(err, "failed to build Host status patch", "host", req.FriendlyName, "hostID", req.Id)
+		return
+	}
+	if err := h.client.Status().Patch(ctx, host, client.RawPatch(types.MergePatchType, statusPatch)); err != nil {
+		log.Error(err, "failed to update Host status", "host", req.FriendlyName, "hostID", req.Id)
+	}
+}
+
+// hostSpecChanged returns true if any of the stored metadata
+// spec fields differs from what the heartbeat returns
+func hostSpecChanged(existing, next *runtimev1alpha1.Host) bool {
+	return existing.HostID != next.HostID ||
+		existing.Hostname != next.Hostname ||
+		existing.HTTPPort != next.HTTPPort ||
+		existing.Environment != next.Environment ||
+		!maps.Equal(existing.Labels, next.Labels)
+}
+
+// hostStatusPatch builds a JSON merge patch for the Host status subresource
+// that always refreshes LastSeen.
+func hostStatusPatch(status *runtimev1alpha1.HostStatus) ([]byte, error) {
+	s := map[string]any{"lastSeen": metav1.Now()}
+	if status.Version == "" {
+		s["version"] = statusUnknown
+	}
+	if status.OSName == "" {
+		s["osName"] = statusUnknown
+	}
+	if status.OSArch == "" {
+		s["osArch"] = statusUnknown
+	}
+	if status.OSKernel == "" {
+		s["osKernel"] = statusUnknown
+	}
+	if status.SystemCPUUsage == "" {
+		s["systemCPUUsage"] = "0"
+	}
+	if status.SystemMemoryTotal == 0 {
+		s["systemMemoryTotal"] = 0
+	}
+	if status.SystemMemoryFree == 0 {
+		s["systemMemoryFree"] = 0
+	}
+	return json.Marshal(map[string]any{"status": s})
 }

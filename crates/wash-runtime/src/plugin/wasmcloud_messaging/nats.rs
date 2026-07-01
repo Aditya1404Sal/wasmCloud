@@ -4,7 +4,7 @@ use std::sync::Arc;
 use crate::engine::ctx::{ActiveCtx, SharedCtx, extract_active_ctx};
 use crate::engine::workload::{ResolvedWorkload, WorkloadItem};
 use crate::observability::Meters;
-use crate::plugin::HostPlugin;
+use crate::plugin::{HostPlugin, WitInterfaces};
 use crate::wit::{WitInterface, WitWorld};
 use async_nats::Subscriber;
 use futures::stream::StreamExt;
@@ -95,9 +95,7 @@ impl<'a> Host for ActiveCtx<'a> {
         body: Vec<u8>,
         timeout_ms: u32,
     ) -> wasmtime::Result<Result<types::BrokerMessage, String>> {
-        let Some(plugin) = self.get_plugin::<NatsMessaging>(PLUGIN_MESSAGING_ID) else {
-            return Ok(Err("plugin not available".to_string()));
-        };
+        let plugin = self.try_get_plugin::<NatsMessaging>(PLUGIN_MESSAGING_ID)?;
 
         let timeout_duration = std::time::Duration::from_millis(timeout_ms as u64);
         let request_future = plugin.client.request(subject, body.into());
@@ -123,9 +121,7 @@ impl<'a> Host for ActiveCtx<'a> {
 
     #[instrument(name = "wasmcloud.messaging.publish", skip_all, fields(subject = %msg.subject, reply_to = %msg.reply_to.as_deref().unwrap_or("<none>")))]
     async fn publish(&mut self, msg: types::BrokerMessage) -> wasmtime::Result<Result<(), String>> {
-        let Some(plugin) = self.get_plugin::<NatsMessaging>(PLUGIN_MESSAGING_ID) else {
-            return Ok(Err("plugin not available".to_string()));
-        };
+        let plugin = self.try_get_plugin::<NatsMessaging>(PLUGIN_MESSAGING_ID)?;
 
         let subject = msg.subject;
 
@@ -172,14 +168,17 @@ impl HostPlugin for NatsMessaging {
     async fn on_workload_item_bind<'a>(
         &self,
         component_handle: &mut WorkloadItem<'a>,
-        interfaces: std::collections::HashSet<crate::wit::WitInterface>,
+        interfaces: WitInterfaces<'_>,
     ) -> anyhow::Result<()> {
-        let Some(interface) = interfaces
-            .iter()
-            .find(|i| i.namespace == "wasmcloud" && i.package == "messaging")
-        else {
+        let Some(interface) = interfaces.get("wasmcloud", "messaging", &[]) else {
             return Ok(());
         };
+
+        // Subscriptions come from this component's own `LocalResources.config`
+        // (so workers in one workload can subscribe to different subjects),
+        // falling back to the workload-scoped host interface config. Capture
+        // the host-interface fallback before borrowing the component.
+        let interface_subscriptions = interface.config.get("subscriptions").cloned();
 
         bindings::wasmcloud::messaging::types::add_to_linker::<_, SharedCtx>(
             component_handle.linker(),
@@ -190,15 +189,29 @@ impl HostPlugin for NatsMessaging {
             extract_active_ctx,
         )?;
 
-        if interface.interfaces.iter().any(|i| i == "handler") {
-            let raw_subscriptions = match interface.config.get("subscriptions") {
-                Some(subs) => subs.split(',').map(|s| s.to_string()).collect(),
-                None => vec![],
-            };
+        let local_subscriptions = component_handle
+            .local_resources()
+            .config
+            .get("subscriptions")
+            .cloned();
 
-            let WorkloadItem::Component(component_handle) = component_handle else {
-                anyhow::bail!("Service can not be tracked");
-            };
+        // Only components are tracked as handlers; services just get the
+        // consumer linker wired above.
+        let WorkloadItem::Component(component_handle) = component_handle else {
+            return Ok(());
+        };
+
+        // Track this component as a subscriber when its world exports the
+        // messaging handler, mirroring the in-memory backend. This works
+        // whether or not the workload declares a `wasmcloud:messaging` host
+        // interface entry.
+        if component_handle
+            .world()
+            .exports
+            .contains(&WitInterface::from("wasmcloud:messaging/handler@0.2.0"))
+        {
+            let raw = local_subscriptions.or(interface_subscriptions);
+            let raw_subscriptions = super::parse_subscriptions(raw.as_deref());
 
             debug!(
                 component_id = component_handle.id(),
@@ -402,7 +415,7 @@ impl HostPlugin for NatsMessaging {
     async fn on_workload_unbind(
         &self,
         workload_id: &str,
-        _interfaces: HashSet<crate::wit::WitInterface>,
+        _interfaces: WitInterfaces<'_>,
     ) -> anyhow::Result<()> {
         let workload_cleanup = |_| async {};
         let component_cleanup = |component_data: ComponentData| async move {
@@ -433,37 +446,6 @@ mod tests {
     use super::*;
     use crate::plugin::WorkloadTrackerItem;
     use std::time::Duration;
-
-    /// Mirrors `on_workload_item_bind`'s parsing of the `subscriptions`
-    /// config string. Locks in the comma-split contract so a regression
-    /// (e.g. switching to a different separator, accidentally trimming) is
-    /// caught without spinning up the full plugin lifecycle.
-    fn parse_subscriptions(s: &str) -> Vec<String> {
-        s.split(',').map(|s| s.to_string()).collect()
-    }
-
-    #[test]
-    fn subscriptions_config_single() {
-        assert_eq!(
-            parse_subscriptions("tasks.task-worker"),
-            vec!["tasks.task-worker"]
-        );
-    }
-
-    #[test]
-    fn subscriptions_config_multiple() {
-        assert_eq!(
-            parse_subscriptions("a,b,c"),
-            vec!["a".to_string(), "b".to_string(), "c".to_string()]
-        );
-    }
-
-    #[test]
-    fn subscriptions_config_preserves_inner_whitespace() {
-        // Subjects with whitespace are unusual but the chart and operator
-        // pass the value through verbatim — make sure we don't trim.
-        assert_eq!(parse_subscriptions(" tasks.x "), vec![" tasks.x "]);
-    }
 
     /// Tracker round-trip: stored subscriptions and a stored cancellation
     /// token are retrievable by the same component_id; cleanup cancels the

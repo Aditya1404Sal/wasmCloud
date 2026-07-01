@@ -18,8 +18,9 @@ COPY --from=planner /src/recipe.json recipe.json
 RUN cargo chef cook --release --target x86_64-unknown-linux-musl --recipe-path recipe.json
 COPY --exclude=rust-toolchain.toml --chown=nonroot:nonroot . .
 
-# Optional comma-separated cargo feature list (e.g. "wasip3,wasi-tls").
-# Empty by default so the standard image stays on WASI Preview 2.
+# Optional comma-separated cargo feature list for opt-in extras (e.g.
+# "wasi-tls", "wasi-webgpu"). WASI Preview 3 is already compiled into the
+# default wash build, so it needs no feature flag here.
 ARG CARGO_FEATURES=""
 
 # build static binary

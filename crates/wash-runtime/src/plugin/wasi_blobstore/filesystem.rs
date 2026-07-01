@@ -6,8 +6,8 @@ use std::sync::Arc;
 
 use crate::engine::ctx::{ActiveCtx, SharedCtx, extract_active_ctx};
 use crate::engine::workload::WorkloadItem;
-use crate::plugin::WorkloadTracker;
 use crate::plugin::{HostPlugin, lock_root};
+use crate::plugin::{WitInterfaces, WorkloadTracker};
 use crate::wit::{WitInterface, WitWorld};
 
 use tokio::sync::RwLock;
@@ -93,9 +93,7 @@ impl<'a> bindings::wasi::blobstore::blobstore::Host for ActiveCtx<'a> {
         &mut self,
         name: ContainerName,
     ) -> wasmtime::Result<Result<Resource<ContainerData>, BlobstoreError>> {
-        let Some(plugin) = self.get_plugin::<FilesystemBlobstore>(PLUGIN_BLOBSTORE_ID) else {
-            return Ok(Err("blobstore plugin not available".to_string()));
-        };
+        let plugin = self.try_get_plugin::<FilesystemBlobstore>(PLUGIN_BLOBSTORE_ID)?;
 
         let root = lock_root(&plugin.root, &name)
             .map_err(|e| wasmtime::format_err!("invalid container name: {e}"))?;
@@ -118,9 +116,7 @@ impl<'a> bindings::wasi::blobstore::blobstore::Host for ActiveCtx<'a> {
         &mut self,
         name: ContainerName,
     ) -> wasmtime::Result<Result<Resource<ContainerData>, BlobstoreError>> {
-        let Some(plugin) = self.get_plugin::<FilesystemBlobstore>(PLUGIN_BLOBSTORE_ID) else {
-            return Ok(Err("blobstore plugin not available".to_string()));
-        };
+        let plugin = self.try_get_plugin::<FilesystemBlobstore>(PLUGIN_BLOBSTORE_ID)?;
 
         let Ok(root) = lock_root(&plugin.root, &name) else {
             return Ok(Err("invalid container name".to_string()));
@@ -144,9 +140,7 @@ impl<'a> bindings::wasi::blobstore::blobstore::Host for ActiveCtx<'a> {
         &mut self,
         name: ContainerName,
     ) -> wasmtime::Result<Result<(), BlobstoreError>> {
-        let Some(plugin) = self.get_plugin::<FilesystemBlobstore>(PLUGIN_BLOBSTORE_ID) else {
-            return Ok(Err("blobstore plugin not available".to_string()));
-        };
+        let plugin = self.try_get_plugin::<FilesystemBlobstore>(PLUGIN_BLOBSTORE_ID)?;
 
         let Ok(path) = lock_root(&plugin.root, &name) else {
             return Ok(Err("invalid container name".to_string()));
@@ -167,9 +161,7 @@ impl<'a> bindings::wasi::blobstore::blobstore::Host for ActiveCtx<'a> {
         &mut self,
         name: ContainerName,
     ) -> wasmtime::Result<Result<bool, BlobstoreError>> {
-        let Some(plugin) = self.get_plugin::<FilesystemBlobstore>(PLUGIN_BLOBSTORE_ID) else {
-            return Ok(Err("blobstore plugin not available".to_string()));
-        };
+        let plugin = self.try_get_plugin::<FilesystemBlobstore>(PLUGIN_BLOBSTORE_ID)?;
 
         let Ok(path) = lock_root(&plugin.root, &name) else {
             return Ok(Err("invalid container name".to_string()));
@@ -184,9 +176,7 @@ impl<'a> bindings::wasi::blobstore::blobstore::Host for ActiveCtx<'a> {
         src: ObjectId,
         dest: ObjectId,
     ) -> wasmtime::Result<Result<(), BlobstoreError>> {
-        let Some(plugin) = self.get_plugin::<FilesystemBlobstore>(PLUGIN_BLOBSTORE_ID) else {
-            return Ok(Err("blobstore plugin not available".to_string()));
-        };
+        let plugin = self.try_get_plugin::<FilesystemBlobstore>(PLUGIN_BLOBSTORE_ID)?;
 
         let Ok(read_container) = lock_root(&plugin.root, &src.container) else {
             return Ok(Err("invalid source container name".to_string()));
@@ -225,9 +215,7 @@ impl<'a> bindings::wasi::blobstore::blobstore::Host for ActiveCtx<'a> {
         src: ObjectId,
         dest: ObjectId,
     ) -> wasmtime::Result<Result<(), BlobstoreError>> {
-        let Some(plugin) = self.get_plugin::<FilesystemBlobstore>(PLUGIN_BLOBSTORE_ID) else {
-            return Ok(Err("blobstore plugin not available".to_string()));
-        };
+        let plugin = self.try_get_plugin::<FilesystemBlobstore>(PLUGIN_BLOBSTORE_ID)?;
 
         let Ok(read_container) = lock_root(&plugin.root, &src.container) else {
             return Ok(Err("invalid source container name".to_string()));
@@ -738,14 +726,11 @@ impl HostPlugin for FilesystemBlobstore {
     async fn on_workload_item_bind<'a>(
         &self,
         component_handle: &mut WorkloadItem<'a>,
-        interfaces: std::collections::HashSet<crate::wit::WitInterface>,
+        interfaces: WitInterfaces<'_>,
     ) -> anyhow::Result<()> {
-        let Some(_interface) = interfaces
-            .iter()
-            .find(|i| i.namespace == "wasi" && i.package == "blobstore")
-        else {
+        if !interfaces.contains("wasi", "blobstore", &[]) {
             return Ok(());
-        };
+        }
 
         tracing::debug!(
             workload_id = component_handle.workload_id(),
@@ -773,14 +758,11 @@ impl HostPlugin for FilesystemBlobstore {
     async fn on_workload_bind(
         &self,
         workload: &crate::engine::workload::UnresolvedWorkload,
-        host_interfaces: std::collections::HashSet<crate::wit::WitInterface>,
+        host_interfaces: WitInterfaces<'_>,
     ) -> anyhow::Result<()> {
-        let Some(_interface) = host_interfaces
-            .iter()
-            .find(|i| i.namespace == "wasi" && i.package == "blobstore")
-        else {
+        if !host_interfaces.contains("wasi", "blobstore", &[]) {
             return Ok(());
-        };
+        }
 
         self.tracker.write().await.add_unresolved_workload(
             workload,
@@ -795,7 +777,7 @@ impl HostPlugin for FilesystemBlobstore {
     async fn on_workload_unbind(
         &self,
         workload_id: &str,
-        _interfaces: std::collections::HashSet<crate::wit::WitInterface>,
+        _interfaces: WitInterfaces<'_>,
     ) -> anyhow::Result<()> {
         let workload_cleanup = |workload_data: Option<WorkloadData>| async {
             if let Some(data) = workload_data {

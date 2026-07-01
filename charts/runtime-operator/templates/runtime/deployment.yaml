@@ -28,8 +28,16 @@ spec:
         {{- toYaml . | nindent 8 }}
       {{- end }}
     spec:
+      automountServiceAccountToken: {{ $top.Values.runtime.automountServiceAccountToken }}
+      securityContext:
+        {{- toYaml $top.Values.runtime.podSecurityContext | nindent 8 }}
       volumes:
         - name: oci-cache
+          emptyDir: {}
+        # wash creates its data/config/cache directories under $HOME (set to /tmp
+        # below), so the host needs a writable /tmp to run with a read-only root
+        # filesystem.
+        - name: tmp
           emptyDir: {}
         {{- if $top.Values.global.tls.enabled }}
         - name: runtime-cert
@@ -56,6 +64,11 @@ spec:
         - name: host
           image: {{ if $registry }}{{ printf "%s/%s" $registry $top.Values.runtime.image.repository }}{{ else }}{{ $top.Values.runtime.image.repository }}{{ end }}:{{ $top.Values.runtime.image.tag | default $top.Chart.AppVersion }}
           env:
+            # wash resolves its XDG data/config/cache dirs under $HOME; point it
+            # at the writable /tmp emptyDir so the host runs with a read-only root
+            # filesystem. A user-supplied runtime.env HOME (below) overrides this.
+            - name: HOME
+              value: /tmp
             - name: WASMCLOUD_HOST_IP
               valueFrom:
                 fieldRef:
@@ -64,16 +77,21 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.namespace
-            {{- /* Optional host env (appended after operator-managed vars).
-                   Standard k8s env shape — supports valueFrom secretKeyRef /
-                   configMapKeyRef. */}}
+            {{- with $top.Values.runtime.env }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
             {{- with .env }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
-          {{- /* Optional envFrom (defensive — symmetric with .env above). */}}
-          {{- with .envFrom }}
+          {{- /* Optional envFrom (chart-wide runtime.envFrom + per-host-group). */}}
+          {{- if or $top.Values.runtime.envFrom .envFrom }}
           envFrom:
+            {{- with $top.Values.runtime.envFrom }}
             {{- toYaml . | nindent 12 }}
+            {{- end }}
+            {{- with .envFrom }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
           {{- end }}
           args:
             {{- if .logLevel }}
@@ -83,13 +101,13 @@ spec:
             - "--host-name=$(WASMCLOUD_HOST_IP)"
             - "--host-group={{ .name }}"
             - "--environment=$(WASMCLOUD_HOST_ENVIRONMENT)"
-            - "--scheduler-nats-url=nats://nats.{{ $top.Release.Namespace }}.svc.cluster.local:4222"
+            - "--scheduler-nats-url={{ include "runtime-operator.schedulerNatsUrl" (dict "ctx" $top "group" .) }}"
             {{- if $top.Values.global.tls.enabled }}
             - "--scheduler-nats-tls-ca=/runtime-cert/ca.crt"
             - "--scheduler-nats-tls-cert=/runtime-cert/tls.crt"
             - "--scheduler-nats-tls-key=/runtime-cert/tls.key"
             {{- end }}
-            - "--data-nats-url=nats://nats.{{ $top.Release.Namespace }}.svc.cluster.local:4222"
+            - "--data-nats-url={{ include "runtime-operator.dataNatsUrl" (dict "ctx" $top "group" .) }}"
             {{- if $top.Values.global.tls.enabled }}
             - "--data-nats-tls-ca=/data-cert/ca.crt"
             - "--data-nats-tls-cert=/data-cert/tls.crt"
@@ -109,10 +127,23 @@ spec:
             {{- if and (.wasip3) (.wasip3.enabled) }}
             - "--wasip3"
             {{- end }}
+            {{- range .wasmProposals }}
+            - "--wasm-proposal={{ . }}"
+            {{- end }}
+            {{- /* Chart-wide runtime.extraArgs applies to every host group; per-host-group
+                   .extraArgs is appended after it. */}}
+            {{- with $top.Values.runtime.extraArgs }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+            {{- with .extraArgs }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
           imagePullPolicy: {{ $top.Values.runtime.image.pull_policy }}
           volumeMounts:
             - name: oci-cache
               mountPath: /oci-cache
+            - name: tmp
+              mountPath: /tmp
             {{- if $top.Values.global.tls.enabled }}
             - name: runtime-cert
               mountPath: /runtime-cert
@@ -132,7 +163,7 @@ spec:
             {{- with .volumeMounts }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
-          {{- with .resources }}
+          {{- with (.resources | default $top.Values.runtime.resources) }}
           resources:
             {{- toYaml . | nindent 12 }}
           {{- end }}
@@ -149,10 +180,21 @@ spec:
             {{- with .ports }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
+          {{- if and (.http) (.http.enabled) }}
+          livenessProbe:
+            tcpSocket:
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 20
+            failureThreshold: 3
+          readinessProbe:
+            tcpSocket:
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          {{- end }}
           securityContext:
-            capabilities:
-              drop:
-                - NET_RAW
+            {{- toYaml $top.Values.runtime.securityContext | nindent 12 }}
       dnsPolicy: ClusterFirst
       restartPolicy: Always
       terminationGracePeriodSeconds: 0

@@ -3,8 +3,8 @@ use std::sync::Arc;
 
 use crate::engine::ctx::{ActiveCtx, SharedCtx, extract_active_ctx};
 use crate::engine::workload::WorkloadItem;
-use crate::plugin::HostPlugin;
 use crate::plugin::WorkloadTracker;
+use crate::plugin::{HostPlugin, WitInterfaces};
 use crate::wit::{WitInterface, WitWorld};
 use async_nats::jetstream::object_store::{self, List, Object, ObjectStore};
 use bytes::Bytes;
@@ -155,9 +155,7 @@ impl<'a> bindings::wasi::blobstore::blobstore::Host for ActiveCtx<'a> {
         &mut self,
         name: ContainerName,
     ) -> wasmtime::Result<Result<Resource<ContainerData>, BlobstoreError>> {
-        let Some(plugin) = self.get_plugin::<NatsBlobstore>(PLUGIN_BLOBSTORE_ID) else {
-            return Ok(Err("blobstore plugin not available".to_string()));
-        };
+        let plugin = self.try_get_plugin::<NatsBlobstore>(PLUGIN_BLOBSTORE_ID)?;
 
         let _workload_permit = match plugin.workload_permit(&self.workload_id, &name, true).await {
             Some(token) => token,
@@ -194,9 +192,7 @@ impl<'a> bindings::wasi::blobstore::blobstore::Host for ActiveCtx<'a> {
         &mut self,
         name: ContainerName,
     ) -> wasmtime::Result<Result<Resource<ContainerData>, BlobstoreError>> {
-        let Some(plugin) = self.get_plugin::<NatsBlobstore>(PLUGIN_BLOBSTORE_ID) else {
-            return Ok(Err("blobstore plugin not available".to_string()));
-        };
+        let plugin = self.try_get_plugin::<NatsBlobstore>(PLUGIN_BLOBSTORE_ID)?;
 
         let _workload_permit = match plugin
             .workload_permit(&self.workload_id, &name, false)
@@ -229,9 +225,7 @@ impl<'a> bindings::wasi::blobstore::blobstore::Host for ActiveCtx<'a> {
         &mut self,
         name: ContainerName,
     ) -> wasmtime::Result<Result<(), BlobstoreError>> {
-        let Some(plugin) = self.get_plugin::<NatsBlobstore>(PLUGIN_BLOBSTORE_ID) else {
-            return Ok(Err("blobstore plugin not available".to_string()));
-        };
+        let plugin = self.try_get_plugin::<NatsBlobstore>(PLUGIN_BLOBSTORE_ID)?;
 
         let _workload_permit = match plugin.workload_permit(&self.workload_id, &name, true).await {
             Some(token) => token,
@@ -252,9 +246,7 @@ impl<'a> bindings::wasi::blobstore::blobstore::Host for ActiveCtx<'a> {
         &mut self,
         name: ContainerName,
     ) -> wasmtime::Result<Result<bool, BlobstoreError>> {
-        let Some(plugin) = self.get_plugin::<NatsBlobstore>(PLUGIN_BLOBSTORE_ID) else {
-            return Ok(Err("blobstore plugin not available".to_string()));
-        };
+        let plugin = self.try_get_plugin::<NatsBlobstore>(PLUGIN_BLOBSTORE_ID)?;
 
         let _workload_permit = match plugin.workload_permit(&self.workload_id, &name, true).await {
             Some(token) => token,
@@ -275,9 +267,7 @@ impl<'a> bindings::wasi::blobstore::blobstore::Host for ActiveCtx<'a> {
         src: ObjectId,
         dest: ObjectId,
     ) -> wasmtime::Result<Result<(), BlobstoreError>> {
-        let Some(plugin) = self.get_plugin::<NatsBlobstore>(PLUGIN_BLOBSTORE_ID) else {
-            return Ok(Err("blobstore plugin not available".to_string()));
-        };
+        let plugin = self.try_get_plugin::<NatsBlobstore>(PLUGIN_BLOBSTORE_ID)?;
 
         let _read_permit = match plugin
             .workload_permit(&self.workload_id, &src.container, false)
@@ -330,9 +320,7 @@ impl<'a> bindings::wasi::blobstore::blobstore::Host for ActiveCtx<'a> {
         src: ObjectId,
         dest: ObjectId,
     ) -> wasmtime::Result<Result<(), BlobstoreError>> {
-        let Some(plugin) = self.get_plugin::<NatsBlobstore>(PLUGIN_BLOBSTORE_ID) else {
-            return Ok(Err("blobstore plugin not available".to_string()));
-        };
+        let plugin = self.try_get_plugin::<NatsBlobstore>(PLUGIN_BLOBSTORE_ID)?;
 
         // requires an extra write permit on the src container to delete the object after copy
         let _write_permit = match plugin
@@ -418,9 +406,7 @@ impl<'a> bindings::wasi::blobstore::container::HostContainer for ActiveCtx<'a> {
         name: ObjectName,
         data: Resource<OutgoingValueHandle>,
     ) -> wasmtime::Result<Result<(), ContainerError>> {
-        let Some(plugin) = self.get_plugin::<NatsBlobstore>(PLUGIN_BLOBSTORE_ID) else {
-            return Ok(Err("blobstore plugin not available".to_string()));
-        };
+        let plugin = self.try_get_plugin::<NatsBlobstore>(PLUGIN_BLOBSTORE_ID)?;
 
         let container_data = self.table.get(&container).cloned()?;
         let _write_permit = match plugin
@@ -472,9 +458,7 @@ impl<'a> bindings::wasi::blobstore::container::HostContainer for ActiveCtx<'a> {
         container: Resource<ContainerData>,
         name: ObjectName,
     ) -> wasmtime::Result<Result<(), ContainerError>> {
-        let Some(plugin) = self.get_plugin::<NatsBlobstore>(PLUGIN_BLOBSTORE_ID) else {
-            return Ok(Err("blobstore plugin not available".to_string()));
-        };
+        let plugin = self.try_get_plugin::<NatsBlobstore>(PLUGIN_BLOBSTORE_ID)?;
 
         let container_data = self.table.get(&container)?;
         let _write_permit = match plugin
@@ -499,9 +483,7 @@ impl<'a> bindings::wasi::blobstore::container::HostContainer for ActiveCtx<'a> {
         container: Resource<ContainerData>,
         names: Vec<ObjectName>,
     ) -> wasmtime::Result<Result<(), ContainerError>> {
-        let Some(plugin) = self.get_plugin::<NatsBlobstore>(PLUGIN_BLOBSTORE_ID) else {
-            return Ok(Err("blobstore plugin not available".to_string()));
-        };
+        let plugin = self.try_get_plugin::<NatsBlobstore>(PLUGIN_BLOBSTORE_ID)?;
 
         let container_data = self.table.get(&container)?;
         let _write_permit = match plugin
@@ -559,9 +541,7 @@ impl<'a> bindings::wasi::blobstore::container::HostContainer for ActiveCtx<'a> {
         &mut self,
         container: Resource<ContainerData>,
     ) -> wasmtime::Result<Result<(), ContainerError>> {
-        let Some(plugin) = self.get_plugin::<NatsBlobstore>(PLUGIN_BLOBSTORE_ID) else {
-            return Ok(Err("blobstore plugin not available".to_string()));
-        };
+        let plugin = self.try_get_plugin::<NatsBlobstore>(PLUGIN_BLOBSTORE_ID)?;
 
         let container_data = self.table.get(&container)?;
         let _write_permit = match plugin
@@ -835,14 +815,11 @@ impl HostPlugin for NatsBlobstore {
     async fn on_workload_item_bind<'a>(
         &self,
         component_handle: &mut WorkloadItem<'a>,
-        interfaces: std::collections::HashSet<crate::wit::WitInterface>,
+        interfaces: WitInterfaces<'_>,
     ) -> anyhow::Result<()> {
-        let Some(_interface) = interfaces
-            .iter()
-            .find(|i| i.namespace == "wasi" && i.package == "blobstore")
-        else {
+        if !interfaces.contains("wasi", "blobstore", &[]) {
             return Ok(());
-        };
+        }
 
         tracing::debug!(
             workload_id = component_handle.workload_id(),
@@ -870,12 +847,9 @@ impl HostPlugin for NatsBlobstore {
     async fn on_workload_bind(
         &self,
         workload: &crate::engine::workload::UnresolvedWorkload,
-        host_interfaces: std::collections::HashSet<crate::wit::WitInterface>,
+        host_interfaces: WitInterfaces<'_>,
     ) -> anyhow::Result<()> {
-        let Some(interface) = host_interfaces
-            .iter()
-            .find(|i| i.namespace == "wasi" && i.package == "blobstore")
-        else {
+        let Some(interface) = host_interfaces.get("wasi", "blobstore", &[]) else {
             return Ok(());
         };
 
@@ -904,7 +878,7 @@ impl HostPlugin for NatsBlobstore {
     async fn on_workload_unbind(
         &self,
         workload_id: &str,
-        _interfaces: std::collections::HashSet<crate::wit::WitInterface>,
+        _interfaces: WitInterfaces<'_>,
     ) -> anyhow::Result<()> {
         let workload_cleanup = |workload_data: Option<WorkloadData>| async {
             if let Some(data) = workload_data {

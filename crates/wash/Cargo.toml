@@ -12,8 +12,16 @@ rust-version.workspace = true
 version.workspace = true
 
 [features]
-wasip3 = ["wash-runtime/wasip3"]
+default = ["wasi-webgpu"]
 wasi-tls = ["wash-runtime/wasi-tls"]
+# Route component-model `(implements ..)` named imports to per-import backends.
+# When enabled, `wash host`/`wash dev` additionally register the multiplexed
+# keyvalue plugin (the unnamed/default import keeps its standalone backend, so
+# normal workloads are unaffected). Needs a wasmtime build with resource-implements.
+wasm_component_model_implements = ["wash-runtime/wasm_component_model_implements"]
+# On by default. Pulls in git-only wasi-gfx deps (no crates.io release);
+# disable with `--no-default-features` for a build without the git sources.
+wasi-webgpu = ["wash-runtime/wasi-webgpu"]
 
 [lints]
 workspace = true
@@ -62,11 +70,6 @@ wasm-pkg-client = { workspace = true }
 wasm-pkg-core = { workspace = true }
 wash-runtime = { workspace = true, features = ["washlet", "oci", "wasi-config", "wasi-logging", "wasi-blobstore", "wasi-keyvalue", "wasmcloud-postgres", "wasi-otel", "wasmcloud-smtp"] }
 wit-component = { workspace = true }
-
-# Enable WebGPU support on non-Windows platforms
-# WebGPU is disabled on Windows due to dependency version conflicts with the windows crate
-[target.'cfg(not(target_os = "windows"))'.dependencies]
-wash-runtime = { workspace = true, features = ["wasi-webgpu"] }
 
 # `O_NOFOLLOW` for the secret-file-open hardening in `crate::workload`.
 # Unix-only. Windows has no portable equivalent.

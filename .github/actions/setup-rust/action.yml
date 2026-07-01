@@ -30,6 +30,10 @@ inputs:
     description: "Install Zig and cargo-zigbuild for cross-compilation"
     required: false
     default: "false"
+  wasm-component-ld-version:
+    description: "Version of standalone wasm-component-ld to install"
+    required: false
+    default: "0.5.24"
 
 runs:
   using: "composite"
@@ -102,14 +106,59 @@ runs:
       if: ${{ inputs.install-zigbuild == 'true' }}
       uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
       with:
-        version: 0.13.0
+        version: 0.16.0
 
     - name: Install cargo-zigbuild
       if: ${{ inputs.install-zigbuild == 'true' }}
-      uses: taiki-e/install-action@873c7452cadb7c034694a1282227095d93fbdf92 # v2.79.14
+      uses: taiki-e/install-action@b8cecb83565409bcc297b2df6e77f030b2a468d5 # v2.82.0
+      env:
+        # Authenticate the action's GitHub API calls so they aren't throttled
+        # by the 60/hr anonymous per-IP limit shared across hosted runners.
+        GITHUB_TOKEN: ${{ github.token }}
       with:
         tool: cargo-zigbuild
 
     - name: Install wash CLI
       if: ${{ inputs.install-wash == 'true' }}
       uses: wasmcloud/setup-wash-action@47756fa211cc82f392c57e39504f43ef46fc0b3e # v2.1.0
+
+    # The wasm32-wasip2 linker. The toolchain bundles one, but it lags the
+    # standalone crate and is too old to decode the component-model
+    # `(implements ..)` imports that wit-bindgen now emits — linking such a
+    # component fails with "decoding custom section ... invalid leading byte".
+    # Drop once a Rust release bundles wasm-component-ld >= 0.5.23.
+    - name: Install cargo-binstall
+      uses: taiki-e/install-action@b8cecb83565409bcc297b2df6e77f030b2a468d5 # v2.82.0
+      env:
+        # Authenticate the action's GitHub API calls so they aren't throttled
+        # by the 60/hr anonymous per-IP limit shared across hosted runners.
+        GITHUB_TOKEN: ${{ github.token }}
+      with:
+        tool: cargo-binstall
+    - name: Install wasm-component-ld
+      shell: bash
+      env:
+        VERSION: ${{ inputs.wasm-component-ld-version }}
+        # Authenticate cargo-binstall's GitHub API calls. Unauthenticated
+        # requests share a 60/hr per-IP limit that hosted runners blow through,
+        # returning 403. binstall then falls back to a source `cargo install`,
+        # which rejects the `--install-path` below and fails the job. The token
+        # raises the limit so the prebuilt release asset is used. `github.token`
+        # (not `secrets`) is the only token context available in a composite
+        # action; read-only access is sufficient for release-asset lookups.
+        GITHUB_TOKEN: ${{ github.token }}
+      run: |
+        set -euo pipefail
+        # rustc resolves `wasm-component-ld` from the active toolchain's own
+        # sysroot (lib/rustlib/<host>/bin), NOT from PATH, so binstalling into
+        # ~/.cargo/bin would leave the build linking with the stale bundled
+        # copy. Install directly over the bundled binary instead. `rustc` is
+        # resolved from the repo root, so a checked-in rust-toolchain.toml pins
+        # the same toolchain the build below uses. Targeting the native sysroot
+        # dir keeps this working on Windows, where passing a bash-style linker
+        # path to cargo would not.
+        bindir="$(rustc --print sysroot)/lib/rustlib/$(rustc -vV | sed -n 's/^host: //p')/bin"
+        cargo binstall --no-confirm --force \
+          --install-path "${bindir}" \
+          "wasm-component-ld@${VERSION}"
+        "${bindir}/wasm-component-ld" --version

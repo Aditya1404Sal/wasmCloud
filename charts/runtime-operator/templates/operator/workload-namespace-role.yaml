@@ -54,6 +54,27 @@ rules:
     - services/finalizers
     verbs:
     - update
+  # BettyBlocks: the precompile controller creates a Job per Artifact in the
+  # Artifact's (watched) namespace, so batch/jobs must be granted here in scoped
+  # mode too — mirrors the cluster-wide grant in clusterrole.yaml (retained in upstream merge).
+  - apiGroups:
+    - batch
+    resources:
+    - jobs
+    verbs:
+    - create
+    - delete
+    - get
+    - list
+    - patch
+    - update
+    - watch
+  - apiGroups:
+    - batch
+    resources:
+    - jobs/status
+    verbs:
+    - get
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding

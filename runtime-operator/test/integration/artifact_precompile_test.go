@@ -122,7 +122,8 @@ var _ = Describe("precompile pipeline", func() {
 
 		Eventually(func(g Gomega) {
 			var job batchv1.Job
-			g.Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: "default", Name: "precompile-" + a.Name}, &job)).To(Succeed())
+			jobKey := types.NamespacedName{Namespace: "default", Name: "precompile-" + a.Name}
+			g.Expect(k8sClient.Get(ctx, jobKey, &job)).To(Succeed())
 
 			g.Expect(job.OwnerReferences).To(ContainElement(HaveField("UID", a.UID)))
 			g.Expect(job.Spec.Template.Spec.Containers).To(HaveLen(1))
