@@ -215,6 +215,9 @@ impl CliCommand for HostCommand {
                 &data_nats_client,
             )))?
             .with_plugin(Arc::new(plugin::smtp::BettySmtp::new()))?
+            .with_plugin(Arc::new(
+                plugin::cancellation_broker::CancellationBroker::new(&data_nats_client),
+            ))?
             .with_meters(Meters::new(ctx.enable_meters()));
 
         #[cfg(feature = "wasm_component_model_implements")]

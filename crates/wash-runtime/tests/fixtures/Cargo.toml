@@ -37,6 +37,8 @@ members = [
     "ephemeral-caller-p3",
     "cancellable-producer",
     "cancellable-component",
+    "cancel-broker-worker",
+    "cancel-broker-commander",
 ]
 
 [workspace.dependencies]

@@ -66,3 +66,7 @@ world smtp {
 world cancellable-jobs {
     import wasmcloud:cancellable-jobs/control@0.1.0;
 }
+
+world cancellation-broker {
+    import betty-blocks:cancellation-broker/broker@0.2.0;
+}

@@ -53,6 +53,9 @@ pub mod wasi_otel;
 #[cfg(feature = "wasmcloud-smtp")]
 pub mod smtp;
 
+/// BettyBlocks: plan-scoped cancellation backed by NATS JetStream KV
+pub mod cancellation_broker;
+
 pub mod wasmcloud_messaging;
 
 /// Shared `(implements ..)` multiplexing core

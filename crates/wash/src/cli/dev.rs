@@ -104,6 +104,22 @@ impl CliCommand for DevCommand {
         // BettyBlocks: register the Betty SMTP host plugin (retained in upstream merge).
         host_builder = host_builder.with_plugin(Arc::new(plugin::smtp::BettySmtp::new()))?;
 
+        // Enable betty-blocks:cancellation-broker/broker for plan-scoped
+        // cancellation. Backed by NATS JetStream KV so the signal spans hosts;
+        // the guests import this interface unconditionally, so it is always
+        // registered.
+        let cancellation_broker_nats_url = dev_config
+            .cancellation_broker_nats_url
+            .as_deref()
+            .unwrap_or("nats://127.0.0.1:4222");
+        let cancellation_broker_nats_client = async_nats::connect(cancellation_broker_nats_url)
+            .await
+            .context("failed to connect to NATS for cancellation-broker plugin")?;
+        host_builder = host_builder.with_plugin(Arc::new(
+            plugin::cancellation_broker::CancellationBroker::new(&cancellation_broker_nats_client),
+        ))?;
+        debug!(url = %cancellation_broker_nats_url, "cancellation-broker plugin registered with NATS JetStream KV");
+
         // Enable wasmcloud:messaging — NATS when data_nats_url is configured,
         // otherwise the in-memory backend.
         if let Some(client) = &data_nats_client {

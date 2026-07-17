@@ -1,0 +1,15 @@
+package betty-blocks:cancellation-broker@0.2.0;
+
+interface broker {
+    /// Set a plan's cancel flag in NATS JetStream KV, keyed by `plan-id`.
+    /// `set-cancel(id, true)` cancels the plan; `set-cancel(id, false)` clears
+    /// it so the id can be (re)used for a fresh run. The commander writes
+    /// `false` at plan start and `true` on cancel. Persisting to KV means the
+    /// flag spans hosts at the edge and survives the subscribe race.
+    set-cancel: func(plan-id: string, cancelled: bool);
+
+    /// Resolve when `plan-id`'s cancel flag is (or becomes) `true`. The host
+    /// subscribes to the KV key first, then reads the current value, so a
+    /// cancel set between subscribe and read is still observed.
+    wait-cancel: async func(plan-id: string);
+}

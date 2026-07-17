@@ -151,6 +151,28 @@ pub fn http_cancellable_host_interfaces(host_header: &str) -> Vec<WitInterface> 
     ]
 }
 
+/// `betty-blocks:cancellation-broker/broker@0.2.0`, backing the plan-scoped
+/// `set-cancel` / `wait-cancel` pair.
+pub fn cancellation_broker_interface() -> WitInterface {
+    WitInterface {
+        namespace: "betty-blocks".to_string(),
+        package: "cancellation-broker".to_string(),
+        interfaces: ["broker".to_string()].into_iter().collect(),
+        version: Some(semver::Version::parse("0.2.0").unwrap()),
+        config: HashMap::new(),
+        name: None,
+    }
+}
+
+/// Interfaces for the `cancel-broker-worker` / `cancel-broker-commander`
+/// fixtures: HTTP plus the cancellation broker.
+pub fn http_cancellation_broker_host_interfaces(host_header: &str) -> Vec<WitInterface> {
+    vec![
+        http_incoming_handler_interface(host_header, None),
+        cancellation_broker_interface(),
+    ]
+}
+
 pub fn component_workload_request(
     component_name: &str,
     workload_name: &str,
@@ -303,6 +325,38 @@ pub async fn start_host_with_p3_cancellable(
             .with_http_handler(Arc::new(http_server)),
     )?
     .with_plugin(Arc::new(CancellableJobsPlugin::default()))?
+    .build()?;
+    let host = host.start().await.context("Failed to start host")?;
+    Ok((bound_addr, host))
+}
+
+/// Like `start_host_with_p3` but also registers the `CancellationBroker`
+/// plugin against `nats_url`, backing `betty-blocks:cancellation-broker/broker`.
+///
+/// Each call builds an independent host with its own NATS connection, so
+/// callers can stand up two hosts on one NATS and assert that a cancel issued
+/// on one is observed on the other.
+pub async fn start_host_with_p3_cancellation_broker(
+    addr: &str,
+    nats_url: &str,
+    // `use<>`: `impl HostApi` does not depend on `addr` and `nats_url`, so don't
+    // capture their lifetimes — callers keep the returned host alive past both.
+) -> Result<(std::net::SocketAddr, impl HostApi + use<>)> {
+    use wash_runtime::plugin::cancellation_broker::CancellationBroker;
+
+    let nats_client = async_nats::connect(nats_url)
+        .await
+        .context("failed to connect host plugin client to NATS")?;
+
+    let engine = Engine::builder().build()?;
+    let http_server = HttpServer::new(DevRouter::default(), addr.parse()?).await?;
+    let bound_addr = http_server.addr();
+    let host = with_standard_plugins(
+        HostBuilder::new()
+            .with_engine(engine)
+            .with_http_handler(Arc::new(http_server)),
+    )?
+    .with_plugin(Arc::new(CancellationBroker::new(&nats_client)))?
     .build()?;
     let host = host.start().await.context("Failed to start host")?;
     Ok((bound_addr, host))

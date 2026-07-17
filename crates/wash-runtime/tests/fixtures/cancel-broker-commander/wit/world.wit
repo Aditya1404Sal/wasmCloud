@@ -1,0 +1,11 @@
+package wasmcloud:cancel-broker-example;
+
+// The "commander" side of a plan: only ever writes the cancel flag, never waits
+// on it. Mirrors the role the broker's WIT documents — `false` at plan start,
+// `true` to cancel.
+world cancel-broker-commander {
+    import betty-blocks:cancellation-broker/broker@0.2.0;
+    import wasi:http/types@0.3.0;
+
+    export wasi:http/handler@0.3.0;
+}

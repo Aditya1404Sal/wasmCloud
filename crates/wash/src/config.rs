@@ -448,6 +448,12 @@ pub struct DevConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub wasi_keyvalue_nats_url: Option<String>,
 
+    /// NATS connection URL for the betty-blocks cancellation-broker backend
+    /// (JetStream KV). Defaults to nats://127.0.0.1:4222 when unset.
+    /// JetStream must be enabled on the server.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cancellation_broker_nats_url: Option<String>,
+
     /// Optional path for WASI blobstore filesystem storage. If not set, an in-memory store is used.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub wasi_blobstore_path: Option<PathBuf>,

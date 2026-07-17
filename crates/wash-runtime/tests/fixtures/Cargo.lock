@@ -114,6 +114,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1e748733b7cbc798e1434b6ac524f0c1ff2ab456fe201501e6497c8417a4fc33"
 
 [[package]]
+name = "cancel-broker-commander"
+version = "0.0.0"
+dependencies = [
+ "wit-bindgen 0.58.0",
+]
+
+[[package]]
+name = "cancel-broker-worker"
+version = "0.0.0"
+dependencies = [
+ "futures",
+ "wit-bindgen 0.58.0",
+]
+
+[[package]]
 name = "cancellable-component"
 version = "0.0.0"
 dependencies = [
