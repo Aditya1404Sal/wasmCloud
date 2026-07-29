@@ -82,7 +82,6 @@ async fn setup() -> Result<TestHarness> {
             components: vec![Component {
                 name: "http-blobstore-component".to_string(),
                 digest: None,
-                bytes: bytes::Bytes::from_static(HTTP_BLOBSTORE_WASM),
                 local_resources: LocalResources {
                     memory_limit_mb: 256,
                     cpu_limit: 1,
@@ -93,7 +92,9 @@ async fn setup() -> Result<TestHarness> {
                 },
                 pool_size: 1,
                 max_invocations: 100,
-                is_precompiled: false,
+                source: wash_runtime::types::Source::Compile(bytes::Bytes::from_static(
+                    HTTP_BLOBSTORE_WASM,
+                )),
             }],
             host_interfaces: vec![
                 WitInterface {

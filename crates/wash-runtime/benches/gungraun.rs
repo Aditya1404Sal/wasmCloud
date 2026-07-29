@@ -96,9 +96,10 @@ fn setup_warm(flavor: Flavor) -> Warm {
                 components: vec![Component {
                     name: format!("hello-{}.wasm", flavor.name()),
                     digest: None,
-                    bytes: bytes::Bytes::from_static(flavor.wasm()),
                     local_resources: LocalResources::default(),
-                    is_precompiled: false,
+                    source: wash_runtime::types::Source::Compile(bytes::Bytes::from_static(
+                        flavor.wasm(),
+                    )),
                     pool_size: 0,
                     max_invocations: 0,
                 }],

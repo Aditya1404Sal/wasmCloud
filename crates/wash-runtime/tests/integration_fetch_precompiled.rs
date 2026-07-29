@@ -11,54 +11,79 @@ use wash_runtime::{
     engine::Engine,
     fetch_precompiled,
     host::{HostApi, HostBuilder},
-    types::{Component, Workload, WorkloadStartRequest},
+    types::{Component, Source, Workload, WorkloadStartRequest, WorkloadState},
 };
 
 #[tokio::test]
 #[ignore = "network: requires Docker for NATS container"]
-async fn workload_starts_with_precompiled_component() -> Result<()> {
+async fn workload_starts_with_file_backed_precompiled_component() -> Result<()> {
     let (_container, nats_url) = start_nats().await?;
 
     let cwasm = precompile_minimal_component()?;
-
-    let bucket = "test-precompiled";
+    let bucket = "test-precompiled-file";
     let key = "minimal.cwasm";
     push_to_nats_bucket(&nats_url, bucket, key, &cwasm).await?;
 
+    // Resolve the URL to a host-owned file in a compiled cache dir. This writes the
+    // `.cwasm` once; the engine maps it file-backed via `deserialize_file`.
+    let cache_dir = tempfile::tempdir()?;
     let url = format!("nats://{bucket}/{key}");
-    let fetched = fetch_precompiled_via(&nats_url, &url).await?;
+    set_nats_url(&nats_url);
+    let path = fetch_precompiled::download_cwasm(&url, cache_dir.path()).await?;
+    assert!(path.exists(), "download_cwasm must write a .cwasm file");
+    assert_eq!(path.extension().and_then(|e| e.to_str()), Some("cwasm"));
 
     let engine = Engine::builder().build()?;
-    let host = HostBuilder::new().with_engine(engine.clone()).build()?;
+    let host = HostBuilder::new().with_engine(engine).build()?;
     let host = host.start().await.context("Failed to start host")?;
 
     let req = WorkloadStartRequest {
         workload_id: uuid::Uuid::new_v4().to_string(),
         workload: Workload {
             namespace: "test".to_string(),
-            name: "precompiled-workload".to_string(),
+            name: "precompiled-file-workload".to_string(),
             annotations: HashMap::new(),
             service: None,
             components: vec![Component {
                 name: "precompiled-component".to_string(),
                 digest: None,
-                bytes: fetched.into(),
                 local_resources: Default::default(),
                 max_invocations: 1,
                 pool_size: 0,
-                is_precompiled: true,
+                source: Source::PrecompiledFile(path.clone()),
             }],
             host_interfaces: vec![],
             volumes: vec![],
         },
     };
 
-    host.workload_start(req).await.context(
-        "workload_start failed — if it's a wasm validation error, \
-                    the is_precompiled flag was ignored",
-    )?;
+    // workload_start returns Ok even when a component fails to load (the failure lands
+    // in the status), so assert on the reported state.
+    let resp = host
+        .workload_start(req)
+        .await
+        .context("workload_start errored for file-backed precompiled component")?;
+    assert_eq!(
+        resp.workload_status.workload_state,
+        WorkloadState::Running,
+        "file-backed precompiled component failed to load: {}",
+        resp.workload_status.message
+    );
+
+    // The host-owned file must still be present since it backs the live mapping.
+    assert!(
+        path.exists(),
+        "the .cwasm mapping file must persist while in use"
+    );
 
     Ok(())
+}
+
+fn set_nats_url(nats_url: &str) {
+    #[allow(unsafe_code)]
+    unsafe {
+        std::env::set_var("NATS_URL", nats_url);
+    }
 }
 
 async fn start_nats() -> Result<(ContainerAsync<GenericImage>, String)> {
@@ -107,12 +132,4 @@ async fn push_to_nats_bucket(nats_url: &str, bucket: &str, key: &str, bytes: &[u
         .await
         .map_err(|e| anyhow::anyhow!("failed to put object '{key}' in '{bucket}': {e}"))?;
     Ok(())
-}
-
-async fn fetch_precompiled_via(nats_url: &str, url: &str) -> Result<Vec<u8>> {
-    #[allow(unsafe_code)]
-    unsafe {
-        std::env::set_var("NATS_URL", nats_url);
-    }
-    fetch_precompiled::fetch(url).await
 }

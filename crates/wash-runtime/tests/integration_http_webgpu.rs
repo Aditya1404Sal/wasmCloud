@@ -72,7 +72,6 @@ async fn test_http_webgpu_integration() -> Result<()> {
             components: vec![Component {
                 name: "http-webgpu-component".to_string(),
                 digest: None,
-                bytes: bytes::Bytes::from_static(HTTP_WEBGPU_WASM),
                 local_resources: LocalResources {
                     memory_limit_mb: 256,
                     cpu_limit: 1,
@@ -81,7 +80,9 @@ async fn test_http_webgpu_integration() -> Result<()> {
                     volume_mounts: vec![],
                     allowed_hosts: Default::default(),
                 },
-                is_precompiled: false,
+                source: wash_runtime::types::Source::Compile(bytes::Bytes::from_static(
+                    HTTP_WEBGPU_WASM,
+                )),
                 pool_size: 1,
                 max_invocations: 100,
             }],

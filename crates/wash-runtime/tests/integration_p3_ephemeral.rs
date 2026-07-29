@@ -55,18 +55,20 @@ async fn test_p3_plain_value_async_call_uses_ephemeral_store() -> Result<()> {
                 Component {
                     name: "ephemeral-caller".to_string(),
                     digest: None,
-                    bytes: bytes::Bytes::from_static(EPHEMERAL_CALLER_P3_WASM),
                     local_resources: LocalResources::default(),
-                    is_precompiled: false,
+                    source: wash_runtime::types::Source::Compile(bytes::Bytes::from_static(
+                        EPHEMERAL_CALLER_P3_WASM,
+                    )),
                     pool_size: 1,
                     max_invocations: 100,
                 },
                 Component {
                     name: "ephemeral-callee".to_string(),
                     digest: None,
-                    bytes: bytes::Bytes::from_static(EPHEMERAL_CALLEE_P3_WASM),
                     local_resources: LocalResources::default(),
-                    is_precompiled: false,
+                    source: wash_runtime::types::Source::Compile(bytes::Bytes::from_static(
+                        EPHEMERAL_CALLEE_P3_WASM,
+                    )),
                     pool_size: 1,
                     max_invocations: 100,
                 },

@@ -95,9 +95,10 @@ async fn implements_imports_route_to_isolated_backends() -> Result<()> {
             components: vec![Component {
                 name: "keyvalue-implements.wasm".to_string(),
                 digest: None,
-                bytes: bytes::Bytes::from_static(KEYVALUE_IMPLEMENTS_WASM),
                 local_resources: LocalResources::default(),
-                is_precompiled: false,
+                source: wash_runtime::types::Source::Compile(bytes::Bytes::from_static(
+                    KEYVALUE_IMPLEMENTS_WASM,
+                )),
                 pool_size: 1,
                 max_invocations: 100,
             }],

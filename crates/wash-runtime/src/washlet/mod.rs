@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::fetch_precompiled::fetch;
+use crate::fetch_precompiled::download_cwasm;
 use crate::host::{Host, HostApi, HostConfig};
 use crate::oci::{self, OciConfig};
 use crate::plugin::HostPlugin;
@@ -38,6 +38,8 @@ pub struct ClusterHostBuilder {
     heartbeat_interval: Option<Duration>,
     cleanup_interval: Option<Duration>,
     cleanup_age: Option<Duration>,
+    compiled_cleanup_interval: Option<Duration>,
+    compiled_cleanup_grace: Option<Duration>,
     host_config: Option<HostConfig>,
 }
 
@@ -97,6 +99,19 @@ impl ClusterHostBuilder {
         self
     }
 
+    /// Sets how often the compiled-cache (`.cwasm`) sweep runs.
+    pub fn with_compiled_cleanup_interval(mut self, interval: Duration) -> Self {
+        self.compiled_cleanup_interval = Some(interval);
+        self
+    }
+
+    /// Sets the grace period: the minimum age an unreferenced `.cwasm` file must
+    /// reach before the sweep may delete it, guarding the write-then-start race.
+    pub fn with_compiled_cleanup_grace(mut self, grace: Duration) -> Self {
+        self.compiled_cleanup_grace = Some(grace);
+        self
+    }
+
     pub fn with_engine(mut self, engine: crate::engine::Engine) -> Self {
         self.host_builder = self.host_builder.with_engine(engine);
         self
@@ -147,6 +162,12 @@ impl ClusterHostBuilder {
             heartbeat_interval,
             cleanup_interval: self.cleanup_interval.unwrap_or(Duration::from_secs(300)),
             cleanup_age: self.cleanup_age.unwrap_or(Duration::from_secs(3600)),
+            compiled_cleanup_interval: self
+                .compiled_cleanup_interval
+                .unwrap_or(Duration::from_secs(300)),
+            compiled_cleanup_grace: self
+                .compiled_cleanup_grace
+                .unwrap_or(Duration::from_secs(3600)),
         })
     }
 }
@@ -157,6 +178,8 @@ pub struct ClusterHost {
     heartbeat_interval: Duration,
     cleanup_interval: Duration,
     cleanup_age: Duration,
+    compiled_cleanup_interval: Duration,
+    compiled_cleanup_grace: Duration,
 }
 
 impl ClusterHost {
@@ -178,6 +201,8 @@ pub async fn run_cluster_host(
 
     let heartbeat_interval = cluster_host.heartbeat_interval;
     let cleanup_interval = cluster_host.cleanup_interval;
+    let compiled_cleanup_interval = cluster_host.compiled_cleanup_interval;
+    let compiled_cleanup_grace = cluster_host.compiled_cleanup_grace;
     let host_id = host.id().to_string();
     let host = host.clone();
 
@@ -204,6 +229,16 @@ pub async fn run_cluster_host(
 
         let mut oci_cleanup_timer = tokio::time::interval(cleanup_interval);
 
+        // Delay the first sweep a full interval. `interval` fires its first tick
+        // immediately, but at startup no workloads have registered yet, so the in-use
+        // set is empty therefore an eager sweep would treat live cache files (and files for
+        // workloads about to restart) as orphans and delete them. Waiting one interval
+        // lets restarted workloads claim their `.cwasm` files first.
+        let mut compiled_cleanup_timer = tokio::time::interval_at(
+            tokio::time::Instant::now() + compiled_cleanup_interval,
+            compiled_cleanup_interval,
+        );
+
         loop {
             tokio::select! {
                 // Shutdown signal
@@ -217,6 +252,10 @@ pub async fn run_cluster_host(
                     let Err(e) = oci::cleanup_cache(cache_dir, cluster_host.cleanup_age).await {
                         error!("error during OCI cache cleanup: {e}");
                     }
+                }
+                // cwasm cache cleanup
+                _ = compiled_cleanup_timer.tick() => {
+                    host.sweep_unused_cwasm(compiled_cleanup_grace).await;
                 }
                 // Send heartbeat
                 _ = heartbeat_timer.tick() => {
@@ -420,22 +459,43 @@ async fn workload_start(
                     url = %component.precompiled_url,
                     "using precompiled component"
                 );
-                let bytes = match fetch(&component.precompiled_url).await {
-                    Ok(b) => b,
-                    Err(e) => {
+                let source = match config.compiled_cache_dir.as_deref() {
+                    Some(dir) => match download_cwasm(&component.precompiled_url, dir).await {
+                        Ok(path) => crate::types::Source::PrecompiledFile(path),
+                        Err(e) => {
+                            tracing::error!(
+                                component = %component.name,
+                                url = %component.precompiled_url,
+                                error = %e,
+                                "failed to resolve precompiled component"
+                            );
+                            return Ok(types::v2::WorkloadStartResponse {
+                                workload_status: Some(types::v2::WorkloadStatus {
+                                    workload_id: workload_id.clone(),
+                                    workload_state: types::v2::WorkloadState::Error.into(),
+                                    message: format!(
+                                        "failed to fetch precompiled component from {}: {}",
+                                        component.precompiled_url, e
+                                    ),
+                                }),
+                            });
+                        }
+                    },
+                    None => {
                         tracing::error!(
                             component = %component.name,
                             url = %component.precompiled_url,
-                            error = %e,
-                            "failed to fetch precompiled component"
+                            "precompiled component requires a compiled cache dir, but none is \
+                             configured; refusing to load it into anonymous memory"
                         );
                         return Ok(types::v2::WorkloadStartResponse {
                             workload_status: Some(types::v2::WorkloadStatus {
                                 workload_id: workload_id.clone(),
                                 workload_state: types::v2::WorkloadState::Error.into(),
                                 message: format!(
-                                    "failed to fetch precompiled component from {}: {}",
-                                    component.precompiled_url, e
+                                    "precompiled component {} requires a compiled cache dir; \
+                                     none is configured",
+                                    component.name
                                 ),
                             }),
                         });
@@ -463,12 +523,11 @@ async fn workload_start(
 
                 pulled_components.push(crate::types::Component {
                     name: component.name.clone(),
-                    bytes: bytes.into(),
                     digest: None,
                     local_resources,
                     pool_size: component.pool_size,
                     max_invocations: component.max_invocations,
-                    is_precompiled: true,
+                    source,
                 })
             } else {
                 let mut oci_config =
@@ -517,12 +576,11 @@ async fn workload_start(
 
                 pulled_components.push(crate::types::Component {
                     name: component.name.clone(),
-                    bytes: bytes.into(),
                     digest: Some(digest),
                     local_resources,
                     pool_size: component.pool_size,
                     max_invocations: component.max_invocations,
-                    is_precompiled: false,
+                    source: crate::types::Source::Compile(bytes.into()),
                 })
             }
         }

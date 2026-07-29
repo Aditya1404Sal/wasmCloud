@@ -46,9 +46,8 @@ fn component(name: &str, bytes: &'static [u8]) -> Component {
     Component {
         name: name.to_string(),
         digest: None,
-        bytes: bytes::Bytes::from_static(bytes),
         local_resources: LocalResources::default(),
-        is_precompiled: false,
+        source: wash_runtime::types::Source::Compile(bytes::Bytes::from_static(bytes)),
         pool_size: 1,
         max_invocations: 100,
     }

@@ -83,7 +83,7 @@ semver = { workspace = true }
 sysinfo = { workspace = true }
 uuid = { workspace = true, features = ["v4"] }
 tempfile = { workspace = true }
-tokio = { workspace = true, features = ["sync", "net", "macros"] }
+tokio = { workspace = true, features = ["sync", "net", "macros", "fs"] }
 tracing = { workspace = true }
 wasmtime = { workspace = true, features = ["anyhow", "component-model", "component-model-async", "cranelift", "pooling-allocator", "gc", "gc-null", "threads"] }
 wasmtime-wasi = { workspace = true, features = ["p3"] }

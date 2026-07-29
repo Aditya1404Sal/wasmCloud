@@ -15,7 +15,7 @@
 //!   [`EmptyDirVolume`], [`HostPathVolume`]
 
 use bytes::Bytes;
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, path::PathBuf, sync::Arc};
 
 use crate::host::allowed_hosts::AllowedHost;
 use crate::wit::WitInterface;
@@ -57,17 +57,34 @@ pub struct Service {
     pub max_restarts: u64,
 }
 
+/// Where a component's code comes from and how it reaches the engine.
+///
+/// Carries the code payload itself, so there is no need for a separate `bytes` field
+/// A precompiled component is always backed by a host-owned file
+#[derive(Debug, Clone, PartialEq)]
+pub enum Source {
+    /// A wasm component to compile.
+    Compile(Bytes),
+    /// A precompiled `.cwasm` in a host-owned file, mapped file-backed via
+    /// `Component::deserialize_file`. Set by the washlet once the precompiled URL is
+    /// resolved into the cache dir.
+    PrecompiledFile(PathBuf),
+}
+
 /// A WebAssembly component that can be executed as part of a workload.
 /// Components can be pooled for concurrent execution and have invocation limits.
-#[derive(Debug, Default, Clone, PartialEq)]
+///
+/// Note : No `Default` because a component with no code source i pretty meaningless, so every construction
+/// must definitively state where its code comes from ([`Source`]).
+#[derive(Debug, Clone, PartialEq)]
 pub struct Component {
     pub name: String,
-    pub bytes: Bytes,
     pub digest: Option<String>,
     pub local_resources: LocalResources,
     pub pool_size: i32,
     pub max_invocations: i32,
-    pub is_precompiled: bool,
+    /// Where the component's code comes from and how it reaches the engine.
+    pub source: Source,
 }
 
 /// Resource limits and configuration for a component or service.

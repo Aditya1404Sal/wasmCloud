@@ -36,7 +36,6 @@ fn create_workload_request(name: &str, host_header: &str) -> WorkloadStartReques
             components: vec![Component {
                 name: "smtp-demo-component".to_string(),
                 digest: None,
-                bytes: bytes::Bytes::from_static(SMTP_DEMO_WASM),
                 local_resources: LocalResources {
                     memory_limit_mb: 256,
                     cpu_limit: 1,
@@ -49,7 +48,9 @@ fn create_workload_request(name: &str, host_header: &str) -> WorkloadStartReques
                 },
                 pool_size: 1,
                 max_invocations: 100,
-                is_precompiled: false,
+                source: wash_runtime::types::Source::Compile(bytes::Bytes::from_static(
+                    SMTP_DEMO_WASM,
+                )),
             }],
             host_interfaces: vec![
                 WitInterface {

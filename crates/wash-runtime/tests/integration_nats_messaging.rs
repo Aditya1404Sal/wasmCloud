@@ -111,7 +111,6 @@ async fn setup() -> Result<TestHarness> {
             components: vec![Component {
                 name: "messaging-handler".to_string(),
                 digest: None,
-                bytes: bytes::Bytes::from_static(MESSAGING_ECHO_WASM),
                 local_resources: LocalResources {
                     memory_limit_mb: 256,
                     cpu_limit: 1,
@@ -120,7 +119,9 @@ async fn setup() -> Result<TestHarness> {
                     volume_mounts: vec![],
                     allowed_hosts: Default::default(),
                 },
-                is_precompiled: false,
+                source: wash_runtime::types::Source::Compile(bytes::Bytes::from_static(
+                    MESSAGING_ECHO_WASM,
+                )),
                 pool_size: 1,
                 max_invocations: 100,
             }],

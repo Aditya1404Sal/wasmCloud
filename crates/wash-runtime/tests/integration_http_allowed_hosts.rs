@@ -137,7 +137,6 @@ fn allowed_hosts_workload(allowed_hosts: Vec<String>) -> WorkloadStartRequest {
             components: vec![Component {
                 name: "http-allowed-hosts.wasm".to_string(),
                 digest: None,
-                bytes: bytes::Bytes::from_static(HTTP_ALLOWED_HOSTS_WASM),
                 local_resources: LocalResources {
                     memory_limit_mb: 128,
                     cpu_limit: 1,
@@ -148,7 +147,9 @@ fn allowed_hosts_workload(allowed_hosts: Vec<String>) -> WorkloadStartRequest {
                 },
                 pool_size: 1,
                 max_invocations: 100,
-                is_precompiled: false,
+                source: wash_runtime::types::Source::Compile(bytes::Bytes::from_static(
+                    HTTP_ALLOWED_HOSTS_WASM,
+                )),
             }],
             host_interfaces: vec![WitInterface {
                 namespace: "wasi".to_string(),

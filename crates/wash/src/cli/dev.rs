@@ -519,12 +519,11 @@ fn build_workload(
     } else {
         components.push(Component {
             name: "wash-dev-component".to_string(),
-            bytes,
             digest: None,
             local_resources: local_resources_for(resolved_workload),
             pool_size: -1,
             max_invocations: -1,
-            is_precompiled: false,
+            source: wash_runtime::types::Source::Compile(bytes),
         });
 
         if let Some(service_bytes) = service_file_bytes {
@@ -540,12 +539,11 @@ fn build_workload(
     for sidecar in sidecars {
         components.push(Component {
             name: sidecar.name,
-            bytes: sidecar.bytes,
+            source: wash_runtime::types::Source::Compile(sidecar.bytes),
             digest: None,
             local_resources: local_resources_for(&sidecar.workload),
             pool_size: -1,
             max_invocations: -1,
-            ..Default::default()
         });
     }
 

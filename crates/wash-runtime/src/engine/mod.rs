@@ -53,10 +53,13 @@ use crate::engine::ctx::SharedCtx;
 #[cfg(feature = "wasi-tls")]
 use crate::engine::ctx::SharedTlsProvider;
 use crate::engine::workload::{UnresolvedWorkload, WorkloadComponent, WorkloadService};
-use crate::types::{EmptyDirVolume, HostPathVolume, VolumeType, Workload};
+use crate::types::{EmptyDirVolume, HostPathVolume, Source, VolumeType, Workload};
 use std::env;
 use std::str::FromStr;
-use std::{path::PathBuf, sync::Arc};
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 use wasmtime_wasi::WasiView;
 
 /// Add all WASI interfaces to the linker, using upstream for non-socket interfaces
@@ -234,9 +237,8 @@ pub struct Engine {
     pub(crate) inner: wasmtime::Engine,
     pub(crate) cache: Cache<CacheKey, CacheValue>,
     // BettyBlocks: compiled-component `.cwasm` mmap cache (retained in upstream merge).
-    /// Optional directory for storing compiled component artifacts (.cwasm files).
-    /// When set, compiled components are serialized to disk and loaded via file-backed
-    /// mmap, allowing the OS to page compiled code in/out instead of pinning it in RAM.
+    /// Optional directory for caching compiled components as `.cwasm` files, loaded
+    /// file-backed (see `persist_and_reload` for why that matters).
     pub(crate) compiled_cache_dir: Option<PathBuf>,
     /// TLS provider override for `wasi:tls` client connections.
     #[cfg(feature = "wasi-tls")]
@@ -412,9 +414,13 @@ impl Engine {
         validated_volumes: &std::collections::HashMap<String, PathBuf>,
         loopback: Arc<std::sync::Mutex<loopback::Network>>,
     ) -> anyhow::Result<WorkloadService> {
-        // Create a wasmtime component from the bytes
+        // A service is always OCI-compiled, and the compile path writes its `.cwasm` to
+        // the cache dir (when one is set) exactly like a component's — so it needs an
+        // `artifact_key` (from the digest) to keep the sweep from reclaiming that file
+        // out from under the running service.
+        let artifact_key = self.oci_artifact_key(service.digest.as_deref());
         let wasmtime_component = self
-            .load_component_bytes(service.bytes, service.digest)
+            .load_component_bytes(&service.bytes, service.digest.as_ref())
             .context("failed to create component from bytes")?;
 
         // Create a linker for this component
@@ -455,6 +461,7 @@ impl Engine {
             service.local_resources,
             service.max_restarts,
             loopback,
+            artifact_key,
         );
 
         let world = service.world();
@@ -472,10 +479,8 @@ impl Engine {
 
     /// Load a WebAssembly component from raw bytes or yields a previously compiled one.
     ///
-    /// When a `compiled_cache_dir` is configured on the engine, compiled components are
-    /// stored as `.cwasm` files on disk and loaded via file-backed mmap. This means the
-    /// compiled native code is backed by a file rather than anonymous memory, allowing the
-    /// OS kernel to page it in/out on demand and reducing resident memory usage.
+    /// When a `compiled_cache_dir` is configured, the compiled component is cached as a
+    /// `.cwasm` file and loaded file-backed (see `persist_and_reload`).
     #[instrument(name = "load_component_bytes", skip_all, fields(digest = %digest.as_ref().map(|d| d.as_ref()).unwrap_or("none")))]
     fn load_component_bytes(
         &self,
@@ -514,12 +519,24 @@ impl Engine {
         }
     }
 
+    /// Load a precompiled component by mmapping its host-owned `.cwasm` file, so its code
+    /// is file-backed — the precompiled counterpart to the compile path's
+    /// `persist_and_reload`, which explains why that matters.
     #[allow(unsafe_code)]
-    #[instrument(name = "load_precompiled_bytes", skip_all)]
-    fn load_precompiled_bytes(&self, bytes: impl AsRef<[u8]>) -> anyhow::Result<Component> {
-        unsafe { Component::deserialize(&self.inner, bytes.as_ref()) }
+    #[instrument(name = "load_precompiled_file", skip_all, fields(path = %path.display()))]
+    fn load_precompiled_file(&self, path: &Path) -> anyhow::Result<Component> {
+        // SAFETY: same behaviour as `Component::deserialize` the file must have been
+        // produced by a compatible wasmtime `serialize`/`precompile`. The washlet
+        // writes it into the host-owned compiled cache dir, so no other process can
+        // rewrite it underneath a live mapping.
+        unsafe { Component::deserialize_file(&self.inner, path) }
             .map_err(anyhow::Error::from)
-            .context("failed to deserialize precompiled component bytes")
+            .with_context(|| {
+                format!(
+                    "failed to deserialize precompiled component file {}",
+                    path.display()
+                )
+            })
     }
 
     fn load_or_compile(
@@ -624,6 +641,23 @@ impl Engine {
         digest.replace(['/', ':', '@'], "-")
     }
 
+    /// The compiled-cache `artifact_key` (a `.cwasm` file stem) for an OCI-compiled
+    /// component or service — the sanitized digest, but only when a compiled cache
+    /// dir is configured so a file actually exists on disk to be swept. The stem
+    /// matches the filename [`load_or_compile`](Self::load_or_compile) writes.
+    fn oci_artifact_key(&self, digest: Option<&str>) -> Option<Arc<str>> {
+        match (self.compiled_cache_dir.as_ref(), digest) {
+            (Some(_), Some(digest)) => Some(Arc::from(Self::sanitize_digest(digest).as_str())),
+            _ => None,
+        }
+    }
+
+    /// The compiled-cache `artifact_key` for a precompiled component backed by a
+    /// host-owned file: the file stem, which the washlet derives from the URL hash.
+    fn artifact_key_from_path(path: &Path) -> Option<Arc<str>> {
+        path.file_stem().and_then(|s| s.to_str()).map(Arc::from)
+    }
+
     /// Initialize a component that is a part of a workload, add wasi@0.2 interfaces (and
     /// wasi:http if the `http` feature is enabled) to the linker.
     #[instrument(name = "initialize_workload_component", skip_all, fields(component.name = %component.name))]
@@ -636,12 +670,20 @@ impl Engine {
         validated_volumes: &std::collections::HashMap<String, PathBuf>,
         loopback: Arc<std::sync::Mutex<loopback::Network>>,
     ) -> anyhow::Result<WorkloadComponent> {
-        // Create a wasmtime component — deserialize if precompiled, else compile from wasm.
-        let wasmtime_component = if component.is_precompiled {
-            self.load_precompiled_bytes(component.bytes)?
-        } else {
-            self.load_component_bytes(component.bytes, component.digest)
-                .context("failed to create component from bytes")?
+        // Build the wasmtime component from its `Source` (deserialize a precompiled file,
+        // or compile from wasm) and derive the `artifact_key` (the `.cwasm` file stem) so
+        // the sweep keeps the on-disk file this running component maps from alive.
+        let (wasmtime_component, artifact_key) = match &component.source {
+            Source::PrecompiledFile(path) => (
+                self.load_precompiled_file(path)?,
+                Self::artifact_key_from_path(path),
+            ),
+            Source::Compile(bytes) => {
+                let compiled = self
+                    .load_component_bytes(bytes, component.digest.as_ref())
+                    .context("failed to create component from bytes")?;
+                (compiled, self.oci_artifact_key(component.digest.as_deref()))
+            }
         };
 
         // Create a linker for this component
@@ -683,6 +725,7 @@ impl Engine {
             component_volume_mounts,
             component.local_resources,
             loopback,
+            artifact_key,
             // TODO: implement pooling and instance limits
             // component.pool_size,
             // component.max_invocations,
@@ -929,14 +972,10 @@ impl EngineBuilder {
     }
 
     // BettyBlocks: compiled_cache_dir builder method (retained in upstream merge).
-    /// Sets a directory for storing compiled component artifacts on disk.
+    /// Sets the directory for caching compiled components as `.cwasm` files.
     ///
-    /// When configured, compiled components are serialized as `.cwasm` files and
-    /// loaded via file-backed mmap (`Component::deserialize_file`). This allows the
-    /// OS to page compiled code in and out of RAM on demand, significantly reducing
-    /// resident memory usage compared to anonymous mmap.
-    ///
-    /// The directory will be created automatically if it does not exist.
+    /// With it set, compiled code is loaded file-backed so the OS can reclaim it under
+    /// memory pressure. Created automatically if it does not exist.
     pub fn with_compiled_cache_dir(mut self, dir: impl Into<PathBuf>) -> Self {
         self.compiled_cache_dir = Some(dir.into());
         self

@@ -63,18 +63,20 @@ async fn test_p3_cross_component_stream_to_http() -> Result<()> {
                 Component {
                     name: "stream-consumer".to_string(),
                     digest: None,
-                    bytes: bytes::Bytes::from_static(STREAM_CONSUMER_P3_WASM),
                     local_resources: LocalResources::default(),
-                    is_precompiled: false,
+                    source: wash_runtime::types::Source::Compile(bytes::Bytes::from_static(
+                        STREAM_CONSUMER_P3_WASM,
+                    )),
                     pool_size: 1,
                     max_invocations: 100,
                 },
                 Component {
                     name: "stream-producer".to_string(),
                     digest: None,
-                    bytes: bytes::Bytes::from_static(STREAM_PRODUCER_P3_WASM),
                     local_resources: LocalResources::default(),
-                    is_precompiled: false,
+                    source: wash_runtime::types::Source::Compile(bytes::Bytes::from_static(
+                        STREAM_PRODUCER_P3_WASM,
+                    )),
                     pool_size: 1,
                     max_invocations: 100,
                 },
@@ -144,9 +146,10 @@ async fn test_p3_incoming_handler_streams_incrementally() -> Result<()> {
             components: vec![Component {
                 name: "stream-pacer".to_string(),
                 digest: None,
-                bytes: bytes::Bytes::from_static(STREAM_PACER_P3_WASM),
                 local_resources: LocalResources::default(),
-                is_precompiled: false,
+                source: wash_runtime::types::Source::Compile(bytes::Bytes::from_static(
+                    STREAM_PACER_P3_WASM,
+                )),
                 pool_size: 1,
                 max_invocations: 100,
             }],
@@ -262,18 +265,20 @@ async fn test_p3_cross_component_stream_streams_incrementally() -> Result<()> {
                 Component {
                     name: "stream-consumer".to_string(),
                     digest: None,
-                    bytes: bytes::Bytes::from_static(STREAM_CONSUMER_P3_WASM),
                     local_resources: LocalResources::default(),
-                    is_precompiled: false,
+                    source: wash_runtime::types::Source::Compile(bytes::Bytes::from_static(
+                        STREAM_CONSUMER_P3_WASM,
+                    )),
                     pool_size: 1,
                     max_invocations: 100,
                 },
                 Component {
                     name: "stream-producer".to_string(),
                     digest: None,
-                    bytes: bytes::Bytes::from_static(STREAM_PRODUCER_P3_WASM),
                     local_resources: LocalResources::default(),
-                    is_precompiled: false,
+                    source: wash_runtime::types::Source::Compile(bytes::Bytes::from_static(
+                        STREAM_PRODUCER_P3_WASM,
+                    )),
                     pool_size: 1,
                     max_invocations: 100,
                 },

@@ -42,7 +42,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -565,6 +565,139 @@ impl Host {
 
         Ok(resolved_workload)
     }
+
+    /// The `.cwasm` artifact keys currently kept alive by running workloads — the sweep's
+    /// "in use" mark set. Derived fresh from the live workload map on every call rather
+    /// than a maintained refcount, so it can't drift out of sync on a crash or a partial
+    /// start.
+    pub(crate) async fn in_use_artifact_keys(&self) -> HashSet<Arc<str>> {
+        let mut keys = HashSet::new();
+        let workloads = self.workloads.read().await;
+        for workload in workloads.values() {
+            if let HostWorkload::Running(workload) = workload {
+                keys.extend(workload.artifact_keys().await);
+            }
+        }
+        keys
+    }
+
+    /// Free disk by deleting `.cwasm` files that no running workload uses anymore.
+    ///
+    /// "In use" is recomputed from the live running workloads on every call (not a kept
+    /// counter, which would drift if the host crashed mid-start), so a file lives
+    /// exactly as long as something running is mapped from it. Two guards stop it from
+    /// deleting a file that's still needed:
+    /// - `grace`: files younger than this are skipped, since a workload may have just
+    ///   downloaded one and not reached `Running` yet (the write-then-start race).
+    /// - the in-memory (moka) compile cache is ignored on purpose — moka dropping a
+    ///   `Component` doesn't mean the file is unmapped, so deletion follows only what's
+    ///   actually running.
+    ///
+    /// No-op when the host has no compiled cache dir. This is the host-local twin of the
+    /// operator's `PrecompileGC` (`artifact_gc.go`), which does the same over the shared
+    /// NATS store.
+    pub(crate) async fn sweep_unused_cwasm(&self, grace: Duration) {
+        let Some(cache_dir) = self.config.compiled_cache_dir.as_deref() else {
+            return;
+        };
+        let in_use = self.in_use_artifact_keys().await;
+        let (scanned, deleted, within_grace) =
+            sweep_unused_cwasm_dir(cache_dir, &in_use, grace).await;
+        debug!(
+            dir = %cache_dir.display(),
+            scanned,
+            in_use = in_use.len(),
+            deleted,
+            within_grace,
+            "cwasm sweep complete"
+        );
+    }
+}
+
+/// Walk `cache_dir`, deleting `.cwasm` files whose stem is not in `in_use` and that are
+/// older than `grace`. Returns `(scanned, deleted, within_grace)`. Split out from
+/// [`Host::sweep_unused_cwasm`] so the in-use mark set can be supplied directly in
+/// tests without standing up a full host + workload.
+async fn sweep_unused_cwasm_dir(
+    cache_dir: &Path,
+    in_use: &HashSet<Arc<str>>,
+    grace: Duration,
+) -> (u64, u64, u64) {
+    let mut dir_entries = match tokio::fs::read_dir(cache_dir).await {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return (0, 0, 0),
+        Err(e) => {
+            warn!(dir = %cache_dir.display(), err = %e, "failed to read compiled cache dir for sweep");
+            return (0, 0, 0);
+        }
+    };
+
+    let (mut scanned, mut deleted, mut within_grace) = (0u64, 0u64, 0u64);
+    loop {
+        let entry = match dir_entries.next_entry().await {
+            Ok(Some(entry)) => entry,
+            Ok(None) => break,
+            Err(e) => {
+                warn!(err = %e, "failed to read compiled cache entry during sweep");
+                break;
+            }
+        };
+        let path = entry.path();
+        let ext = path.extension().and_then(|e| e.to_str());
+
+        // Stale `.tmp` files are crash leftovers from an interrupted atomic write
+        // (temp-then-rename in `download_cwasm`); they are never valid, so drop them
+        // once past the grace window — a fresh one may be an in-flight write.
+        if ext == Some("tmp") {
+            if file_older_than(&entry, grace).await {
+                match tokio::fs::remove_file(&path).await {
+                    Ok(()) => debug!(path = %path.display(), "reaped stale temp file"),
+                    Err(e) => {
+                        warn!(path = %path.display(), err = %e, "failed to delete stale temp file")
+                    }
+                }
+            }
+            continue;
+        }
+
+        // Only sweep `.cwasm` files; leave any other files untouched.
+        if ext != Some("cwasm") {
+            continue;
+        }
+        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        scanned += 1;
+        if in_use.contains(stem) {
+            continue;
+        }
+        // Not in use — only delete once it has aged past the grace window.
+        if !file_older_than(&entry, grace).await {
+            within_grace += 1;
+            continue;
+        }
+        match tokio::fs::remove_file(&path).await {
+            Ok(()) => {
+                deleted += 1;
+                // Irreversible, so keep deletions at info for the audit trail.
+                info!(path = %path.display(), "swept orphaned compiled cache file");
+            }
+            Err(e) => {
+                warn!(path = %path.display(), err = %e, "failed to delete orphaned compiled cache file");
+            }
+        }
+    }
+    (scanned, deleted, within_grace)
+}
+
+/// Whether `entry`'s last-modified time is more than `grace` in the past. Returns
+/// `false` when the age can't be determined, so a file we can't reason about is kept
+/// rather than deleted — safer for one that may back a live mapping.
+async fn file_older_than(entry: &tokio::fs::DirEntry, grace: Duration) -> bool {
+    match entry.metadata().await.and_then(|m| m.modified()) {
+        Ok(modified) => modified.elapsed().map(|age| age > grace).unwrap_or(false),
+        Err(_) => false,
+    }
 }
 
 impl HostApi for Host {
@@ -802,9 +935,7 @@ pub struct HostConfig {
     pub allow_oci_insecure: bool,
     pub oci_pull_timeout: Option<Duration>,
     pub oci_cache_dir: Option<PathBuf>,
-    /// Directory for storing compiled component artifacts (.cwasm files).
-    /// When set, compiled components are loaded via file-backed mmap, allowing the OS
-    /// to page compiled code in/out of RAM on demand instead of pinning it in memory.
+    /// Directory for caching compiled components as `.cwasm` files, loaded file-backed.
     /// See `FILE_BACKED_MMAP_COMPILED_CACHE.md` for details.
     pub compiled_cache_dir: Option<PathBuf>,
 }
@@ -1022,6 +1153,132 @@ mod tests {
     use super::*;
     use crate::types::Component;
 
+    /// Minimal empty component: magic `\0asm` + component version + layer. Enough to
+    /// build a `WorkloadComponent`/`WorkloadService` we never instantiate.
+    fn empty_component() -> wasmtime::component::Component {
+        let engine = wasmtime::Engine::default();
+        wasmtime::component::Component::new(
+            &engine,
+            [0x00, 0x61, 0x73, 0x6d, 0x0d, 0x00, 0x01, 0x00],
+        )
+        .unwrap()
+    }
+
+    fn keyed_component(
+        name: &str,
+        key: Option<&str>,
+    ) -> crate::engine::workload::WorkloadComponent {
+        let engine = wasmtime::Engine::default();
+        crate::engine::workload::WorkloadComponent::new(
+            "w",
+            "n",
+            "ns",
+            name,
+            empty_component(),
+            wasmtime::component::Linker::new(&engine),
+            Vec::new(),
+            crate::types::LocalResources::default(),
+            Arc::default(),
+            key.map(Arc::<str>::from),
+        )
+    }
+
+    fn keyed_service(key: Option<&str>) -> crate::engine::workload::WorkloadService {
+        let engine = wasmtime::Engine::default();
+        crate::engine::workload::WorkloadService::new(
+            "w",
+            "n",
+            "ns",
+            empty_component(),
+            wasmtime::component::Linker::new(&engine),
+            Vec::new(),
+            crate::types::LocalResources::default(),
+            0,
+            Arc::default(),
+            key.map(Arc::<str>::from),
+        )
+    }
+
+    #[tokio::test]
+    async fn in_use_artifact_keys_marks_only_running_workloads() {
+        use crate::engine::workload::ResolvedWorkload;
+
+        let host = Host::builder().build().expect("failed to build host");
+
+        // One running workload: a keyed component, an unkeyed one (no on-disk file), and
+        // a keyed service. Only the `Some` keys should be marked in-use.
+        let running = ResolvedWorkload::for_test(
+            vec![
+                keyed_component("a", Some("key-a")),
+                keyed_component("b", None),
+            ],
+            Some(keyed_service(Some("key-svc"))),
+        );
+
+        {
+            let mut workloads = host.workloads.write().await;
+            workloads.insert("running".into(), HostWorkload::Running(Box::new(running)));
+            // Non-running workloads must contribute nothing to the mark set.
+            workloads.insert("starting".into(), HostWorkload::Starting);
+            workloads.insert("errored".into(), HostWorkload::Error("boom".into()));
+        }
+
+        let keys = host.in_use_artifact_keys().await;
+        assert_eq!(
+            keys,
+            HashSet::from([Arc::<str>::from("key-a"), Arc::<str>::from("key-svc")]),
+            "only Some keys from running workloads' components + service are in-use"
+        );
+    }
+
+    #[tokio::test]
+    async fn sweep_deletes_orphans_past_grace_keeps_in_use_and_non_cwasm() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = |name: &str| dir.path().join(name);
+        std::fs::write(p("inuse.cwasm"), b"x").unwrap();
+        std::fs::write(p("orphan.cwasm"), b"x").unwrap();
+        std::fs::write(p("keep.txt"), b"x").unwrap();
+        std::fs::write(p(".stale.abc.tmp"), b"x").unwrap();
+
+        let in_use: HashSet<Arc<str>> = std::iter::once(Arc::<str>::from("inuse")).collect();
+
+        // grace = 0: every not-in-use `.cwasm` is past grace and gets swept.
+        let (scanned, deleted, within_grace) =
+            sweep_unused_cwasm_dir(dir.path(), &in_use, Duration::ZERO).await;
+
+        assert_eq!(scanned, 2, "only .cwasm files are scanned");
+        assert_eq!(deleted, 1);
+        assert_eq!(within_grace, 0);
+        assert!(p("inuse.cwasm").exists(), "in-use file kept");
+        assert!(!p("orphan.cwasm").exists(), "orphan swept");
+        assert!(p("keep.txt").exists(), "non-.cwasm file untouched");
+        assert!(!p(".stale.abc.tmp").exists(), "stale temp file reaped");
+    }
+
+    #[tokio::test]
+    async fn sweep_spares_orphans_within_grace() {
+        let dir = tempfile::tempdir().unwrap();
+        let orphan = dir.path().join("fresh.cwasm");
+        std::fs::write(&orphan, b"x").unwrap();
+
+        // A large grace protects a freshly-written orphan (the write-then-start race).
+        let (scanned, deleted, within_grace) =
+            sweep_unused_cwasm_dir(dir.path(), &HashSet::new(), Duration::from_secs(3600)).await;
+
+        assert_eq!(scanned, 1);
+        assert_eq!(deleted, 0);
+        assert_eq!(within_grace, 1);
+        assert!(orphan.exists(), "within-grace orphan kept");
+    }
+
+    #[tokio::test]
+    async fn sweep_missing_dir_is_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("does-not-exist");
+        let stats = sweep_unused_cwasm_dir(&missing, &HashSet::new(), Duration::ZERO).await;
+        assert_eq!(stats, (0, 0, 0));
+    }
+
     #[tokio::test]
     async fn test_workload_start_failed() {
         let host = Host::builder().build().expect("failed to build host");
@@ -1037,11 +1294,12 @@ mod tests {
                     components: vec![Component {
                         name: "test".to_string(),
                         digest: None,
-                        bytes: vec![0xD, 0xE, 0xA, 0xD, 0xB, 0xE, 0xE, 0xF].into(),
                         local_resources: Default::default(),
                         pool_size: 1,
                         max_invocations: 100,
-                        is_precompiled: false,
+                        source: crate::types::Source::Compile(
+                            vec![0xD, 0xE, 0xA, 0xD, 0xB, 0xE, 0xE, 0xF].into(),
+                        ),
                     }],
                     host_interfaces: vec![],
                     volumes: vec![],

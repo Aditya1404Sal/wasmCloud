@@ -60,9 +60,140 @@ fn parse_nats_url(url: &Url) -> Result<(String, String)> {
     Ok((bucket, key))
 }
 
+/// Download a precompiled component's `.cwasm` into the host's local cache dir and
+/// return where it landed. The engine loads the component from that file, which lets
+/// the OS drop it from RAM when memory is tight and re-read it from disk on demand —
+/// much cheaper than keeping every component pinned in memory.
+///
+/// The filename is a hash of the URL, so if we've already downloaded this artifact we
+/// just hand back the file we have instead of downloading it again (precompiled URLs
+/// are digest-pinned: the same URL always means the same bytes). The download is
+/// written to a temp file and then renamed into place, so a component is never loaded
+/// from a half-written file — and because the host owns the file, nothing else can
+/// change it while it's in use.
+#[cfg(feature = "oci")]
+pub async fn download_cwasm(url: &str, cache_dir: &std::path::Path) -> Result<std::path::PathBuf> {
+    let key = cache_key_for_url(url);
+    let path = cache_dir.join(format!("{key}.cwasm"));
+
+    // Cache hit: the file already exists — skip the download. Refresh its mtime first so
+    // the sweep's grace window treats a reused (possibly long-idle) file as fresh. Without
+    // this, an orphan older than the grace period that's being started again could be
+    // swept in the gap before the engine maps it — and the precompiled path, unlike the
+    // OCI path, has no wasm to recompile from, so that start would just fail.
+    if tokio::fs::try_exists(&path).await.unwrap_or(false) {
+        refresh_mtime(&path).await;
+        tracing::debug!(url, path = %path.display(), "precompiled cache hit");
+        return Ok(path);
+    }
+
+    let bytes = fetch(url).await?;
+
+    tokio::fs::create_dir_all(cache_dir)
+        .await
+        .with_context(|| {
+            format!(
+                "failed to create compiled cache dir {}",
+                cache_dir.display()
+            )
+        })?;
+
+    // Write to a unique temp file in the same dir, then rename onto the final path.
+    // Why indirect? A direct write isn't atomic — a crash or a concurrent start could
+    // leave/expose a half-written `.cwasm` at the canonical path, which the cache-hit
+    // check would then trust and `deserialize_file` would mmap as corrupt. rename is
+    // atomic within a filesystem, so a reader sees either no file or the complete one.
+    let tmp = cache_dir.join(format!(".{key}.{}.tmp", uuid::Uuid::new_v4()));
+    tokio::fs::write(&tmp, &bytes)
+        .await
+        .with_context(|| format!("failed to write precompiled bytes to {}", tmp.display()))?;
+    if let Err(e) = tokio::fs::rename(&tmp, &path).await {
+        let _ = tokio::fs::remove_file(&tmp).await;
+        return Err(anyhow::Error::from(e)).with_context(|| {
+            format!(
+                "failed to move precompiled file into place at {}",
+                path.display()
+            )
+        });
+    }
+
+    tracing::debug!(
+        url,
+        path = %path.display(),
+        size_bytes = bytes.len(),
+        "cached precompiled component"
+    );
+    Ok(path)
+}
+
+/// Best-effort bump of `path`'s modification time to now, so the compiled-cache sweep's
+/// grace window treats a just-reused file as fresh. Any failure is ignored: the worst
+/// case is the pre-existing reuse-vs-sweep race, never a broken load.
+#[cfg(feature = "oci")]
+async fn refresh_mtime(path: &std::path::Path) {
+    if let Ok(file) = tokio::fs::OpenOptions::new().write(true).open(path).await {
+        let _ = file
+            .into_std()
+            .await
+            .set_modified(std::time::SystemTime::now());
+    }
+}
+
+/// Content-addressed filename stem for a precompiled URL: the hex SHA-256 of the URL.
+/// Collision-free and stable, avoiding the lossy `/:@ -> -` collapsing that reusing
+/// the OCI `sanitize_digest` on a URL would cause.
+#[cfg(feature = "oci")]
+fn cache_key_for_url(url: &str) -> String {
+    use sha2::{Digest, Sha256};
+    use std::fmt::Write as _;
+
+    let digest = Sha256::digest(url.as_bytes());
+    let mut hex = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        let _ = write!(hex, "{byte:02x}");
+    }
+    hex
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "oci")]
+    #[tokio::test]
+    async fn download_cwasm_caches_then_hits_without_refetch() {
+        let src_dir = tempfile::tempdir().unwrap();
+        let cache_dir = tempfile::tempdir().unwrap();
+
+        let source = src_dir.path().join("artifact.cwasm");
+        std::fs::write(&source, b"precompiled-bytes").unwrap();
+        let url = format!("file://{}", source.display());
+
+        // Miss: fetch the source and write a host-owned copy into the cache dir.
+        let path = download_cwasm(&url, cache_dir.path()).await.unwrap();
+        assert_eq!(path.parent(), Some(cache_dir.path()));
+        assert_eq!(path.extension().and_then(|e| e.to_str()), Some("cwasm"));
+        assert_eq!(std::fs::read(&path).unwrap(), b"precompiled-bytes");
+
+        // Delete the source so any re-fetch would fail — proving the second call is a
+        // pure cache hit (stat, no download) that returns the same host-owned file.
+        std::fs::remove_file(&source).unwrap();
+        let hit = download_cwasm(&url, cache_dir.path()).await.unwrap();
+        assert_eq!(hit, path);
+        assert_eq!(std::fs::read(&hit).unwrap(), b"precompiled-bytes");
+    }
+
+    #[cfg(feature = "oci")]
+    #[test]
+    fn cache_key_for_url_is_stable_hex_sha256() {
+        let a = cache_key_for_url("nats://bucket/key");
+        let b = cache_key_for_url("nats://bucket/key");
+        let c = cache_key_for_url("nats://bucket/other");
+        assert_eq!(a, b, "same URL must hash the same");
+        assert_ne!(a, c, "different URLs must differ");
+        assert_eq!(a.len(), 64, "hex sha256 is 64 chars");
+        assert!(a.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    }
 
     #[test]
     fn parses_nats_url_into_bucket_and_key() {

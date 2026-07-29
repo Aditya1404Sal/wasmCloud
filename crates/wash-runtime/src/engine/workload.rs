@@ -69,6 +69,8 @@ pub struct WorkloadMetadata {
     pub(crate) loopback: Arc<std::sync::Mutex<loopback::Network>>,
     /// Linked component ids
     linked_components: HashSet<Arc<str>>,
+    /// `.cwasm` filename stem the sweep marks in-use to keep this component's file alive; `None` if no file backs it.
+    pub(crate) artifact_key: Option<Arc<str>>,
 }
 
 impl WorkloadMetadata {
@@ -276,6 +278,7 @@ impl WorkloadService {
         local_resources: LocalResources,
         max_restarts: u64,
         loopback: Arc<std::sync::Mutex<loopback::Network>>,
+        artifact_key: Option<Arc<str>>,
     ) -> Self {
         Self {
             metadata: WorkloadMetadata {
@@ -291,6 +294,7 @@ impl WorkloadService {
                 plugins: None,
                 loopback,
                 linked_components: Default::default(),
+                artifact_key,
             },
             handle: None,
             max_restarts,
@@ -353,6 +357,7 @@ impl WorkloadComponent {
         volume_mounts: Vec<(PathBuf, VolumeMount)>,
         local_resources: LocalResources,
         loopback: Arc<std::sync::Mutex<loopback::Network>>,
+        artifact_key: Option<Arc<str>>,
     ) -> Self {
         Self {
             metadata: WorkloadMetadata {
@@ -368,6 +373,7 @@ impl WorkloadComponent {
                 plugins: None,
                 loopback,
                 linked_components: Default::default(),
+                artifact_key,
             },
             name: component_name.into(),
             // TODO: Implement pooling and instance limits
@@ -535,6 +541,33 @@ impl std::fmt::Debug for ResolvedWorkload {
     }
 }
 
+#[cfg(test)]
+impl ResolvedWorkload {
+    /// Assemble a resolved workload directly from components and an optional service,
+    /// bypassing the resolve pipeline. Test-only: for exercising logic that reads only
+    /// the workload's components + service (e.g. the sweep's `artifact_keys` mark set).
+    pub(crate) fn for_test(
+        components: Vec<WorkloadComponent>,
+        service: Option<WorkloadService>,
+    ) -> Self {
+        let components = components
+            .into_iter()
+            .map(|c| (Arc::from(c.name()), c))
+            .collect();
+        Self {
+            id: Arc::from("test-workload"),
+            name: Arc::from("test"),
+            namespace: Arc::from("test-namespace"),
+            components: Arc::new(RwLock::new(components)),
+            http_handler: Arc::new(crate::host::http::NullServer::default()),
+            service,
+            host_interfaces: Vec::new(),
+            #[cfg(feature = "wasi-tls")]
+            tls_provider: None,
+        }
+    }
+}
+
 impl ResolvedWorkload {
     /// Executes the service, if present, and returns whether it was run.
     #[instrument(name="execute_service", skip_all, fields(workload.id = self.id.as_ref(), workload.name = self.name.as_ref(), workload.namespace = self.namespace.as_ref()))]
@@ -662,6 +695,25 @@ impl ResolvedWorkload {
 
     pub fn components(&self) -> Arc<RwLock<HashMap<Arc<str>, WorkloadComponent>>> {
         self.components.clone()
+    }
+
+    /// Collect the compiled-cache artifact keys (`.cwasm` file stems) backing
+    /// every component and the service in this workload. The compiled-cache
+    /// sweep unions these across all running workloads to decide which on-disk
+    /// artifacts are still in use and must not be deleted.
+    pub(crate) async fn artifact_keys(&self) -> Vec<Arc<str>> {
+        let mut keys = Vec::new();
+        for component in self.components.read().await.values() {
+            if let Some(key) = component.metadata.artifact_key.clone() {
+                keys.push(key);
+            }
+        }
+        if let Some(service) = &self.service
+            && let Some(key) = service.metadata.artifact_key.clone()
+        {
+            keys.push(key);
+        }
+        keys
     }
 
     pub fn host_interfaces(&self) -> &Vec<WitInterface> {
@@ -2176,6 +2228,7 @@ mod tests {
             Vec::new(),
             local_resources,
             Arc::default(),
+            None,
         )
     }
 
@@ -2198,6 +2251,7 @@ mod tests {
             Vec::new(),
             local_resources,
             Arc::default(),
+            None,
         )
     }
 
@@ -2220,6 +2274,7 @@ mod tests {
             local_resources,
             3,
             Arc::default(),
+            None,
         )
     }
 
@@ -2289,6 +2344,7 @@ mod tests {
                 Vec::new(),
                 LocalResources::default(),
                 Arc::default(),
+                None,
             )
         };
         for (plugin, iface) in cases {

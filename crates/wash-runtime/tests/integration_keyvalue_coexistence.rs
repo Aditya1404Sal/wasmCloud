@@ -99,9 +99,10 @@ async fn standalone_and_multiplexed_keyvalue_coexist() -> Result<()> {
             components: vec![Component {
                 name: "keyvalue-counter.wasm".to_string(),
                 digest: None,
-                bytes: bytes::Bytes::from_static(KEYVALUE_COUNTER_WASM),
                 local_resources: LocalResources::default(),
-                is_precompiled: false,
+                source: wash_runtime::types::Source::Compile(bytes::Bytes::from_static(
+                    KEYVALUE_COUNTER_WASM,
+                )),
                 pool_size: 1,
                 max_invocations: 100,
             }],

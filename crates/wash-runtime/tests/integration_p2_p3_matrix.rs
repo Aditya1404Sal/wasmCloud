@@ -68,9 +68,10 @@ async fn test_p3_http_handler_serves_request() -> Result<()> {
             components: vec![Component {
                 name: "http-handler-p3.wasm".to_string(),
                 digest: None,
-                bytes: bytes::Bytes::from_static(HTTP_HANDLER_P3_WASM),
                 local_resources: LocalResources::default(),
-                is_precompiled: false,
+                source: wash_runtime::types::Source::Compile(bytes::Bytes::from_static(
+                    HTTP_HANDLER_P3_WASM,
+                )),
                 pool_size: 1,
                 max_invocations: 100,
             }],
@@ -121,9 +122,10 @@ async fn test_p3_http_blobstore() -> Result<()> {
             components: vec![Component {
                 name: "http-blobstore-p3.wasm".to_string(),
                 digest: None,
-                bytes: bytes::Bytes::from_static(HTTP_BLOBSTORE_P3_WASM),
                 local_resources: LocalResources::default(),
-                is_precompiled: false,
+                source: wash_runtime::types::Source::Compile(bytes::Bytes::from_static(
+                    HTTP_BLOBSTORE_P3_WASM,
+                )),
                 pool_size: 1,
                 max_invocations: 100,
             }],
@@ -177,9 +179,10 @@ async fn test_p3_http_concurrent_requests() -> Result<()> {
             components: vec![Component {
                 name: "http-handler-p3.wasm".to_string(),
                 digest: None,
-                bytes: bytes::Bytes::from_static(HTTP_HANDLER_P3_WASM),
                 local_resources: LocalResources::default(),
-                is_precompiled: false,
+                source: wash_runtime::types::Source::Compile(bytes::Bytes::from_static(
+                    HTTP_HANDLER_P3_WASM,
+                )),
                 pool_size: 1,
                 max_invocations: 100,
             }],
@@ -308,27 +311,30 @@ async fn test_p3_caller_p2_middleware_p2_callee() -> Result<()> {
                 Component {
                     name: "p3-caller".to_string(),
                     digest: None,
-                    bytes: bytes::Bytes::from_static(P3_CALLER_WASM),
                     local_resources: LocalResources::default(),
-                    is_precompiled: false,
+                    source: wash_runtime::types::Source::Compile(bytes::Bytes::from_static(
+                        P3_CALLER_WASM,
+                    )),
                     pool_size: 1,
                     max_invocations: 100,
                 },
                 Component {
                     name: "p2-middleware".to_string(),
                     digest: None,
-                    bytes: bytes::Bytes::from_static(P2_MIDDLEWARE_WASM),
                     local_resources: LocalResources::default(),
-                    is_precompiled: false,
+                    source: wash_runtime::types::Source::Compile(bytes::Bytes::from_static(
+                        P2_MIDDLEWARE_WASM,
+                    )),
                     pool_size: 1,
                     max_invocations: 100,
                 },
                 Component {
                     name: "p2-callee".to_string(),
                     digest: None,
-                    bytes: bytes::Bytes::from_static(P2_CALLEE_WASM),
                     local_resources: LocalResources::default(),
-                    is_precompiled: false,
+                    source: wash_runtime::types::Source::Compile(bytes::Bytes::from_static(
+                        P2_CALLEE_WASM,
+                    )),
                     pool_size: 1,
                     max_invocations: 100,
                 },
@@ -385,27 +391,30 @@ async fn test_p2_caller_p2_middleware_p3_callee() -> Result<()> {
                 Component {
                     name: "p2-caller".to_string(),
                     digest: None,
-                    bytes: bytes::Bytes::from_static(P2_CALLER_WASM),
                     local_resources: LocalResources::default(),
-                    is_precompiled: false,
+                    source: wash_runtime::types::Source::Compile(bytes::Bytes::from_static(
+                        P2_CALLER_WASM,
+                    )),
                     pool_size: 1,
                     max_invocations: 100,
                 },
                 Component {
                     name: "p2-middleware".to_string(),
                     digest: None,
-                    bytes: bytes::Bytes::from_static(P2_MIDDLEWARE_WASM),
                     local_resources: LocalResources::default(),
-                    is_precompiled: false,
+                    source: wash_runtime::types::Source::Compile(bytes::Bytes::from_static(
+                        P2_MIDDLEWARE_WASM,
+                    )),
                     pool_size: 1,
                     max_invocations: 100,
                 },
                 Component {
                     name: "p3-callee".to_string(),
                     digest: None,
-                    bytes: bytes::Bytes::from_static(P3_CALLEE_WASM),
                     local_resources: LocalResources::default(),
-                    is_precompiled: false,
+                    source: wash_runtime::types::Source::Compile(bytes::Bytes::from_static(
+                        P3_CALLEE_WASM,
+                    )),
                     pool_size: 1,
                     max_invocations: 100,
                 },
@@ -458,27 +467,30 @@ async fn test_p3_caller_p2_middleware_p3_callee() -> Result<()> {
                 Component {
                     name: "p3-caller".to_string(),
                     digest: None,
-                    bytes: bytes::Bytes::from_static(P3_CALLER_WASM),
                     local_resources: LocalResources::default(),
-                    is_precompiled: false,
+                    source: wash_runtime::types::Source::Compile(bytes::Bytes::from_static(
+                        P3_CALLER_WASM,
+                    )),
                     pool_size: 1,
                     max_invocations: 100,
                 },
                 Component {
                     name: "p2-middleware".to_string(),
                     digest: None,
-                    bytes: bytes::Bytes::from_static(P2_MIDDLEWARE_WASM),
                     local_resources: LocalResources::default(),
-                    is_precompiled: false,
+                    source: wash_runtime::types::Source::Compile(bytes::Bytes::from_static(
+                        P2_MIDDLEWARE_WASM,
+                    )),
                     pool_size: 1,
                     max_invocations: 100,
                 },
                 Component {
                     name: "p3-callee".to_string(),
                     digest: None,
-                    bytes: bytes::Bytes::from_static(P3_CALLEE_WASM),
                     local_resources: LocalResources::default(),
-                    is_precompiled: false,
+                    source: wash_runtime::types::Source::Compile(bytes::Bytes::from_static(
+                        P3_CALLEE_WASM,
+                    )),
                     pool_size: 1,
                     max_invocations: 100,
                 },
@@ -537,9 +549,10 @@ async fn test_all_p3_workload() -> Result<()> {
             components: vec![Component {
                 name: "http-blobstore-p3.wasm".to_string(),
                 digest: None,
-                bytes: bytes::Bytes::from_static(HTTP_BLOBSTORE_P3_WASM),
                 local_resources: LocalResources::default(),
-                is_precompiled: false,
+                source: wash_runtime::types::Source::Compile(bytes::Bytes::from_static(
+                    HTTP_BLOBSTORE_P3_WASM,
+                )),
                 pool_size: 1,
                 max_invocations: 100,
             }],
@@ -590,7 +603,6 @@ async fn test_p2_regression_with_p3_enabled() -> Result<()> {
             components: vec![Component {
                 name: "http-counter.wasm".to_string(),
                 digest: None,
-                bytes: bytes::Bytes::from_static(HTTP_COUNTER_WASM),
                 local_resources: LocalResources {
                     memory_limit_mb: 256,
                     cpu_limit: 1,
@@ -603,7 +615,9 @@ async fn test_p2_regression_with_p3_enabled() -> Result<()> {
                     // http-counter calls example.com
                     allowed_hosts: vec!["example.com".parse().unwrap()].into(),
                 },
-                is_precompiled: false,
+                source: wash_runtime::types::Source::Compile(bytes::Bytes::from_static(
+                    HTTP_COUNTER_WASM,
+                )),
                 pool_size: 1,
                 max_invocations: 100,
             }],

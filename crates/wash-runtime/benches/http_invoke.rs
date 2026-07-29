@@ -102,13 +102,14 @@ async fn start_warm_host(flavor: Flavor) -> anyhow::Result<WarmHost> {
             components: vec![Component {
                 name: format!("hello-{}.wasm", flavor.name()),
                 digest: None,
-                bytes: bytes::Bytes::from_static(flavor.wasm()),
                 local_resources: LocalResources::default(),
                 // 0/0 → the runtime picks sensible defaults. For the P3
                 // instance-reuse path this means 128 reuses × 16 concurrent
                 // (matches `wasmtime serve`). The non-reuse path ignores
                 // both fields.
-                is_precompiled: false,
+                source: wash_runtime::types::Source::Compile(bytes::Bytes::from_static(
+                    flavor.wasm(),
+                )),
                 pool_size: 0,
                 max_invocations: 0,
             }],

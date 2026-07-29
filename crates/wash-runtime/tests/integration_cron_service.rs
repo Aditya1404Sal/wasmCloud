@@ -55,11 +55,12 @@ async fn test_cron_service_integration() -> Result<()> {
             components: vec![Component {
                 name: "cron-component".to_string(),
                 digest: None,
-                bytes: bytes::Bytes::from_static(CRON_COMPONENT_WASM),
                 local_resources: Default::default(),
                 max_invocations: 1,
                 pool_size: 0,
-                is_precompiled: false,
+                source: wash_runtime::types::Source::Compile(bytes::Bytes::from_static(
+                    CRON_COMPONENT_WASM,
+                )),
             }],
             host_interfaces: vec![],
             volumes: vec![],

@@ -11,6 +11,8 @@ use wash_runtime::{
 
 use crate::cli::{CliCommand, CliContext, CommandOutput};
 
+const COMPILED_CACHE_SUBDIR: &str = "cwasm";
+
 #[derive(Debug, Clone, Args)]
 pub struct HostCommand {
     /// The host group label to assign to the host
@@ -114,7 +116,8 @@ pub struct HostCommand {
 
     /// Directory for caching compiled component artifacts (.cwasm files).
     /// Enables file-backed mmap for compiled code, reducing memory usage.
-    #[clap(long = "compiled-cache-dir")]
+    /// Defaults to `<cache-dir>/cwasm`; set to a path to override.
+    #[clap(long = "compiled-cache-dir", env = "WASH_COMPILED_CACHE_DIR")]
     pub compiled_cache_dir: Option<PathBuf>,
 
     /// How often to run OCI cache cleanup (e.g. "5m", "300s")
@@ -124,6 +127,17 @@ pub struct HostCommand {
     /// Maximum age of cached OCI artifacts before they are cleaned up (e.g. "1h", "3600s")
     #[clap(long = "oci-cleanup-age", value_parser = humantime::parse_duration, env = "WASH_OCI_CLEANUP_AGE")]
     pub oci_cleanup_age: Option<Duration>,
+
+    /// How often to sweep orphaned compiled artifacts (.cwasm) from the compiled
+    /// cache dir (e.g. "5m", "300s"). Defaults to 5m.
+    #[clap(long = "compiled-cache-cleanup-interval", value_parser = humantime::parse_duration, env = "WASH_COMPILED_CACHE_CLEANUP_INTERVAL")]
+    pub compiled_cache_cleanup_interval: Option<Duration>,
+
+    /// Grace period an unreferenced compiled artifact (.cwasm) must reach before the
+    /// sweep may delete it (e.g. "1h", "3600s"), guarding the write-then-start race.
+    /// Defaults to 1h.
+    #[clap(long = "compiled-cache-cleanup-grace", value_parser = humantime::parse_duration, env = "WASH_COMPILED_CACHE_CLEANUP_GRACE")]
+    pub compiled_cache_cleanup_grace: Option<Duration>,
 
     /// Enable WASI OpenTelemetry plugin
     #[arg(long = "wasi-otel", default_value_t = false)]
@@ -174,21 +188,25 @@ impl CliCommand for HostCommand {
         .context("failed to connect to NATS")?;
         let data_nats_client = Arc::new(data_nats_client);
 
+        let compiled_cache_dir = self
+            .compiled_cache_dir
+            .clone()
+            .unwrap_or_else(|| ctx.cache_dir().join(COMPILED_CACHE_SUBDIR));
+
         let host_config = wash_runtime::host::HostConfig {
             allow_oci_insecure: self.allow_insecure_registries,
             oci_pull_timeout: Some(self.registry_pull_timeout),
             oci_cache_dir: self.oci_cache_dir.clone(),
-            compiled_cache_dir: self.compiled_cache_dir.clone(),
+            compiled_cache_dir: Some(compiled_cache_dir.clone()),
         };
 
         let mut engine_builder = Engine::builder()
             .with_pooling_allocator(true)
             .with_fuel_consumption(ctx.enable_meters());
 
-        // BettyBlocks: opt-in compiled-component `.cwasm` mmap cache (retained in upstream merge).
-        if let Some(ref dir) = self.compiled_cache_dir {
-            engine_builder = engine_builder.with_compiled_cache_dir(dir);
-        }
+        // BettyBlocks : Compiled-component `.cwasm` mmap cache: precompiled
+        // load path is file-backed rather than pinned in anonymous memory.
+        engine_builder = engine_builder.with_compiled_cache_dir(&compiled_cache_dir);
         for proposal in &self.wasm_proposals {
             engine_builder = engine_builder.with_wasm_proposal(*proposal);
         }
@@ -255,6 +273,14 @@ impl CliCommand for HostCommand {
 
         if let Some(age) = self.oci_cleanup_age {
             cluster_host_builder = cluster_host_builder.with_cleanup_age(age);
+        }
+
+        if let Some(interval) = self.compiled_cache_cleanup_interval {
+            cluster_host_builder = cluster_host_builder.with_compiled_cleanup_interval(interval);
+        }
+
+        if let Some(grace) = self.compiled_cache_cleanup_grace {
+            cluster_host_builder = cluster_host_builder.with_compiled_cleanup_grace(grace);
         }
 
         if let Some(host_name) = &self.host_name {

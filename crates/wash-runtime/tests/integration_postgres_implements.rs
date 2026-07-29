@@ -153,9 +153,10 @@ async fn implements_imports_route_to_per_credential_connections() -> Result<()> 
             components: vec![Component {
                 name: "postgres-implements.wasm".to_string(),
                 digest: None,
-                bytes: bytes::Bytes::from_static(POSTGRES_IMPLEMENTS_WASM),
                 local_resources: LocalResources::default(),
-                is_precompiled: false,
+                source: wash_runtime::types::Source::Compile(bytes::Bytes::from_static(
+                    POSTGRES_IMPLEMENTS_WASM,
+                )),
                 pool_size: 1,
                 max_invocations: 100,
             }],

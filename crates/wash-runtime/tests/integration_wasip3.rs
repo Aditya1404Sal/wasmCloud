@@ -129,7 +129,6 @@ async fn test_p2_http_component_works_with_p3_enabled() -> Result<()> {
             components: vec![Component {
                 name: "http-counter.wasm".to_string(),
                 digest: None,
-                bytes: bytes::Bytes::from_static(HTTP_COUNTER_WASM),
                 local_resources: LocalResources {
                     memory_limit_mb: 256,
                     cpu_limit: 1,
@@ -142,7 +141,9 @@ async fn test_p2_http_component_works_with_p3_enabled() -> Result<()> {
                     // http-counter calls example.com — empty-list default would deny.
                     allowed_hosts: vec!["example.com".parse().unwrap()].into(),
                 },
-                is_precompiled: false,
+                source: wash_runtime::types::Source::Compile(bytes::Bytes::from_static(
+                    HTTP_COUNTER_WASM,
+                )),
                 pool_size: 1,
                 max_invocations: 100,
             }],
@@ -193,13 +194,14 @@ async fn test_p2_concurrent_requests_with_p3_enabled() -> Result<()> {
             components: vec![Component {
                 name: "http-counter.wasm".to_string(),
                 digest: None,
-                bytes: bytes::Bytes::from_static(HTTP_COUNTER_WASM),
                 local_resources: LocalResources {
                     // http-counter calls example.com.
                     allowed_hosts: vec!["example.com".parse().unwrap()].into(),
                     ..Default::default()
                 },
-                is_precompiled: false,
+                source: wash_runtime::types::Source::Compile(bytes::Bytes::from_static(
+                    HTTP_COUNTER_WASM,
+                )),
                 pool_size: 1,
                 max_invocations: 100,
             }],
@@ -259,9 +261,10 @@ async fn test_p3_linker_accepts_p2_component() -> Result<()> {
         components: vec![Component {
             name: "http-counter.wasm".to_string(),
             digest: None,
-            bytes: bytes::Bytes::from_static(HTTP_COUNTER_WASM),
             local_resources: LocalResources::default(),
-            is_precompiled: false,
+            source: wash_runtime::types::Source::Compile(bytes::Bytes::from_static(
+                HTTP_COUNTER_WASM,
+            )),
             pool_size: 1,
             max_invocations: 100,
         }],

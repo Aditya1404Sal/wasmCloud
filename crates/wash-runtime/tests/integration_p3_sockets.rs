@@ -83,9 +83,10 @@ async fn test_p3_socket_component_initialization() -> Result<()> {
         components: vec![Component {
             name: "socket-test-p3.wasm".to_string(),
             digest: None,
-            bytes: bytes::Bytes::from_static(SOCKET_TEST_P3_WASM),
             local_resources: Default::default(),
-            is_precompiled: false,
+            source: wash_runtime::types::Source::Compile(bytes::Bytes::from_static(
+                SOCKET_TEST_P3_WASM,
+            )),
             pool_size: 1,
             max_invocations: 10,
         }],

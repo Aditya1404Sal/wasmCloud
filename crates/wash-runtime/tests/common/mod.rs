@@ -168,9 +168,8 @@ pub fn component_workload_request(
             components: vec![Component {
                 name: component_name.to_string(),
                 digest: None,
-                bytes: bytes::Bytes::from_static(wasm),
                 local_resources,
-                is_precompiled: false,
+                source: wash_runtime::types::Source::Compile(bytes::Bytes::from_static(wasm)),
                 pool_size: 1,
                 max_invocations: 100,
             }],

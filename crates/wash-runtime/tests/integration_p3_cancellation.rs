@@ -54,18 +54,20 @@ fn cancellable_workload(host_header: &str) -> WorkloadStartRequest {
                 Component {
                     name: "cancellable-consumer".to_string(),
                     digest: None,
-                    bytes: bytes::Bytes::from_static(CANCELLABLE_COMPONENT_WASM),
                     local_resources: LocalResources::default(),
-                    is_precompiled: false,
+                    source: wash_runtime::types::Source::Compile(bytes::Bytes::from_static(
+                        CANCELLABLE_COMPONENT_WASM,
+                    )),
                     pool_size: 4,
                     max_invocations: 100,
                 },
                 Component {
                     name: "cancellable-producer".to_string(),
                     digest: None,
-                    bytes: bytes::Bytes::from_static(CANCELLABLE_PRODUCER_WASM),
                     local_resources: LocalResources::default(),
-                    is_precompiled: false,
+                    source: wash_runtime::types::Source::Compile(bytes::Bytes::from_static(
+                        CANCELLABLE_PRODUCER_WASM,
+                    )),
                     pool_size: 4,
                     max_invocations: 100,
                 },

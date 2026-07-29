@@ -201,7 +201,6 @@ async fn test_inter_component_call() -> Result<()> {
                 Component {
                     name: "caller".to_string(),
                     digest: None,
-                    bytes: bytes::Bytes::from_static(CALLER_WASM),
                     local_resources: LocalResources {
                         memory_limit_mb: 128,
                         cpu_limit: 1,
@@ -212,12 +211,13 @@ async fn test_inter_component_call() -> Result<()> {
                     },
                     pool_size: 1,
                     max_invocations: 100,
-                    is_precompiled: false,
+                    source: wash_runtime::types::Source::Compile(bytes::Bytes::from_static(
+                        CALLER_WASM,
+                    )),
                 },
                 Component {
                     name: "middleware".to_string(),
                     digest: None,
-                    bytes: bytes::Bytes::from_static(MIDDLEWARE_WASM),
                     local_resources: LocalResources {
                         memory_limit_mb: 256,
                         cpu_limit: 2,
@@ -228,12 +228,13 @@ async fn test_inter_component_call() -> Result<()> {
                     },
                     pool_size: 2,
                     max_invocations: 100,
-                    is_precompiled: false,
+                    source: wash_runtime::types::Source::Compile(bytes::Bytes::from_static(
+                        MIDDLEWARE_WASM,
+                    )),
                 },
                 Component {
                     name: "callee".to_string(),
                     digest: None,
-                    bytes: bytes::Bytes::from_static(CALLEE_WASM),
                     local_resources: LocalResources {
                         memory_limit_mb: 256,
                         cpu_limit: 2,
@@ -244,7 +245,9 @@ async fn test_inter_component_call() -> Result<()> {
                     },
                     pool_size: 2,
                     max_invocations: 100,
-                    is_precompiled: false,
+                    source: wash_runtime::types::Source::Compile(bytes::Bytes::from_static(
+                        CALLEE_WASM,
+                    )),
                 },
             ],
             host_interfaces: vec![
