@@ -165,26 +165,31 @@ pub async fn start_retrieval_workload(
 }
 
 /// A uniquely named `betty_it_` table of one text column, created, read and
-/// dropped on a connection of the test's own rather than the plugin's.
+/// dropped on a connection of the test's own rather than the plugin's. A table
+/// its test never passes to [`ScratchTable::drop_table`], having panicked or
+/// returned early, is dropped when the value is.
 pub struct ScratchTable {
     pub name: String,
+    database_url: String,
     client: tokio_postgres::Client,
+    dropped: bool,
 }
 
 impl ScratchTable {
     pub async fn create(database_url: &str, purpose: &str) -> Result<Self> {
         let nanos = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
         let name = format!("betty_it_{purpose}_{}_{nanos}", std::process::id());
-        let client = admin_client(database_url).await?;
-        // A drop blocked behind a transaction the plugin left open fails
-        // instead of hanging the test.
+        let client = scratch_client(database_url).await?;
         client
-            .batch_execute(&format!(
-                "SET lock_timeout = '10s'; CREATE TABLE {name} (v text)"
-            ))
+            .batch_execute(&format!("CREATE TABLE {name} (v text)"))
             .await
             .with_context(|| format!("create {name}"))?;
-        Ok(Self { name, client })
+        Ok(Self {
+            name,
+            database_url: database_url.to_string(),
+            client,
+            dropped: false,
+        })
     }
 
     /// Every value in the table, in order, as this connection sees them.
@@ -199,10 +204,74 @@ impl ScratchTable {
             .collect()
     }
 
-    pub async fn drop_table(self) -> Result<()> {
-        self.client
-            .batch_execute(&format!("DROP TABLE {}", self.name))
-            .await
-            .with_context(|| format!("drop {}", self.name))
+    pub async fn drop_table(mut self) -> Result<()> {
+        let dropped = drop_scratch_table(&self.client, &self.name).await;
+        self.dropped = true;
+        dropped
     }
+}
+
+impl Drop for ScratchTable {
+    fn drop(&mut self) {
+        if self.dropped {
+            return;
+        }
+        // `drop` cannot await, and no runtime can block inside the test's: the
+        // table goes on a thread with a runtime and a connection of its own.
+        let (url, name) = (self.database_url.clone(), self.name.clone());
+        let cleanup = std::thread::spawn(move || -> Result<()> {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?
+                .block_on(async {
+                    let client = scratch_client(&url).await?;
+                    drop_scratch_table(&client, &name).await
+                })
+        });
+        match cleanup.join() {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => eprintln!("left scratch table {} behind: {e:#}", self.name),
+            Err(_) => eprintln!(
+                "left scratch table {} behind: the thread dropping it panicked",
+                self.name
+            ),
+        }
+    }
+}
+
+/// A connection of the test's own, on which a statement waiting for a lock
+/// fails after ten seconds instead of hanging the test.
+async fn scratch_client(database_url: &str) -> Result<tokio_postgres::Client> {
+    let client = admin_client(database_url).await?;
+    client
+        .batch_execute("SET lock_timeout = '10s'")
+        .await
+        .context("set lock_timeout")?;
+    Ok(client)
+}
+
+/// Drop `table`, first terminating every other session holding a lock on it.
+/// A transaction the plugin failed to end holds one, and the plugin's pool can
+/// outlive the test's host through the ingress server's workload handles.
+async fn drop_scratch_table(client: &tokio_postgres::Client, table: &str) -> Result<()> {
+    let terminated = client
+        .query(
+            &format!(
+                "SELECT pg_terminate_backend(pid) FROM pg_locks \
+                 WHERE relation = '{table}'::regclass AND pid <> pg_backend_pid()"
+            ),
+            &[],
+        )
+        .await
+        .with_context(|| format!("terminate the sessions locking {table}"))?;
+    if !terminated.is_empty() {
+        eprintln!(
+            "terminated the sessions behind {} lock(s) on {table}",
+            terminated.len()
+        );
+    }
+    client
+        .batch_execute(&format!("DROP TABLE {table}"))
+        .await
+        .with_context(|| format!("drop {table}"))
 }

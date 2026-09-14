@@ -77,19 +77,12 @@ async fn a_null_value_binds_against_a_text_placeholder() -> Result<()> {
 async fn a_committed_transaction_persists() -> Result<()> {
     let db = test_database().await?;
     let table = ScratchTable::create(&db.url, "commit").await?;
-    let outcome = async {
-        let path = format!("/commit-persists?table={}", table.name);
-        let body = answer(&db.url, fake_embedder(), &path).await?;
-        // Read on the table's own connection: the plugin's one session would
-        // see the transaction's row whether or not COMMIT was sent.
-        anyhow::Ok((body, table.values().await?))
-    }
-    .await;
-    table.drop_table().await?;
-    let (body, values) = outcome?;
-    assert_eq!(body, "committed");
-    assert_eq!(values, ["kept"]);
-    Ok(())
+    let path = format!("/commit-persists?table={}", table.name);
+    assert_eq!(answer(&db.url, fake_embedder(), &path).await?, "committed");
+    // Read on the table's own connection: the plugin's one session would see
+    // the transaction's row whether or not COMMIT was sent.
+    assert_eq!(table.values().await?, ["kept"]);
+    table.drop_table().await
 }
 
 #[tokio::test]
@@ -98,13 +91,12 @@ async fn dropping_a_transaction_rolls_it_back() -> Result<()> {
     let db = test_database().await?;
     let table = ScratchTable::create(&db.url, "rollback").await?;
     let path = format!("/drop-rolls-back?table={}", table.name);
-    let body = answer(&db.url, fake_embedder(), &path).await;
-    table.drop_table().await?;
     assert_eq!(
-        body?, "rows=0",
+        answer(&db.url, fake_embedder(), &path).await?,
+        "rows=0",
         "the next statement on the transaction's connection must not see its insert"
     );
-    Ok(())
+    table.drop_table().await
 }
 
 #[tokio::test]
