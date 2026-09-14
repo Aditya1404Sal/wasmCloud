@@ -1487,6 +1487,14 @@ impl DevConfig {
         .map(Some)
     }
 
+    /// `retrieval_model_config`, with a relative path joined onto
+    /// `project_dir` rather than left to resolve against the working directory.
+    pub fn retrieval_model_config_path(&self, project_dir: &Path) -> Option<PathBuf> {
+        self.retrieval_model_config
+            .as_ref()
+            .map(|path| project_dir.join(path))
+    }
+
     pub fn validate(&self) -> Result<()> {
         let mut errors: Vec<String> = Vec::new();
 
@@ -2390,6 +2398,34 @@ workload:
             ..Default::default()
         };
         assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn dev_retrieval_model_config_resolves_against_the_project_dir() {
+        // The context-provider POC's layout: the model sits beside the project.
+        let root = tempfile::tempdir().unwrap();
+        let project = root.path().join("context-provider-wasm");
+        let models = root.path().join("context-provider/models");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&models).unwrap();
+        std::fs::write(models.join("granite.json"), "{}").unwrap();
+
+        let relative = DevConfig {
+            retrieval_model_config: Some(PathBuf::from("../context-provider/models/granite.json")),
+            ..Default::default()
+        };
+        let resolved = relative.retrieval_model_config_path(&project).unwrap();
+        // Found from the project, not from this test's own working directory.
+        assert!(resolved.exists(), "{}", resolved.display());
+
+        let absolute = DevConfig {
+            retrieval_model_config: Some(models.join("granite.json")),
+            ..Default::default()
+        };
+        assert_eq!(
+            absolute.retrieval_model_config_path(&project),
+            Some(models.join("granite.json"))
+        );
     }
 
     #[test]

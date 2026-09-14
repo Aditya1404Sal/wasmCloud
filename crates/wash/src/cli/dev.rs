@@ -364,12 +364,12 @@ impl CliCommand for DevCommand {
         #[cfg(feature = "betty-retrieval")]
         match (
             &dev_config.retrieval_database_url,
-            &dev_config.retrieval_model_config,
+            dev_config.retrieval_model_config_path(project_dir),
         ) {
             (Some(database_url), Some(model_config)) => {
                 let retrieval_config = build_betty_retrieval_config(
                     database_url.clone(),
-                    model_config.clone(),
+                    model_config,
                     BettyRetrievalOverrides {
                         pool_size: dev_config.retrieval_pool_size,
                         connect_timeout_secs: dev_config.retrieval_connect_timeout_secs,
