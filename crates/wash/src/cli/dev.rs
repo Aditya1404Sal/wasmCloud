@@ -22,6 +22,8 @@ use wash_runtime::{
     wit::WitInterface,
 };
 
+#[cfg(feature = "betty-retrieval")]
+use crate::cli::retrieval::{BettyRetrievalOverrides, build_betty_retrieval_config};
 use crate::{
     cli::{
         CliCommand, CliContext, CommandOutput, component_build::build_dev_component,
@@ -357,6 +359,51 @@ impl CliCommand for DevCommand {
                 debug!("wasmcloud:postgres multiplexed plugin registered (implements)");
             }
         }
+
+        // Add the betty-blocks:retrieval plugin if configured
+        #[cfg(feature = "betty-retrieval")]
+        match (
+            &dev_config.retrieval_database_url,
+            &dev_config.retrieval_model_config,
+        ) {
+            (Some(database_url), Some(model_config)) => {
+                let retrieval_config = build_betty_retrieval_config(
+                    database_url.clone(),
+                    model_config.clone(),
+                    BettyRetrievalOverrides {
+                        pool_size: dev_config.retrieval_pool_size,
+                        connect_timeout_secs: dev_config.retrieval_connect_timeout_secs,
+                        ef_search: dev_config.retrieval_ef_search,
+                        max_scan_tuples: dev_config.retrieval_max_scan_tuples,
+                        embed_threads: dev_config.retrieval_embed_threads,
+                    },
+                )
+                .context("failed to configure the betty-blocks retrieval plugin")?;
+                host_builder = host_builder.with_plugin(Arc::new(
+                    plugin::betty_retrieval::BettyRetrieval::new(retrieval_config)
+                        .context("failed to configure the betty-blocks retrieval plugin")?,
+                ))?;
+                debug!("betty-blocks:retrieval plugin registered");
+            }
+            (Some(_), None) => {
+                bail!("dev.retrieval_database_url is set but dev.retrieval_model_config is missing")
+            }
+            (None, Some(_)) => {
+                bail!("dev.retrieval_model_config is set but dev.retrieval_database_url is missing")
+            }
+            (None, None) => {}
+        }
+        #[cfg(not(feature = "betty-retrieval"))]
+        ensure!(
+            dev_config.retrieval_database_url.is_none()
+                && dev_config.retrieval_model_config.is_none()
+                && dev_config.retrieval_pool_size.is_none()
+                && dev_config.retrieval_connect_timeout_secs.is_none()
+                && dev_config.retrieval_ef_search.is_none()
+                && dev_config.retrieval_max_scan_tuples.is_none()
+                && dev_config.retrieval_embed_threads.is_none(),
+            "dev.retrieval_* keys require a wash build with the `betty-retrieval` feature"
+        );
 
         // Add otel plugin
         if dev_config.wasi_otel {

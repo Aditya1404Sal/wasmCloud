@@ -34,6 +34,10 @@ pub mod host;
 pub mod inspect;
 pub mod new;
 pub mod oci;
+/// Shared config-building helper behind the `betty-retrieval` plugin, used by
+/// both `wash host` and `wash dev`.
+#[cfg(feature = "betty-retrieval")]
+mod retrieval;
 pub mod signal;
 pub mod update;
 pub mod wit;

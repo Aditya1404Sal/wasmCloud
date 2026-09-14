@@ -1319,6 +1319,45 @@ pub struct DevConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub postgres_url: Option<String>,
 
+    /// PostgreSQL connection URL for the betty-blocks:retrieval plugin's own
+    /// pool. Requires `dev.retrieval_model_config` to also be set. Only
+    /// takes effect in a wash build with the `betty-retrieval` feature.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retrieval_database_url: Option<String>,
+
+    /// Path to the granite embedding model's descriptor (MODEL.json) for the
+    /// betty-blocks:retrieval plugin. Relative paths resolve against the
+    /// project directory. Requires `dev.retrieval_database_url` to also be
+    /// set. Only takes effect in a wash build with the `betty-retrieval`
+    /// feature.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retrieval_model_config: Option<PathBuf>,
+
+    /// Maximum size of the betty-blocks:retrieval plugin's connection pool.
+    /// Unset keeps the plugin's own default (8).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retrieval_pool_size: Option<usize>,
+
+    /// How long the betty-blocks:retrieval plugin's pool waits for a new
+    /// connection before failing. Unset keeps the plugin's own default (10s).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retrieval_connect_timeout_secs: Option<u64>,
+
+    /// `hnsw.ef_search` the betty-blocks:retrieval plugin sets on every
+    /// pooled connection. Unset keeps the plugin's own default (200).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retrieval_ef_search: Option<u32>,
+
+    /// `hnsw.max_scan_tuples` the betty-blocks:retrieval plugin sets on every
+    /// pooled connection. Unset keeps the plugin's own default (20000).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retrieval_max_scan_tuples: Option<u32>,
+
+    /// Threads the betty-blocks:retrieval plugin's embedder uses. Unset
+    /// keeps the plugin's own default (4).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retrieval_embed_threads: Option<usize>,
+
     /// Enable WASI OpenTelemetry support
     #[serde(default)]
     pub wasi_otel: bool,
@@ -1495,6 +1534,28 @@ impl DevConfig {
                 &["postgres", "postgresql"],
                 &mut errors,
             );
+        }
+        if let Some(url) = &self.retrieval_database_url {
+            check_url_scheme(
+                "dev.retrieval_database_url",
+                url,
+                &["postgres", "postgresql"],
+                &mut errors,
+            );
+        }
+        match (
+            self.retrieval_database_url.is_some(),
+            self.retrieval_model_config.is_some(),
+        ) {
+            (true, false) => errors.push(
+                "dev.retrieval_database_url is set but dev.retrieval_model_config is missing"
+                    .to_string(),
+            ),
+            (false, true) => errors.push(
+                "dev.retrieval_model_config is set but dev.retrieval_database_url is missing"
+                    .to_string(),
+            ),
+            _ => {}
         }
 
         if cfg!(target_os = "windows") && self.wasi_webgpu {
@@ -2261,6 +2322,51 @@ workload:
     fn dev_postgresql_valid_scheme_is_ok() {
         let cfg = DevConfig {
             postgres_url: Some("postgresql://user:pass@localhost/db".to_string()),
+            ..Default::default()
+        };
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn dev_retrieval_wrong_scheme_is_err() {
+        let cfg = DevConfig {
+            retrieval_database_url: Some("mysql://localhost/db".to_string()),
+            retrieval_model_config: Some(PathBuf::from("models/granite.json")),
+            ..Default::default()
+        };
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("retrieval_database_url"), "{err}");
+    }
+
+    #[test]
+    fn dev_retrieval_url_without_model_config_is_err() {
+        let cfg = DevConfig {
+            retrieval_database_url: Some(
+                "postgres://genius:genius@127.0.0.1:55433/genius_retrieval".to_string(),
+            ),
+            ..Default::default()
+        };
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("retrieval_model_config"), "{err}");
+    }
+
+    #[test]
+    fn dev_retrieval_model_config_without_url_is_err() {
+        let cfg = DevConfig {
+            retrieval_model_config: Some(PathBuf::from("models/granite.json")),
+            ..Default::default()
+        };
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("retrieval_database_url"), "{err}");
+    }
+
+    #[test]
+    fn dev_retrieval_both_set_with_postgres_url_is_ok() {
+        let cfg = DevConfig {
+            retrieval_database_url: Some(
+                "postgres://genius:genius@127.0.0.1:55433/genius_retrieval".to_string(),
+            ),
+            retrieval_model_config: Some(PathBuf::from("models/granite.json")),
             ..Default::default()
         };
         assert!(cfg.validate().is_ok());

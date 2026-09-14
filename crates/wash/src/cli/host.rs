@@ -9,6 +9,8 @@ use wash_runtime::{
     plugin::{self},
 };
 
+#[cfg(feature = "betty-retrieval")]
+use crate::cli::retrieval::{BettyRetrievalOverrides, build_betty_retrieval_config};
 use crate::cli::{CliCommand, CliContext, CommandOutput, signal};
 use crate::config::{HttpClientTrustRoots, load_config};
 
@@ -320,6 +322,54 @@ pub struct HostCommand {
     /// (e.g. postgres://user:pass@bouncer:6432?sslmode=require&pool_size=10)
     #[arg(long = "postgres-url", env = "WASH_POSTGRES_URL")]
     pub postgres_url: Option<String>,
+
+    /// PostgreSQL connection URL for the betty-blocks:retrieval plugin's own
+    /// pool. Also requires `--retrieval-model-config`.
+    #[cfg(feature = "betty-retrieval")]
+    #[arg(long = "retrieval-database-url", env = "WASH_RETRIEVAL_DATABASE_URL")]
+    pub retrieval_database_url: Option<String>,
+
+    /// Path to the granite embedding model's descriptor (MODEL.json) for the
+    /// betty-blocks:retrieval plugin. Also requires `--retrieval-database-url`.
+    #[cfg(feature = "betty-retrieval")]
+    #[arg(long = "retrieval-model-config", env = "WASH_RETRIEVAL_MODEL_CONFIG")]
+    pub retrieval_model_config: Option<PathBuf>,
+
+    /// Maximum size of the betty-blocks:retrieval plugin's connection pool.
+    /// Unset keeps the plugin's own default (8).
+    #[cfg(feature = "betty-retrieval")]
+    #[arg(long = "retrieval-pool-size", env = "WASH_RETRIEVAL_POOL_SIZE")]
+    pub retrieval_pool_size: Option<usize>,
+
+    /// How long the betty-blocks:retrieval plugin's pool waits for a new
+    /// connection before failing. Unset keeps the plugin's own default (10s).
+    #[cfg(feature = "betty-retrieval")]
+    #[arg(
+        long = "retrieval-connect-timeout-secs",
+        env = "WASH_RETRIEVAL_CONNECT_TIMEOUT_SECS"
+    )]
+    pub retrieval_connect_timeout_secs: Option<u64>,
+
+    /// `hnsw.ef_search` the betty-blocks:retrieval plugin sets on every
+    /// pooled connection. Unset keeps the plugin's own default (200).
+    #[cfg(feature = "betty-retrieval")]
+    #[arg(long = "retrieval-ef-search", env = "WASH_RETRIEVAL_EF_SEARCH")]
+    pub retrieval_ef_search: Option<u32>,
+
+    /// `hnsw.max_scan_tuples` the betty-blocks:retrieval plugin sets on every
+    /// pooled connection. Unset keeps the plugin's own default (20000).
+    #[cfg(feature = "betty-retrieval")]
+    #[arg(
+        long = "retrieval-max-scan-tuples",
+        env = "WASH_RETRIEVAL_MAX_SCAN_TUPLES"
+    )]
+    pub retrieval_max_scan_tuples: Option<u32>,
+
+    /// Threads the betty-blocks:retrieval plugin's embedder uses. Unset
+    /// keeps the plugin's own default (4).
+    #[cfg(feature = "betty-retrieval")]
+    #[arg(long = "retrieval-embed-threads", env = "WASH_RETRIEVAL_EMBED_THREADS")]
+    pub retrieval_embed_threads: Option<usize>,
 
     /// Allow insecure OCI Registries
     #[arg(long = "allow-insecure-registries", default_value_t = false)]
@@ -830,6 +880,37 @@ impl CliCommand for HostCommand {
             }
         }
 
+        #[cfg(feature = "betty-retrieval")]
+        match (&self.retrieval_database_url, &self.retrieval_model_config) {
+            (Some(database_url), Some(model_config)) => {
+                let retrieval_config = build_betty_retrieval_config(
+                    database_url.clone(),
+                    model_config.clone(),
+                    BettyRetrievalOverrides {
+                        pool_size: self.retrieval_pool_size,
+                        connect_timeout_secs: self.retrieval_connect_timeout_secs,
+                        ef_search: self.retrieval_ef_search,
+                        max_scan_tuples: self.retrieval_max_scan_tuples,
+                        embed_threads: self.retrieval_embed_threads,
+                    },
+                )
+                .context("failed to configure the betty-blocks retrieval plugin")?;
+                cluster_host_builder = cluster_host_builder.with_plugin(Arc::new(
+                    plugin::betty_retrieval::BettyRetrieval::new(retrieval_config)
+                        .context("failed to configure the betty-blocks retrieval plugin")?,
+                ))?;
+            }
+            (Some(_), None) => anyhow::bail!(
+                "--retrieval-database-url (or WASH_RETRIEVAL_DATABASE_URL) requires \
+                 --retrieval-model-config (or WASH_RETRIEVAL_MODEL_CONFIG) to also be set"
+            ),
+            (None, Some(_)) => anyhow::bail!(
+                "--retrieval-model-config (or WASH_RETRIEVAL_MODEL_CONFIG) requires \
+                 --retrieval-database-url (or WASH_RETRIEVAL_DATABASE_URL) to also be set"
+            ),
+            (None, None) => {}
+        }
+
         if let Some(interval) = self.oci_cleanup_interval {
             cluster_host_builder = cluster_host_builder.with_cleanup_interval(interval);
         }
@@ -1212,6 +1293,104 @@ mod tests {
         // credentials — never a basic auth with an empty half.
         assert_eq!(host_plugin_registry_credentials(Some("user"), None), None);
         assert_eq!(host_plugin_registry_credentials(None, Some("pass")), None);
+    }
+}
+
+#[cfg(all(test, feature = "betty-retrieval"))]
+mod retrieval_tests {
+    use clap::{CommandFactory, Parser};
+
+    use super::HostCommand;
+
+    /// `HostCommand` is an `Args` group, so give it a `Parser` to parse under.
+    #[derive(Debug, Parser)]
+    struct TestCli {
+        #[command(flatten)]
+        host: HostCommand,
+    }
+
+    fn parse(args: &[&str]) -> HostCommand {
+        TestCli::parse_from(std::iter::once("wash-host").chain(args.iter().copied())).host
+    }
+
+    #[test]
+    fn the_retrieval_flags_parse() {
+        let host = parse(&[
+            "--retrieval-database-url",
+            "postgres://genius:genius@127.0.0.1:55433/genius_retrieval",
+            "--retrieval-model-config",
+            "models/granite-embedding-107m-multilingual.json",
+            "--retrieval-pool-size",
+            "16",
+            "--retrieval-connect-timeout-secs",
+            "5",
+            "--retrieval-ef-search",
+            "100",
+            "--retrieval-max-scan-tuples",
+            "500",
+            "--retrieval-embed-threads",
+            "2",
+        ]);
+        assert_eq!(
+            host.retrieval_database_url.as_deref(),
+            Some("postgres://genius:genius@127.0.0.1:55433/genius_retrieval")
+        );
+        assert_eq!(
+            host.retrieval_model_config,
+            Some(std::path::PathBuf::from(
+                "models/granite-embedding-107m-multilingual.json"
+            ))
+        );
+        assert_eq!(host.retrieval_pool_size, Some(16));
+        assert_eq!(host.retrieval_connect_timeout_secs, Some(5));
+        assert_eq!(host.retrieval_ef_search, Some(100));
+        assert_eq!(host.retrieval_max_scan_tuples, Some(500));
+        assert_eq!(host.retrieval_embed_threads, Some(2));
+    }
+
+    #[test]
+    fn the_retrieval_flags_default_to_unset() {
+        let host = parse(&[]);
+        assert_eq!(host.retrieval_database_url, None);
+        assert_eq!(host.retrieval_model_config, None);
+        assert_eq!(host.retrieval_pool_size, None);
+        assert_eq!(host.retrieval_connect_timeout_secs, None);
+        assert_eq!(host.retrieval_ef_search, None);
+        assert_eq!(host.retrieval_max_scan_tuples, None);
+        assert_eq!(host.retrieval_embed_threads, None);
+    }
+
+    /// Locks in the env var names `wash host --help` documents and that
+    /// operators rely on to configure retrieval without a flag per process.
+    #[test]
+    fn the_retrieval_flags_are_wired_to_their_env_vars() {
+        let command = TestCli::command();
+        let expected = [
+            ("retrieval-database-url", "WASH_RETRIEVAL_DATABASE_URL"),
+            ("retrieval-model-config", "WASH_RETRIEVAL_MODEL_CONFIG"),
+            ("retrieval-pool-size", "WASH_RETRIEVAL_POOL_SIZE"),
+            (
+                "retrieval-connect-timeout-secs",
+                "WASH_RETRIEVAL_CONNECT_TIMEOUT_SECS",
+            ),
+            ("retrieval-ef-search", "WASH_RETRIEVAL_EF_SEARCH"),
+            (
+                "retrieval-max-scan-tuples",
+                "WASH_RETRIEVAL_MAX_SCAN_TUPLES",
+            ),
+            ("retrieval-embed-threads", "WASH_RETRIEVAL_EMBED_THREADS"),
+        ];
+        for (long, env) in expected {
+            let arg = command
+                .get_arguments()
+                .find(|a| a.get_long() == Some(long))
+                .unwrap_or_else(|| panic!("--{long} must be a defined flag"));
+            assert_eq!(
+                arg.get_env().and_then(|e| e.to_str()),
+                Some(env),
+                "--{long} must read from {env}"
+            );
+        }
     }
 }
 
