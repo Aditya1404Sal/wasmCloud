@@ -137,6 +137,7 @@ const P3_FIXTURES: &[&str] = &[
     "keyvalue-implements-p3",
     "keyvalue-default-p3",
     "postgres-stream-p3",
+    "retrieval-store-p3",
     "svc-counter",
     "svc-http-proxy",
     "svc-tcp-echo",
