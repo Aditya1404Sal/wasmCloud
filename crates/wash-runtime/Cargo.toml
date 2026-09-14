@@ -162,6 +162,11 @@ tokio-postgres-rustls = { optional = true, workspace = true }
 ulid = { optional = true, workspace = true, features = ["std"] }
 
 # Betty retrieval dependencies (optional, behind 'betty-retrieval' feature)
+# `genius-embed` resolves only with the context-provider POC checked out at
+# `bettyblocks/context-provider-poc`, beside this repository. Cargo loads a path
+# dependency even when it is optional or dev-only, so without that checkout the
+# whole workspace fails to resolve, with this feature off too. Vendor or publish
+# `genius-embed` before this branch is merged.
 genius-embed = { path = "../../../bettyblocks/context-provider-poc/genius-embed", optional = true }
 pgvector = { version = "=0.4.1", default-features = false, features = ["postgres"], optional = true }
 
@@ -205,6 +210,10 @@ redis = { workspace = true }
 tokio-postgres = { workspace = true, features = ["runtime"] }
 # `FakeEmbedder` for the betty-retrieval integration test. Without default
 # features, so a test build without `betty-retrieval` does not link `ort`.
+# The same path as the optional dependency above: it needs the POC checked out
+# at `bettyblocks/context-provider-poc` beside this repository, or the whole
+# workspace fails to resolve, even with the feature off. Vendor or publish
+# `genius-embed` before this branch is merged.
 genius-embed = { path = "../../../bettyblocks/context-provider-poc/genius-embed", default-features = false, features = ["fake"] }
 criterion = { version = "0.5", features = ["async_tokio", "html_reports"] }
 # Pinned to match the gungraun-runner version the bench host's Ansible

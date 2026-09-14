@@ -1,5 +1,10 @@
 //! Host side of `betty-blocks:retrieval`, owning the Postgres pool and the
 //! embedding model on behalf of the wasm component.
+//!
+//! `genius-embed` is a path dependency into the context-provider POC checkout
+//! (see this crate's `Cargo.toml`). Without that checkout the whole workspace
+//! fails to resolve, even with this feature off, so `genius-embed` must be
+//! vendored or published before this branch is merged.
 
 mod bindings;
 mod config;
