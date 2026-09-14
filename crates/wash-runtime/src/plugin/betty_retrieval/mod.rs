@@ -3,17 +3,22 @@
 
 mod bindings;
 mod config;
+mod errors;
+mod params;
+mod store;
+mod tx;
 
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use anyhow::{Context as _, anyhow};
+use anyhow::{Context as _, anyhow, bail};
 use deadpool_postgres::{Hook, HookError, Manager, ManagerConfig, Pool, RecyclingMethod};
 use genius_embed::{Adapter, Embedder, ModelConfig, space_identity};
 use tokio::sync::OnceCell;
 use url::Url;
 
-use crate::plugin::HostPlugin;
+use crate::engine::workload::WorkloadItem;
+use crate::plugin::{HostPlugin, WitInterfaces};
 use crate::wit::{WitInterface, WitWorld};
 
 pub use config::BettyRetrievalConfig;
@@ -35,9 +40,7 @@ pub struct SpaceInfo {
 /// pgvector vectors before a statement reaches the database.
 pub struct BettyRetrieval {
     config: BettyRetrievalConfig,
-    /// Exposed via [`Self::embedder`], for `store`'s host functions once they
-    /// link (next task).
-    #[allow(dead_code)]
+    /// Turns `embed` bind parameters into vectors.
     embedder: Arc<dyn Embedder>,
     space: SpaceInfo,
     /// Filled by [`HostPlugin::start`]; a plugin that never started has none.
@@ -91,16 +94,14 @@ impl BettyRetrieval {
     }
 
     /// The pool [`HostPlugin::start`] opened, or an error if it has not run
-    /// yet. Called by `store`'s host functions once they link (next task).
-    #[allow(dead_code)]
+    /// yet.
     pub(crate) fn pool(&self) -> anyhow::Result<&Pool> {
         self.pool
             .get()
             .ok_or_else(|| anyhow!("the betty-retrieval plugin has not started its pool yet"))
     }
 
-    /// Called by `store`'s host functions once they link (next task).
-    #[allow(dead_code)]
+    /// The model `embed` bind parameters resolve with.
     pub(crate) fn embedder(&self) -> &Arc<dyn Embedder> {
         &self.embedder
     }
@@ -237,6 +238,29 @@ impl HostPlugin for BettyRetrieval {
         self.pool
             .set(pool)
             .map_err(|_| anyhow!("the betty-retrieval plugin already started"))?;
+        Ok(())
+    }
+
+    async fn on_workload_item_bind<'a>(
+        &self,
+        item: &mut WorkloadItem<'a>,
+        interfaces: WitInterfaces<'_>,
+    ) -> anyhow::Result<()> {
+        let retrieval: Vec<&WitInterface> = interfaces
+            .iter()
+            .filter(|i| i.namespace == "betty-blocks" && i.package == "retrieval")
+            .collect();
+        if retrieval.is_empty() {
+            return Ok(());
+        }
+        if retrieval.iter().any(|i| !i.config.is_empty()) {
+            bail!(
+                "betty-blocks:retrieval does not read interface config: the database and model are \
+                 host settings (`wash host --retrieval-*` flags or `dev.retrieval_*` keys), not \
+                 workload config"
+            );
+        }
+        store::add_to_linker(item.linker())?;
         Ok(())
     }
 

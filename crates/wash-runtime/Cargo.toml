@@ -61,7 +61,7 @@ wasmcloud-postgres = [
 ]
 # Betty retrieval host plugin: owns the Postgres pool and the granite
 # embedding model behind betty-blocks:retrieval.
-betty-retrieval = ["wasmcloud-postgres", "dep:genius-embed", "dep:pgvector"]
+betty-retrieval = ["wasmcloud-postgres", "dep:genius-embed", "dep:pgvector", "dep:sha2"]
 # BettyBlocks: SMTP host-plugin feature (retained in upstream merge).
 wasmcloud-smtp = ["dep:html2text", "dep:lettre"]
 wasi-tls = ["dep:wasmtime-wasi-tls"]
