@@ -3,15 +3,18 @@
 
 use std::sync::Arc;
 
+use bytes::BytesMut;
 use genius_embed::Embedder;
 use pgvector::Vector;
 use sha2::{Digest as _, Sha256};
-use tokio_postgres::types::ToSql;
+use tokio_postgres::types::{Format, IsNull, ToSql, Type};
 
 use super::bindings::betty_blocks::retrieval::types::{Error, Param, Role};
 use super::bindings::wasmcloud::postgres::types::PgValue;
+use super::errors::{self, ParamEncodeError};
 
 /// A resolved parameter, owning whatever its statement borrows.
+#[derive(Debug)]
 pub(crate) enum Bound {
     Value(PgValue),
     Vector(Vector),
@@ -19,7 +22,7 @@ pub(crate) enum Bound {
 }
 
 impl Bound {
-    pub(crate) fn as_sql(&self) -> &(dyn ToSql + Sync) {
+    fn inner(&self) -> &(dyn ToSql + Sync) {
         match self {
             Bound::Value(v) => v,
             Bound::Vector(v) => v,
@@ -28,9 +31,51 @@ impl Bound {
     }
 }
 
+/// Encodes exactly as the value it holds. A failure is wrapped in
+/// [`ParamEncodeError`], so it is reported as the parameter's fault rather
+/// than the connection's.
+impl ToSql for Bound {
+    fn to_sql(
+        &self,
+        ty: &Type,
+        out: &mut BytesMut,
+    ) -> Result<IsNull, Box<dyn std::error::Error + Sync + Send>> {
+        self.to_sql_checked(ty, out)
+    }
+
+    fn accepts(_ty: &Type) -> bool {
+        true
+    }
+
+    fn to_sql_checked(
+        &self,
+        ty: &Type,
+        out: &mut BytesMut,
+    ) -> Result<IsNull, Box<dyn std::error::Error + Sync + Send>> {
+        self.inner()
+            .to_sql_checked(ty, out)
+            .map_err(|e| ParamEncodeError::new(e).into())
+    }
+
+    fn encode_format(&self, ty: &Type) -> Format {
+        self.inner().encode_format(ty)
+    }
+}
+
 /// `bound` as the slice tokio-postgres binds, in parameter order.
 pub(crate) fn as_sql(bound: &[Bound]) -> Vec<&(dyn ToSql + Sync)> {
-    bound.iter().map(Bound::as_sql).collect()
+    bound.iter().map(|b| b as &(dyn ToSql + Sync)).collect()
+}
+
+/// Refuses a statement whose placeholders and bound parameters differ in
+/// number, before it runs.
+pub(crate) fn check_count(expected: usize, bound: usize) -> Result<(), Error> {
+    if expected == bound {
+        return Ok(());
+    }
+    Err(errors::invalid_params(format!(
+        "statement expects {expected} parameters but {bound} were bound"
+    )))
 }
 
 pub(crate) fn embed_role(role: Role) -> genius_embed::Role {
@@ -101,6 +146,7 @@ async fn embed_many(
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    use super::super::bindings::wasmcloud::postgres::types::Error as PgError;
     use super::*;
 
     /// A pure function of each text and role, so a reordered output shows,
@@ -263,6 +309,44 @@ mod tests {
                 Resolved::Vector(vector_for("alpha", genius_embed::Role::Query)),
             ]
         );
+    }
+
+    #[test]
+    fn a_bound_value_encodes_exactly_as_the_value_it_holds() {
+        let value = PgValue::Text("orders".to_string());
+        let mut direct = BytesMut::new();
+        let mut through = BytesMut::new();
+        assert!(value.to_sql_checked(&Type::TEXT, &mut direct).is_ok());
+        assert!(
+            Bound::Value(value)
+                .to_sql_checked(&Type::TEXT, &mut through)
+                .is_ok()
+        );
+        assert_eq!(through, direct);
+    }
+
+    #[test]
+    fn a_parameter_that_cannot_encode_is_tagged_as_the_parameters_fault() {
+        let err = Bound::Vector(Vector::from(vec![0.5]))
+            .to_sql_checked(&Type::TEXT, &mut BytesMut::new())
+            .err()
+            .expect("a vector does not encode as text");
+        assert!(err.is::<ParamEncodeError>(), "{err}");
+        assert!(
+            err.source()
+                .is_some_and(|source| source.is::<tokio_postgres::types::WrongType>()),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_parameter_count_mismatch_is_invalid_params() {
+        assert!(check_count(2, 2).is_ok());
+        assert!(matches!(
+            check_count(2, 1),
+            Err(Error::Postgres(PgError::InvalidParams(m)))
+                if m == "statement expects 2 parameters but 1 were bound"
+        ));
     }
 
     #[tokio::test]

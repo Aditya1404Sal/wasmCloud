@@ -26,10 +26,14 @@ pub(crate) mod conversions {
     include!("../wasmcloud_postgres/conversions.rs");
 
     /// Convert one fetched row into WIT `pg-value`s, in column order. A
-    /// `String` error names the column that failed to convert.
+    /// `String` error names the column that failed to convert, and why.
     pub(crate) fn row_to_values(r: &Row) -> Result<Vec<PgValue>, String> {
         (0..r.len())
-            .map(|idx| r.try_get(idx).map_err(|e| format!("column {idx}: {e}")))
+            .map(|idx| {
+                r.try_get(idx).map_err(|e| {
+                    format!("column {idx}: {}", super::super::errors::with_sources(&e))
+                })
+            })
             .collect()
     }
 }

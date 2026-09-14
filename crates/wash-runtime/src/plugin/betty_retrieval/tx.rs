@@ -12,8 +12,9 @@ use super::bindings::betty_blocks::retrieval::store::{HostTransaction, HostTrans
 use super::bindings::betty_blocks::retrieval::types;
 use super::bindings::conversions::row_to_values;
 use super::bindings::wasmcloud::postgres::types::Row;
+use super::params::{self, Bound};
 use super::store::{QueryResult, checkout, plugin};
-use super::{BettyRetrieval, errors, params};
+use super::{BettyRetrieval, errors};
 
 const CANCELLED: &str = "a statement was cancelled before it finished";
 
@@ -35,12 +36,13 @@ impl TxConn {
         self.client.as_ref().ok_or_else(finished)
     }
 
-    /// The pinned connection, and a guard for the statement about to run on it.
-    fn start_statement(
+    /// The pinned connection, and where a statement run on it records why the
+    /// transaction can no longer commit.
+    fn statement_parts(
         &mut self,
-    ) -> Result<(&deadpool_postgres::Object, StatementGuard<'_>), types::Error> {
+    ) -> Result<(&deadpool_postgres::Object, &mut Option<String>), types::Error> {
         let client = self.client.as_ref().ok_or_else(finished)?;
-        Ok((client, StatementGuard::arm(&mut self.aborted)))
+        Ok((client, &mut self.aborted))
     }
 
     /// Back to the pool, once the server has ended the transaction.
@@ -142,6 +144,20 @@ fn conn<U>(
     accessor.with(|mut access| wasmtime::Result::Ok(Arc::clone(&access.get().table.get(tx)?.conn)))
 }
 
+/// Prepare `sql` under a guard, then refuse it before it runs if its
+/// placeholders and the bound parameters differ in number.
+async fn prepare_checked(
+    client: &deadpool_postgres::Object,
+    aborted: &mut Option<String>,
+    sql: &str,
+    bound: &[Bound],
+) -> Result<tokio_postgres::Statement, types::Error> {
+    let guard = StatementGuard::arm(aborted);
+    let stmt = guard.finish(client.prepare(sql).await)?;
+    params::check_count(stmt.params().len(), bound.len())?;
+    Ok(stmt)
+}
+
 /// Every row, read before returning: rows streamed lazily would keep the
 /// pinned connection busy, and a `commit` would wait behind them.
 async fn collect_query(
@@ -152,14 +168,10 @@ async fn collect_query(
 ) -> Result<(Vec<String>, Vec<Row>), types::Error> {
     let bound = params::resolve(plugin.embedder(), params).await?;
     let mut conn = conn.lock().await;
-    let (client, guard) = conn.start_statement()?;
-    let outcome = async {
-        let stmt = client.prepare(sql).await?;
-        let rows = client.query(&stmt, &params::as_sql(&bound)).await?;
-        Ok::<_, tokio_postgres::Error>((stmt, rows))
-    }
-    .await;
-    let (stmt, rows) = guard.finish(outcome)?;
+    let (client, aborted) = conn.statement_parts()?;
+    let stmt = prepare_checked(client, aborted, sql, &bound).await?;
+    let guard = StatementGuard::arm(aborted);
+    let rows = guard.finish(client.query(&stmt, &params::as_sql(&bound)).await)?;
     let columns = stmt
         .columns()
         .iter()
@@ -180,13 +192,16 @@ async fn run_execute(
 ) -> Result<u64, types::Error> {
     let bound = params::resolve(plugin.embedder(), params).await?;
     let mut conn = conn.lock().await;
-    let (client, guard) = conn.start_statement()?;
-    guard.finish(client.execute(sql, &params::as_sql(&bound)).await)
+    let (client, aborted) = conn.statement_parts()?;
+    let stmt = prepare_checked(client, aborted, sql, &bound).await?;
+    let guard = StatementGuard::arm(aborted);
+    guard.finish(client.execute(&stmt, &params::as_sql(&bound)).await)
 }
 
 async fn run_batch(conn: &Mutex<TxConn>, sql: &str) -> Result<(), types::Error> {
     let mut conn = conn.lock().await;
-    let (client, guard) = conn.start_statement()?;
+    let (client, aborted) = conn.statement_parts()?;
+    let guard = StatementGuard::arm(aborted);
     guard.finish(client.batch_execute(sql).await)
 }
 

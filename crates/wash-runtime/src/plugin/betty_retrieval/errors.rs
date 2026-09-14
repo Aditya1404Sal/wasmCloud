@@ -5,24 +5,54 @@ use deadpool_postgres::{PoolError, TimeoutType};
 use super::bindings::betty_blocks::retrieval::types::Error;
 use super::bindings::wasmcloud::postgres::types::{DbError, Error as PgError};
 
+/// A bind parameter tokio-postgres could not encode. It displays as the
+/// original error, which is also its source.
+#[derive(Debug)]
+pub(crate) struct ParamEncodeError(Box<dyn std::error::Error + Sync + Send>);
+
+impl ParamEncodeError {
+    pub(crate) fn new(source: Box<dyn std::error::Error + Sync + Send>) -> Self {
+        Self(source)
+    }
+}
+
+impl std::fmt::Display for ParamEncodeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.0, f)
+    }
+}
+
+impl std::error::Error for ParamEncodeError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&*self.0)
+    }
+}
+
 /// A statement's failure. A database error keeps its SQLSTATE so a component
-/// can branch on `code`; a parameter that could not encode as its column's
-/// type is `invalid-params`; anything else is the connection's.
+/// can branch on `code`; anything else failed before reaching the database.
 pub(crate) fn postgres(e: &tokio_postgres::Error) -> Error {
-    if let Some(db) = e.as_db_error() {
-        return Error::Postgres(PgError::QueryFailed(DbError {
+    match e.as_db_error() {
+        Some(db) => Error::Postgres(PgError::QueryFailed(DbError {
             code: db.code().code().to_string(),
             severity: db.severity().to_string(),
             message: db.message().to_string(),
             detail: db.detail().map(ToString::to_string),
             extras: Vec::new(),
-        }));
+        })),
+        None => client_side(e),
     }
+}
+
+/// A failure the database did not report. A bind parameter's fault is
+/// `invalid-params`, which no retry fixes; anything else is the connection's.
+fn client_side(e: &(dyn std::error::Error + 'static)) -> Error {
     let message = with_sources(e);
-    if caused_by_wrong_type(e) {
-        Error::Postgres(PgError::InvalidParams(message))
+    let parameter = std::iter::successors(Some(e), |e| e.source())
+        .any(|e| e.is::<ParamEncodeError>() || e.is::<postgres_types::WrongType>());
+    if parameter {
+        invalid_params(message)
     } else {
-        Error::Postgres(PgError::ConnectionFailed(message))
+        connection_failed(message)
     }
 }
 
@@ -41,6 +71,10 @@ pub(crate) fn pool(e: &PoolError) -> Error {
 
 pub(crate) fn connection_failed(message: String) -> Error {
     Error::Postgres(PgError::ConnectionFailed(message))
+}
+
+pub(crate) fn invalid_params(message: String) -> Error {
+    Error::Postgres(PgError::InvalidParams(message))
 }
 
 /// A returned value with no `pg-value` to become.
@@ -63,14 +97,10 @@ pub(crate) fn aborted_transaction(first_error: String) -> Error {
     }))
 }
 
-fn caused_by_wrong_type(e: &(dyn std::error::Error + 'static)) -> bool {
-    std::iter::successors(Some(e), |e| e.source()).any(|e| e.is::<postgres_types::WrongType>())
-}
-
 /// `e` and each of its sources: tokio-postgres's own `Display` names only the
 /// kind of failure ("error serializing parameter 0"), never its cause, while
 /// deadpool's already ends with its source, which is not repeated.
-fn with_sources(e: &(dyn std::error::Error + 'static)) -> String {
+pub(crate) fn with_sources(e: &(dyn std::error::Error + 'static)) -> String {
     let mut message = String::new();
     for err in std::iter::successors(Some(e), |e| e.source()) {
         let text = err.to_string();
@@ -91,24 +121,26 @@ fn with_sources(e: &(dyn std::error::Error + 'static)) -> String {
 mod tests {
     use super::*;
 
+    /// Like tokio-postgres's `Error`: `Display` names only the kind of failure,
+    /// and the cause is left to `source`.
     #[derive(Debug)]
-    struct SerializeFailed(postgres_types::WrongType);
+    struct KindOnly(&'static str, Box<dyn std::error::Error + Sync + Send>);
 
-    impl std::fmt::Display for SerializeFailed {
+    impl std::fmt::Display for KindOnly {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            f.write_str("error serializing parameter 0")
+            f.write_str(self.0)
         }
     }
 
-    impl std::error::Error for SerializeFailed {
+    impl std::error::Error for KindOnly {
         fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-            Some(&self.0)
+            Some(&*self.1)
         }
     }
 
     /// Like deadpool's `PoolError`: its `Display` already ends with its source.
     #[derive(Debug)]
-    struct CreateFailed(SerializeFailed);
+    struct CreateFailed(KindOnly);
 
     impl std::fmt::Display for CreateFailed {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -120,6 +152,14 @@ mod tests {
         fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
             Some(&self.0)
         }
+    }
+
+    fn serializing(cause: impl std::error::Error + Sync + Send + 'static) -> KindOnly {
+        KindOnly("error serializing parameter 0", Box::new(cause))
+    }
+
+    fn wrong_type() -> postgres_types::WrongType {
+        postgres_types::WrongType::new::<i32>(postgres_types::Type::TEXT)
     }
 
     fn query_failed(err: Error) -> Option<DbError> {
@@ -161,29 +201,50 @@ mod tests {
     }
 
     #[test]
-    fn a_wrong_type_anywhere_in_the_source_chain_is_detected() {
-        let wrong = postgres_types::WrongType::new::<i32>(postgres_types::Type::TEXT);
-        assert!(caused_by_wrong_type(&SerializeFailed(wrong)));
-        assert!(!caused_by_wrong_type(&std::io::Error::other(
-            "connection reset by peer"
-        )));
+    fn a_parameter_that_failed_to_encode_is_invalid_params() {
+        let encode = ParamEncodeError::new("invalid character in a UUID".into());
+        assert!(matches!(
+            client_side(&serializing(encode)),
+            Error::Postgres(PgError::InvalidParams(m))
+                if m == "error serializing parameter 0: invalid character in a UUID"
+        ));
     }
 
     #[test]
-    fn a_message_carries_every_source() {
-        let wrong = postgres_types::WrongType::new::<i32>(postgres_types::Type::TEXT);
+    fn a_value_of_the_wrong_rust_type_is_invalid_params() {
+        assert!(matches!(
+            client_side(&serializing(wrong_type())),
+            Error::Postgres(PgError::InvalidParams(_))
+        ));
+    }
+
+    #[test]
+    fn a_failure_no_parameter_caused_is_connection_failed() {
+        assert!(matches!(
+            client_side(&std::io::Error::other("connection reset by peer")),
+            Error::Postgres(PgError::ConnectionFailed(m)) if m == "connection reset by peer"
+        ));
+    }
+
+    #[test]
+    fn a_message_carries_every_nested_cause() {
+        let decode = KindOnly(
+            "error deserializing column 2",
+            Box::new(KindOnly(
+                "unsupported type [vector]",
+                "no pg-value decodes it".into(),
+            )),
+        );
         assert_eq!(
-            with_sources(&SerializeFailed(wrong)),
-            "error serializing parameter 0: cannot convert between the Rust type `i32` and the \
-             Postgres type `text`"
+            with_sources(&decode),
+            "error deserializing column 2: unsupported type [vector]: no pg-value decodes it"
         );
     }
 
     #[test]
     fn a_source_its_wrapper_already_prints_is_not_repeated() {
-        let wrong = postgres_types::WrongType::new::<i32>(postgres_types::Type::TEXT);
         assert_eq!(
-            with_sources(&CreateFailed(SerializeFailed(wrong))),
+            with_sources(&CreateFailed(serializing(wrong_type()))),
             "error occurred while creating a new object: error serializing parameter 0: cannot \
              convert between the Rust type `i32` and the Postgres type `text`"
         );

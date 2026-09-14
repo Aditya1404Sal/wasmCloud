@@ -70,10 +70,7 @@ async fn start_query(
 ) -> Result<Streaming, types::Error> {
     let bound = params::resolve(plugin.embedder(), params).await?;
     let client = checkout(plugin).await?;
-    let stmt = client
-        .prepare(sql)
-        .await
-        .map_err(|e| errors::postgres(&e))?;
+    let stmt = prepare_checked(&client, sql, &bound).await?;
     let columns = stmt
         .columns()
         .iter()
@@ -89,6 +86,21 @@ async fn start_query(
         rows,
         done,
     })
+}
+
+/// Prepare `sql`, refusing it before it runs if its placeholders and the bound
+/// parameters differ in number.
+async fn prepare_checked(
+    client: &deadpool_postgres::Client,
+    sql: &str,
+    bound: &[Bound],
+) -> Result<tokio_postgres::Statement, types::Error> {
+    let stmt = client
+        .prepare(sql)
+        .await
+        .map_err(|e| errors::postgres(&e))?;
+    params::check_count(stmt.params().len(), bound.len())?;
+    Ok(stmt)
 }
 
 async fn drain_query(
@@ -156,8 +168,9 @@ async fn run_execute(
 ) -> Result<u64, types::Error> {
     let bound = params::resolve(plugin.embedder(), params).await?;
     let client = checkout(plugin).await?;
+    let stmt = prepare_checked(&client, sql, &bound).await?;
     client
-        .execute(sql, &params::as_sql(&bound))
+        .execute(&stmt, &params::as_sql(&bound))
         .await
         .map_err(|e| errors::postgres(&e))
 }
