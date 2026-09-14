@@ -37,8 +37,9 @@ impl BettyRetrievalConfig {
         }
     }
 
-    /// Refuses a zero pool size, connect timeout, embed thread count or
-    /// `ef_search`, and a `database_url` that is not `postgres`/`postgresql`.
+    /// Refuses a zero pool size, connect timeout, embed thread count,
+    /// `ef_search` or `max_scan_tuples`, and a `database_url` that is not
+    /// `postgres`/`postgresql`.
     pub fn validate(&self) -> anyhow::Result<()> {
         if self.pool_size == 0 {
             bail!("pool_size must be greater than zero");
@@ -51,6 +52,9 @@ impl BettyRetrievalConfig {
         }
         if self.ef_search == 0 {
             bail!("ef_search must be greater than zero");
+        }
+        if self.max_scan_tuples == 0 {
+            bail!("max_scan_tuples must be greater than zero");
         }
         let url = Url::parse(&self.database_url)
             .with_context(|| format!("database_url {:?} is not a valid url", self.database_url))?;
@@ -148,6 +152,17 @@ mod tests {
             .expect_err("a zero ef_search must be refused")
             .to_string();
         assert!(err.contains("ef_search"), "{err}");
+    }
+
+    #[test]
+    fn validate_refuses_a_zero_max_scan_tuples() {
+        let mut cfg = config();
+        cfg.max_scan_tuples = 0;
+        let err = cfg
+            .validate()
+            .expect_err("a zero max_scan_tuples must be refused")
+            .to_string();
+        assert!(err.contains("max_scan_tuples"), "{err}");
     }
 
     #[test]
