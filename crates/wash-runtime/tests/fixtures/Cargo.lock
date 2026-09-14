@@ -807,6 +807,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "retrieval-store-p3"
+version = "0.0.0"
+dependencies = [
+ "futures",
+ "wit-bindgen 0.60.0",
+]
+
+[[package]]
 name = "secrets-caller"
 version = "0.0.0"
 dependencies = [

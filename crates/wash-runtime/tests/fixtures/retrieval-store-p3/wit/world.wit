@@ -1,0 +1,14 @@
+package wasmcloud:retrieval-store-p3;
+
+// Drives the betty-blocks:retrieval host plugin from a guest: one check per
+// request path, answered with what the guest observed. The monotonic clock
+// races a statement so the guest can drop it mid-flight.
+world retrieval-store-p3 {
+    import wasi:http/types@0.3.0;
+    import wasi:clocks/types@0.3.0;
+    import wasi:clocks/monotonic-clock@0.3.0;
+    import betty-blocks:retrieval/types@0.1.0;
+    import betty-blocks:retrieval/store@0.1.0;
+
+    export wasi:http/handler@0.3.0;
+}
