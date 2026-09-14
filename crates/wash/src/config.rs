@@ -1886,15 +1886,18 @@ pub fn example_config() -> Config {
     }
 }
 
+/// Refuses `value` unless it is a URL with one of the `expected` schemes. The
+/// message names `field` and never the value: a URL can carry a password, in
+/// its userinfo or its query string.
 fn check_url_scheme(field: &str, value: &str, expected: &[&str], errors: &mut Vec<String>) {
     match url::Url::parse(value) {
         Ok(u) if expected.contains(&u.scheme()) => {}
         Ok(u) => errors.push(format!(
-            "{field} '{value}' has scheme '{}', expected one of: {}",
+            "{field} has scheme '{}', expected one of: {}",
             u.scheme(),
             expected.join(", ")
         )),
-        Err(e) => errors.push(format!("{field} '{value}' is not a valid URL: {e}")),
+        Err(e) => errors.push(format!("{field} is not a valid URL: {e}")),
     }
 }
 
@@ -2336,6 +2339,23 @@ workload:
         };
         let err = cfg.validate().unwrap_err().to_string();
         assert!(err.contains("retrieval_database_url"), "{err}");
+    }
+
+    #[test]
+    fn dev_retrieval_url_errors_leave_out_the_password() {
+        for url in [
+            "postgres://genius:hunter2@127.0.0.1:5543x/genius_retrieval",
+            "mysql://genius:hunter2@127.0.0.1/genius_retrieval",
+        ] {
+            let cfg = DevConfig {
+                retrieval_database_url: Some(url.to_string()),
+                retrieval_model_config: Some(PathBuf::from("models/granite.json")),
+                ..Default::default()
+            };
+            let err = cfg.validate().unwrap_err().to_string();
+            assert!(err.contains("dev.retrieval_database_url"), "{err}");
+            assert!(!err.contains("hunter2"), "{err}");
+        }
     }
 
     #[test]
