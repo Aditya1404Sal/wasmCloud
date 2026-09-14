@@ -1,6 +1,12 @@
 //! Host side of `betty-blocks:retrieval`, owning the Postgres pool and the
 //! embedding model on behalf of the wasm component.
 //!
+//! A workload lists `wasmcloud:postgres/types@0.2.0` beside
+//! `betty-blocks:retrieval/types,store@0.1.0`: the retrieval types use the
+//! postgres ones, so a component imports both, and this plugin links the
+//! postgres types only for a workload that lists them. `wash dev` derives both
+//! entries from the component's imports.
+//!
 //! `genius-embed` is a path dependency into the context-provider POC checkout
 //! (see this crate's `Cargo.toml`). Without that checkout the whole workspace
 //! fails to resolve, even with this feature off, so `genius-embed` must be
