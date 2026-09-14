@@ -17,6 +17,7 @@ use genius_embed::{Adapter, Embedder, ModelConfig, space_identity};
 use tokio::sync::OnceCell;
 use url::Url;
 
+use crate::engine::ctx::{ActiveCtx, SharedCtx, extract_active_ctx};
 use crate::engine::workload::WorkloadItem;
 use crate::plugin::{HostPlugin, WitInterfaces};
 use crate::wit::{WitInterface, WitWorld};
@@ -193,6 +194,8 @@ fn build_pool(mgr: Manager, config: &BettyRetrievalConfig) -> anyhow::Result<Poo
         .context("build the betty-retrieval connection pool")
 }
 
+impl bindings::wasmcloud::postgres::types::Host for ActiveCtx<'_> {}
+
 #[async_trait::async_trait]
 impl HostPlugin for BettyRetrieval {
     fn id(&self) -> &'static str {
@@ -201,9 +204,10 @@ impl HostPlugin for BettyRetrieval {
 
     fn world(&self) -> WitWorld {
         WitWorld {
-            imports: HashSet::from([WitInterface::from(
-                "betty-blocks:retrieval/types,store@0.1.0",
-            )]),
+            imports: HashSet::from([
+                WitInterface::from("betty-blocks:retrieval/types,store@0.1.0"),
+                WitInterface::from("wasmcloud:postgres/types@0.2.0"),
+            ]),
             ..Default::default()
         }
     }
@@ -251,6 +255,8 @@ impl HostPlugin for BettyRetrieval {
             .filter(|i| i.namespace == "betty-blocks" && i.package == "retrieval")
             .collect();
         if retrieval.is_empty() {
+            // Alone, a postgres types entry is a stock-postgres workload's, and
+            // that plugin links the types when it binds query or prepared.
             return Ok(());
         }
         if retrieval.iter().any(|i| !i.config.is_empty()) {
@@ -260,7 +266,19 @@ impl HostPlugin for BettyRetrieval {
                  workload config"
             );
         }
-        store::add_to_linker(item.linker())?;
+        let linker = item.linker();
+        store::add_to_linker(linker)?;
+        // Plugins are offered interfaces in id order, so this plugin gets the
+        // postgres types entry before the stock one, which would bail on it.
+        if interfaces
+            .iter()
+            .any(|i| i.namespace == "wasmcloud" && i.package == "postgres")
+        {
+            bindings::wasmcloud::postgres::types::add_to_linker::<_, SharedCtx>(
+                linker,
+                extract_active_ctx,
+            )?;
+        }
         Ok(())
     }
 
@@ -310,6 +328,18 @@ mod tests {
             BettyRetrieval::with_embedder(stub_config(), Arc::new(StubEmbedder), stub_space())
                 .expect("with_embedder builds a plugin from a stub embedder");
         assert_eq!(plugin.space(), &stub_space());
+    }
+
+    #[test]
+    fn the_world_claims_the_postgres_types_the_retrieval_types_use() {
+        let plugin =
+            BettyRetrieval::with_embedder(stub_config(), Arc::new(StubEmbedder), stub_space())
+                .expect("with_embedder builds a plugin from a stub embedder");
+        let imports = plugin.world().imports;
+        assert!(imports.contains(&WitInterface::from(
+            "betty-blocks:retrieval/types,store@0.1.0"
+        )));
+        assert!(imports.contains(&WitInterface::from("wasmcloud:postgres/types@0.2.0")));
     }
 
     #[test]
