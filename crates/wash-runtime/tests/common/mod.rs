@@ -13,6 +13,9 @@ pub mod tls;
 #[cfg(feature = "wasmcloud-postgres")]
 pub mod postgres;
 
+#[cfg(feature = "betty-retrieval")]
+pub mod retrieval;
+
 pub mod streaming;
 
 use anyhow::{Context, Result};

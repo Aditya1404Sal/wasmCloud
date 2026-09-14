@@ -203,6 +203,9 @@ testcontainers = { workspace = true }
 redis = { workspace = true }
 # postgres client for admin setup (create roles/tables) in tests
 tokio-postgres = { workspace = true, features = ["runtime"] }
+# `FakeEmbedder` for the betty-retrieval integration test. Without default
+# features, so a test build without `betty-retrieval` does not link `ort`.
+genius-embed = { path = "../../../bettyblocks/context-provider-poc/genius-embed", default-features = false, features = ["fake"] }
 criterion = { version = "0.5", features = ["async_tokio", "html_reports"] }
 # Pinned to match the gungraun-runner version the bench host's Ansible
 # playbook installs (scripts/bench/ansible/provision.yml). gungraun
