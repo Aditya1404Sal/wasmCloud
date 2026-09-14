@@ -177,6 +177,8 @@ mod roster_tests {
         ids.push(super::wasi_webgpu::WASI_WEBGPU_ID);
         #[cfg(all(feature = "wasmcloud-postgres", not(doctest)))]
         ids.push(super::wasmcloud_postgres::PLUGIN_POSTGRES_ID);
+        #[cfg(feature = "betty-retrieval")]
+        ids.push(super::betty_retrieval::PLUGIN_BETTY_RETRIEVAL_ID);
         #[cfg(feature = "wasmcloud-nats")]
         ids.push(super::wasmcloud_nats::PLUGIN_NATS_ID);
 
