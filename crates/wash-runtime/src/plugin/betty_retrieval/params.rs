@@ -7,7 +7,7 @@ use bytes::BytesMut;
 use genius_embed::Embedder;
 use pgvector::Vector;
 use sha2::{Digest as _, Sha256};
-use tokio_postgres::types::{Format, IsNull, ToSql, Type};
+use tokio_postgres::types::{Format, IsNull, Kind, ToSql, Type, WrongType};
 
 use super::bindings::betty_blocks::retrieval::types::{Error, Param, Role};
 use super::bindings::wasmcloud::postgres::types::PgValue;
@@ -52,6 +52,15 @@ impl ToSql for Bound {
         ty: &Type,
         out: &mut BytesMut,
     ) -> Result<IsNull, Box<dyn std::error::Error + Sync + Send>> {
+        // `PgValue` accepts every type, so without this a list would reach a
+        // postgres-types slice encoder, which panics on a type that is not an
+        // array.
+        if let Bound::Value(value) = self
+            && !has_array_levels(ty, array_levels(value))
+        {
+            let wrong = WrongType::new::<PgValue>(ty.clone());
+            return Err(ParamEncodeError::new(Box::new(wrong)).into());
+        }
         self.inner()
             .to_sql_checked(ty, out)
             .map_err(|e| ParamEncodeError::new(e).into())
@@ -60,6 +69,64 @@ impl ToSql for Bound {
     fn encode_format(&self, ty: &Type) -> Format {
         self.inner().encode_format(ty)
     }
+}
+
+/// How many nested lists the stock conversion encodes `value` as. `int2-vector`,
+/// `path` and `polygon` count too: each of them is encoded as a list.
+fn array_levels(value: &PgValue) -> usize {
+    match value {
+        PgValue::Int2VectorArray(_) | PgValue::PathArray(_) | PgValue::PolygonArray(_) => 2,
+        PgValue::Int8Array(_)
+        | PgValue::BoolArray(_)
+        | PgValue::Float8Array(_)
+        | PgValue::Float4Array(_)
+        | PgValue::Int4Array(_)
+        | PgValue::NumericArray(_)
+        | PgValue::Int2Array(_)
+        | PgValue::Int2Vector(_)
+        | PgValue::BitArray(_)
+        | PgValue::VarbitArray(_)
+        | PgValue::ByteaArray(_)
+        | PgValue::CharArray(_)
+        | PgValue::VarcharArray(_)
+        | PgValue::CidrArray(_)
+        | PgValue::InetArray(_)
+        | PgValue::MacaddrArray(_)
+        | PgValue::Macaddr8Array(_)
+        | PgValue::BoxArray(_)
+        | PgValue::CircleArray(_)
+        | PgValue::LineArray(_)
+        | PgValue::LsegArray(_)
+        | PgValue::Path(_)
+        | PgValue::PointArray(_)
+        | PgValue::Polygon(_)
+        | PgValue::DateArray(_)
+        | PgValue::IntervalArray(_)
+        | PgValue::TimeArray(_)
+        | PgValue::TimeTzArray(_)
+        | PgValue::TimestampArray(_)
+        | PgValue::TimestampTzArray(_)
+        | PgValue::JsonArray(_)
+        | PgValue::JsonbArray(_)
+        | PgValue::MoneyArray(_)
+        | PgValue::PgLsnArray(_)
+        | PgValue::NameArray(_)
+        | PgValue::TextArray(_)
+        | PgValue::XmlArray(_)
+        | PgValue::UuidArray(_) => 1,
+        _ => 0,
+    }
+}
+
+/// Whether `ty` is an array `levels` deep: an array whose members are arrays,
+/// and so on.
+fn has_array_levels(ty: &Type, levels: usize) -> bool {
+    (0..levels)
+        .try_fold(ty, |ty, _| match ty.kind() {
+            Kind::Array(member) => Some(member),
+            _ => None,
+        })
+        .is_some()
 }
 
 /// `bound` as the slice tokio-postgres binds, in parameter order.
@@ -337,6 +404,54 @@ mod tests {
                 .is_some_and(|source| source.is::<tokio_postgres::types::WrongType>()),
             "{err}"
         );
+    }
+
+    #[test]
+    fn a_list_bound_to_a_type_with_fewer_array_levels_is_wrong_type_rather_than_a_panic() {
+        let point = ((0, 0, 1), (0, 0, 1));
+        for (value, ty) in [
+            (PgValue::Int4Array(vec![1, 2]), Type::INT4),
+            (PgValue::TextArray(vec!["orders".to_string()]), Type::TEXT),
+            (PgValue::Int2Vector(vec![1]), Type::INT2),
+            (PgValue::Path(vec![point]), Type::PATH),
+            (PgValue::Int2VectorArray(vec![vec![1]]), Type::INT2_ARRAY),
+            (PgValue::PathArray(vec![vec![point]]), Type::POINT_ARRAY),
+        ] {
+            let mut out = BytesMut::new();
+            let err = Bound::Value(value)
+                .to_sql_checked(&ty, &mut out)
+                .err()
+                .expect("a list must not encode as a type with fewer array levels");
+            assert!(err.is::<ParamEncodeError>(), "{ty}: {err}");
+            assert!(
+                err.source().is_some_and(|source| source.is::<WrongType>()),
+                "{ty}: {err}"
+            );
+            assert!(out.is_empty(), "{ty}: a refused parameter writes nothing");
+        }
+    }
+
+    #[test]
+    fn a_list_bound_to_a_type_with_as_many_array_levels_encodes_as_the_list_alone() {
+        for (value, ty) in [
+            (PgValue::Int4Array(vec![1, 2]), Type::INT4_ARRAY),
+            (PgValue::Int2Vector(vec![1, 2]), Type::INT2_VECTOR),
+            (
+                PgValue::Int2VectorArray(vec![vec![1, 2]]),
+                Type::INT2_VECTOR_ARRAY,
+            ),
+        ] {
+            let mut direct = BytesMut::new();
+            let mut through = BytesMut::new();
+            assert!(value.to_sql_checked(&ty, &mut direct).is_ok(), "{ty}");
+            assert!(
+                Bound::Value(value)
+                    .to_sql_checked(&ty, &mut through)
+                    .is_ok(),
+                "{ty}"
+            );
+            assert_eq!(through, direct, "{ty}");
+        }
     }
 
     #[test]
