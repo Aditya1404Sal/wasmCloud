@@ -172,12 +172,14 @@ async fn create_vector_extension(
 }
 
 /// Build the pool: fast recycling, wait/create timeouts bound to
-/// `connect_timeout`, and a `post_create` hook applying the native
-/// provider's session GUCs to every physical connection.
+/// `connect_timeout` and run on tokio (deadpool refuses timeouts without a
+/// runtime), and a `post_create` hook applying the native provider's session
+/// GUCs to every physical connection.
 fn build_pool(mgr: Manager, config: &BettyRetrievalConfig) -> anyhow::Result<Pool> {
     let setup = Arc::new(config.session_setup_sql());
     Pool::builder(mgr)
         .max_size(config.pool_size)
+        .runtime(deadpool_postgres::Runtime::Tokio1)
         .wait_timeout(Some(config.connect_timeout))
         .create_timeout(Some(config.connect_timeout))
         .post_create(Hook::async_fn(move |client, _| {
@@ -352,6 +354,28 @@ mod tests {
             .expect_err("the pool is not open before start() runs")
             .to_string();
         assert!(err.contains("start"), "{err}");
+    }
+
+    /// deadpool refuses wait and create timeouts at `build()` unless the pool
+    /// has a runtime to run them on; building never connects.
+    #[test]
+    fn the_pool_builds_with_the_plugins_timeouts_set() {
+        let config = BettyRetrievalConfig::new(
+            "postgres://betty:betty@127.0.0.1:1/never_connected".to_string(),
+            std::path::PathBuf::from("models/granite-embedding-107m-multilingual.json"),
+        );
+        let pg_config: tokio_postgres::Config = config
+            .database_url
+            .parse()
+            .expect("the dummy url parses as a postgres config");
+        let manager = Manager::from_config(
+            pg_config,
+            tokio_postgres::NoTls,
+            ManagerConfig {
+                recycling_method: RecyclingMethod::Fast,
+            },
+        );
+        build_pool(manager, &config).expect("a pool with the plugin's timeouts builds");
     }
 
     /// Cross-checks this plugin's `BettyRetrieval::new` against the native
