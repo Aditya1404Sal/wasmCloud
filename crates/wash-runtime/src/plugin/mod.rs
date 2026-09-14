@@ -49,6 +49,9 @@ pub mod wasi_logging;
 #[cfg(all(feature = "wasmcloud-postgres", not(doctest)))]
 pub mod wasmcloud_postgres;
 
+#[cfg(feature = "betty-retrieval")]
+pub mod betty_retrieval;
+
 #[cfg(feature = "wasi-otel")]
 pub mod wasi_otel;
 
@@ -102,6 +105,7 @@ pub use component_plugin_spec::ComponentPluginSpec;
 /// warning to a refusal, and only on a host that was not built with the plugin,
 /// so the failure is loud rather than silent.
 pub const KNOWN_PLUGIN_IDS: &[&str] = &[
+    "betty-blocks-retrieval",
     "wasi-blobstore",
     "wasi-blobstore-multiplexed",
     "wasi-config",

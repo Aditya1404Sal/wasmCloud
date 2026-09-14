@@ -26,6 +26,7 @@ host-component-plugins = ["wash-runtime/host-component-plugins"]
 # On by default. Pulls in git-only wasi-gfx deps (no crates.io release);
 # disable with `--no-default-features` for a build without the git sources.
 wasi-webgpu = ["wash-runtime/wasi-webgpu"]
+betty-retrieval = ["wash-runtime/betty-retrieval"]
 
 [lints]
 workspace = true

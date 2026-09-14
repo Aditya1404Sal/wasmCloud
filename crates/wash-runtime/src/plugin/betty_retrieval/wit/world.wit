@@ -1,0 +1,178 @@
+/// The interface between the context provider's wasm component and the host
+/// plugin that owns its Postgres pool and embedding model. Designed in
+/// docs/superpowers/specs/2026-09-10-retrieval-wit-interface-design.md.
+package betty-blocks:retrieval@0.1.0;
+
+/// The stock wasmcloud:postgres value, row and error types, used unchanged —
+/// a component that knows one knows the other, and the plugin can share the
+/// host's conversions rather than fork them.
+interface types {
+    use wasmcloud:postgres/types@0.2.0.{pg-value, row, column-name, error as pg-error};
+
+    /// Which side of an asymmetric model a text is embedded for. The plugin
+    /// applies the model's prefix; the component never sees it.
+    enum role { query, passage }
+
+    /// A bind parameter. A plain value passes through. An embed variant is
+    /// replaced by the model's vector at bind time, so `$n` is legal anywhere
+    /// a `vector` is, and the vector never crosses the boundary.
+    variant param {
+        value(pg-value),
+        /// One text → one `vector`.
+        embed-text(tuple<string, role>),
+        /// Many texts → one `vector[]`, in input order. Duplicate texts are
+        /// embedded once.
+        embed-texts(tuple<list<string>, role>),
+    }
+
+    variant error {
+        /// The database or the connection. See wasmcloud:postgres.
+        postgres(pg-error),
+        /// An embed parameter could not become a vector.
+        embed(string),
+        /// `begin` waited out the pool.
+        pool-exhausted,
+    }
+
+    /// The space every embed parameter lands in. Fixed for the plugin's
+    /// lifetime; a component refuses a corpus tagged with a different one.
+    record space { space-id: string, model-id: string, dimension: u32 }
+}
+
+/// Queries against the plugin's pool. Imported by the component; served by
+/// the host plugin.
+interface store {
+    use types.{param, row, column-name, error, space as space-info};
+
+    /// One statement, auto-committed, any pooled connection. Rows stream.
+    query: async func(sql: string, params: list<param>)
+        -> result<tuple<list<column-name>, stream<row>, future<result<_, error>>>, error>;
+
+    /// One statement, auto-committed; rows affected.
+    execute: async func(sql: string, params: list<param>) -> result<u64, error>;
+
+    /// Several statements, no parameters, one implicit transaction. For DDL.
+    batch: async func(sql: string) -> result<_, error>;
+
+    /// Pin one connection and open a transaction on it.
+    begin: async func() -> result<transaction, error>;
+
+    /// Dropping it without `commit` rolls back and returns the connection.
+    resource transaction {
+        query:   async func(sql: string, params: list<param>)
+            -> result<tuple<list<column-name>, stream<row>, future<result<_, error>>>, error>;
+        execute: async func(sql: string, params: list<param>) -> result<u64, error>;
+        batch:   async func(sql: string) -> result<_, error>;
+        /// Consumes the transaction. After a failed statement Postgres
+        /// answers COMMIT with ROLLBACK and no error; an implementation must
+        /// not report success — check the command tag or track failure.
+        commit:  static async func(tx: transaction) -> result<_, error>;
+    }
+
+    space: func() -> space-info;
+}
+
+/// Exported by the component; meta-json imports it directly. This is the
+/// HTTP `POST /apps/{app}/search` response, typed. Both doorways call one
+/// function; HTTP is a JSON encoding of `search-result`.
+interface search {
+    enum expand-strategy { none, one-hop, requires }
+
+    record search-options {
+        /// `k`; clamped to 1..=50.
+        max-results: u32,
+        /// Entity types allowed to seed. Empty means the deployment default,
+        /// which excludes `variable`. Expansion is never restricted by this.
+        types: list<string>,
+        /// Kept out of seeds, context and a hit's edges. Walked through.
+        exclude-types: list<string>,
+        /// `none` = the deployment default.
+        expand: option<expand-strategy>,
+        /// Total entities returned, seeds included. `none` = default, clamped
+        /// to `max-results..=200`.
+        budget: option<u32>,
+        /// `requires` hops. `none` = default, clamped to 1..=6.
+        max-depth: option<u32>,
+        /// Also return what depends ON the hits. `none` = deployment default (on).
+        dependents: option<bool>,
+        /// At most this many dependents across all hits.
+        dependents-budget: option<u32>,
+    }
+
+    record ranks { vector: option<s64>, lexical: option<s64> }
+    record edge  { other-id: string, other-name: string, relation: string, outgoing: bool, provenance: string }
+    record issue { kind: string, missing-id: string, rule: string }
+
+    /// An entity matched by meaning.
+    record hit {
+        id: string, name: string, entity-type: string, score: f64,
+        /// Populated under `one-hop` only.
+        edges: list<edge>,
+        edges-truncated: bool,
+        /// Dangling references in this entity's own logic.
+        issues: list<issue>,
+        /// Absent for the vector-only search.
+        ranks: option<ranks>,
+    }
+
+    /// Reached by the forward walk: something a hit depends on.
+    record depends-on {
+        id: string, name: string, entity-type: string,
+        depth: u32, via-id: string, relation: string, provenance: string,
+        /// False when its own dependencies did not fit the budget.
+        expanded: bool,
+    }
+
+    /// Reached by the reverse walk: something that depends on a hit.
+    record dependent {
+        id: string, name: string, entity-type: string,
+        depth: u32, via-id: string, relation: string,
+        /// The weakest provenance on the path that reached it.
+        provenance: string,
+    }
+
+    record match-quality { confidence: string, best: f64, spread: f64, agreement: option<bool> }
+    record expansion {
+        strategy: string, budget: u32, max-depth: u32,
+        seeds: u32, returned: u32, hidden: u32, truncated: bool,
+    }
+
+    /// What each field means, in prose, for a reader that cannot see this
+    /// file — the result ends up in a model prompt. Mirrors `api.rs`'s
+    /// `Descriptions` field for field.
+    record entity-field-descriptions {
+        score: string, ranks: string, depth: string, via-id: string,
+        relation: string, provenance: string, expanded: string, issues: string,
+    }
+    record descriptions {
+        hits: string, match: string, depends-on: string, dependents: string,
+        expansion: string, fused: string,
+        entity-fields: entity-field-descriptions,
+    }
+
+    record search-result {
+        /// First, so meaning precedes data.
+        descriptions: descriptions,
+        hits: list<hit>,
+        match: option<match-quality>,
+        /// Empty under `none` and `one-hop`.
+        depends-on: list<depends-on>,
+        dependents: list<dependent>,
+        expansion: option<expansion>,
+        fused: bool,
+    }
+
+    variant search-error {
+        unknown-app,             // HTTP 404
+        space-mismatch(string),  // 409 — the corpus predates this model; re-ingest
+        invalid(string),         // 400 — an unknown type name, k out of range
+        unavailable(string),     // 503 — the database or the pool
+        internal(string),        // 500 — a statement or an embedding failed
+        timeout,                 // 504
+    }
+
+    search: async func(app: string, query: string, options: search-options)
+        -> result<search-result, search-error>;
+}
+
+world plugin-imports { import types; import store; }
