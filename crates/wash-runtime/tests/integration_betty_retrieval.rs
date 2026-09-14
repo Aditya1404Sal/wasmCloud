@@ -173,6 +173,21 @@ async fn a_placeholder_count_mismatch_is_invalid_params() -> Result<()> {
 
 #[tokio::test]
 #[ignore = "needs a pgvector database; run with `-- --ignored`"]
+async fn an_array_bound_to_a_scalar_placeholder_is_invalid_params_not_a_panic() -> Result<()> {
+    let body = ask("/array-for-scalar").await?;
+    assert!(
+        body.starts_with("invalid-params=error serializing parameter 0: "),
+        "{body}"
+    );
+    assert!(body.contains("the Postgres type `int4`"), "{body}");
+    // The pool's one connection served the next statement, so the refused one
+    // did not panic the host mid-call.
+    assert!(body.ends_with(" then=1"), "{body}");
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "needs a pgvector database; run with `-- --ignored`"]
 async fn an_undecodable_column_is_value_conversion_failed_naming_the_cause() -> Result<()> {
     let body = ask("/undecodable-column").await?;
     assert!(

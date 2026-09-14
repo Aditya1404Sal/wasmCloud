@@ -18,6 +18,8 @@
 //!   - `/second-begin` — `begin` while a transaction holds the only connection.
 //!   - `/cancelled-statement` — `commit` after a statement dropped mid-flight.
 //!   - `/placeholder-mismatch` — a statement bound with too few parameters.
+//!   - `/array-for-scalar` — an `int4-array` value bound to a scalar
+//!     `$1::int4`, then the next statement on the same pool.
 //!   - `/undecodable-column` — a column no `pg-value` can hold.
 //!
 //! The test runs the plugin with a pool of one connection, so the statements a
@@ -67,6 +69,7 @@ async fn run(path: &str) -> Result<String, String> {
         "/second-begin" => second_begin().await,
         "/cancelled-statement" => cancelled_statement().await,
         "/placeholder-mismatch" => placeholder_mismatch().await,
+        "/array-for-scalar" => array_for_scalar().await,
         "/undecodable-column" => undecodable_column().await,
         other => Err(format!("no route {other}")),
     }
@@ -219,6 +222,20 @@ async fn placeholder_mismatch() -> Result<String, String> {
         Err(other) => Err(format!("the query failed with {other:?}")),
         Ok(_) => Err("the query ran with its placeholder unbound".to_string()),
     }
+}
+
+async fn array_for_scalar() -> Result<String, String> {
+    let refused = match store::execute(
+        "SELECT $1::int4".to_string(),
+        vec![Param::Value(PgValue::Int4Array(vec![1, 2]))],
+    )
+    .await
+    {
+        Err(Error::Postgres(PgError::InvalidParams(message))) => message,
+        other => return Err(format!("the statement returned {other:?}")),
+    };
+    let after = integer(only(&rows("SELECT 1", Vec::new()).await?)?)?;
+    Ok(format!("invalid-params={refused} then={after}"))
 }
 
 /// The statement starts, so the decode failure arrives on the completion
