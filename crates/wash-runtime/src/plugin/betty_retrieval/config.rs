@@ -56,8 +56,8 @@ impl BettyRetrievalConfig {
         if self.max_scan_tuples == 0 {
             bail!("max_scan_tuples must be greater than zero");
         }
-        let url = Url::parse(&self.database_url)
-            .with_context(|| format!("database_url {:?} is not a valid url", self.database_url))?;
+        // The value is left out: a url can carry a password.
+        let url = Url::parse(&self.database_url).context("database_url is not a valid url")?;
         if !matches!(url.scheme(), "postgres" | "postgresql") {
             bail!(
                 "database_url must use the postgres or postgresql scheme, got {:?}",
@@ -174,6 +174,23 @@ mod tests {
             .expect_err("a non-postgres scheme must be refused")
             .to_string();
         assert!(err.contains("database_url"), "{err}");
+    }
+
+    #[test]
+    fn validate_names_a_bad_database_url_without_its_password() {
+        for url in [
+            "postgres://genius:hunter2@127.0.0.1:5543x/genius_retrieval",
+            "mysql://genius:hunter2@127.0.0.1/genius_retrieval",
+        ] {
+            let mut cfg = config();
+            cfg.database_url = url.to_string();
+            let err = cfg
+                .validate()
+                .expect_err("a bad database_url must be refused");
+            let message = format!("{err:#}");
+            assert!(message.contains("database_url"), "{message}");
+            assert!(!message.contains("hunter2"), "{message}");
+        }
     }
 
     #[test]
