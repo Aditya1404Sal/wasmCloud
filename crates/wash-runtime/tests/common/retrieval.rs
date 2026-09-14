@@ -15,6 +15,7 @@ use testcontainers::{
     core::{IntoContainerPort, WaitFor},
     runners::AsyncRunner,
 };
+use tokio::sync::OnceCell;
 
 use wash_runtime::{
     engine::Engine,
@@ -61,9 +62,17 @@ pub struct TestDatabase {
 
 /// `BETTY_RETRIEVAL_TEST_DATABASE_URL` when set (locally, the genius-retrieval
 /// compose database); otherwise a `pgvector/pgvector:pg17` container that
-/// lives as long as the returned value.
+/// lives as long as the returned value. Either way the vector extension exists
+/// before a host starts.
 pub async fn test_database() -> Result<TestDatabase> {
     if let Ok(url) = std::env::var("BETTY_RETRIEVAL_TEST_DATABASE_URL") {
+        // Once for all the tests sharing this database: each plugin creates the
+        // extension as its host starts, and hosts starting together against a
+        // database without it race, the losers failing to start.
+        static VECTOR_EXTENSION: OnceCell<()> = OnceCell::const_new();
+        VECTOR_EXTENSION
+            .get_or_try_init(|| create_vector_extension(&url))
+            .await?;
         return Ok(TestDatabase {
             url,
             _container: None,
@@ -81,16 +90,26 @@ pub async fn test_database() -> Result<TestDatabase> {
     let port = container.get_host_port_ipv4(5432).await?;
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     // The image logs that line for its initdb server too, which takes no TCP
-    // connections; wait for the server that does.
-    admin_client(&url).await?;
+    // connections; this waits for the server that does.
+    create_vector_extension(&url).await?;
     Ok(TestDatabase {
         url,
         _container: Some(container),
     })
 }
 
+/// `CREATE EXTENSION IF NOT EXISTS vector`, once `database_url` accepts
+/// connections.
+async fn create_vector_extension(database_url: &str) -> Result<()> {
+    admin_client(database_url)
+        .await?
+        .batch_execute("CREATE EXTENSION IF NOT EXISTS vector")
+        .await
+        .context("create the vector extension")
+}
+
 /// One connection, so the statements one request runs share a Postgres
-/// session unless the plugin replaced it; a two-second wait, so a connection
+/// session unless the plugin replaced it; a five-second wait, so a connection
 /// the plugin never returns makes the next checkout `pool-exhausted` well
 /// inside the request.
 fn plugin(database_url: &str, embedder: Arc<FakeEmbedder>) -> Result<BettyRetrieval> {
@@ -100,7 +119,7 @@ fn plugin(database_url: &str, embedder: Arc<FakeEmbedder>) -> Result<BettyRetrie
         PathBuf::from("unused-model-config.json"),
     );
     config.pool_size = 1;
-    config.connect_timeout = Duration::from_secs(2);
+    config.connect_timeout = Duration::from_secs(5);
     BettyRetrieval::with_embedder(config, embedder, fake_space())
 }
 

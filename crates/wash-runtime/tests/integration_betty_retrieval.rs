@@ -4,7 +4,7 @@
 //! each test starts its own host, requests one path and asserts on the answer.
 //!
 //! The plugin is built around a `FakeEmbedder`, with a pool of one connection
-//! and a two-second wait (see `common::retrieval`): the statements one request
+//! and a five-second wait (see `common::retrieval`): the statements one request
 //! runs share a Postgres session, and a connection the plugin fails to return
 //! shows up as `pool-exhausted` inside the request.
 //!
@@ -13,7 +13,6 @@
 //! `pgvector/pgvector:pg17` container. The file compiles only once
 //! `cargo xtask build-fixtures` has staged the fixture.
 #![cfg(feature = "betty-retrieval")]
-#![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::sync::Arc;
 
