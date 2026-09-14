@@ -164,10 +164,10 @@ pub async fn start_retrieval_workload(
     Ok((addr, host))
 }
 
-/// A uniquely named `betty_it_` table of one text column, created, read and
-/// dropped on a connection of the test's own rather than the plugin's. A table
-/// its test never passes to [`ScratchTable::drop_table`], having panicked or
-/// returned early, is dropped when the value is.
+/// A uniquely named `public.betty_it_` table of one text column, created, read
+/// and dropped on a connection of the test's own rather than the plugin's. A
+/// table its test never passes to [`ScratchTable::drop_table`], having panicked
+/// or returned early, is dropped when the value is.
 pub struct ScratchTable {
     pub name: String,
     database_url: String,
@@ -178,7 +178,9 @@ pub struct ScratchTable {
 impl ScratchTable {
     pub async fn create(database_url: &str, purpose: &str) -> Result<Self> {
         let nanos = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
-        let name = format!("betty_it_{purpose}_{}_{nanos}", std::process::id());
+        // Qualified: the plugin's sessions pin `search_path` to `public`, while
+        // this connection keeps the role's own.
+        let name = format!("public.betty_it_{purpose}_{}_{nanos}", std::process::id());
         let client = scratch_client(database_url).await?;
         client
             .batch_execute(&format!("CREATE TABLE {name} (v text)"))

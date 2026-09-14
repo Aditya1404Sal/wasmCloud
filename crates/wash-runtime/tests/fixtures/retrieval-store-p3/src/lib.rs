@@ -241,8 +241,9 @@ async fn undecodable_column() -> Result<String, String> {
 async fn failed_commit(tx: Transaction) -> Result<String, String> {
     match Transaction::commit(tx).await {
         Err(Error::Postgres(PgError::QueryFailed(db))) => Ok(format!(
-            "code={} detail={}",
+            "code={} message={:?} detail={:?}",
             db.code,
+            db.message,
             db.detail.unwrap_or_default()
         )),
         other => Err(format!("commit returned {other:?}")),
@@ -300,19 +301,22 @@ fn text(value: &str) -> Param {
     Param::Value(PgValue::Text(value.to_string()))
 }
 
-/// The `table=` parameter, which must name one of the test's `betty_it_` tables.
+/// The `table=` parameter: one of the test's tables, schema-qualified as
+/// `public.betty_it_...`, so it resolves the same under any `search_path`.
 fn table(query: &str) -> Result<String, String> {
     query
         .split('&')
         .find_map(|pair| pair.strip_prefix("table="))
         .filter(|name| {
-            name.starts_with("betty_it_")
-                && name
-                    .bytes()
-                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+            name.strip_prefix("public.betty_it_").is_some_and(|rest| {
+                !rest.is_empty()
+                    && rest
+                        .bytes()
+                        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+            })
         })
         .map(str::to_string)
-        .ok_or_else(|| format!("expected ?table=betty_it_..., got {query:?}"))
+        .ok_or_else(|| format!("expected ?table=public.betty_it_..., got {query:?}"))
 }
 
 fn debug(value: impl std::fmt::Debug) -> String {

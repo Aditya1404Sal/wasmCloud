@@ -42,6 +42,14 @@ async fn ask(path: &str) -> Result<String> {
     answer(&db.url, fake_embedder(), path).await
 }
 
+/// `commit`'s answer for a transaction an earlier statement aborted: 25P02, the
+/// plugin's fixed message, and that statement's failure as the detail.
+fn aborted_commit(detail: &str) -> String {
+    const MESSAGE: &str =
+        "the transaction was aborted by an earlier failed statement; nothing was committed";
+    format!("code=25P02 message={MESSAGE:?} detail={detail:?}")
+}
+
 #[tokio::test]
 #[ignore = "needs a pgvector database; run with `-- --ignored`"]
 async fn embed_text_binds_a_vector_as_wide_as_the_embedder() -> Result<()> {
@@ -104,7 +112,7 @@ async fn dropping_a_transaction_rolls_it_back() -> Result<()> {
 async fn commit_after_a_failed_statement_reports_25p02() -> Result<()> {
     assert_eq!(
         ask("/commit-after-failure").await?,
-        "code=25P02 detail=division by zero"
+        aborted_commit("division by zero")
     );
     Ok(())
 }
@@ -149,7 +157,7 @@ async fn begin_while_a_transaction_holds_the_only_connection_is_pool_exhausted()
 async fn a_statement_cancelled_mid_flight_keeps_its_transaction_from_committing() -> Result<()> {
     assert_eq!(
         ask("/cancelled-statement").await?,
-        "code=25P02 detail=a statement was cancelled before it finished"
+        aborted_commit("a statement was cancelled before it finished")
     );
     Ok(())
 }
