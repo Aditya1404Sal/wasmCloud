@@ -295,6 +295,10 @@ impl HostPlugin for BettyRetrieval {
         Ok(())
     }
 
+    /// Closes the pool and nothing more. A transaction a guest still holds
+    /// keeps its pinned connection until the guest commits or drops it, and
+    /// that connection is then closed rather than pooled. Every later checkout
+    /// answers `connection-failed` ("Pool has been closed"). Nothing is logged.
     async fn stop(&self) -> anyhow::Result<()> {
         if let Some(pool) = self.pool.get() {
             pool.close();
