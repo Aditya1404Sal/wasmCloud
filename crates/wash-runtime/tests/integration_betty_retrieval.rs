@@ -6,7 +6,8 @@
 //! The plugin is built around a `FakeEmbedder`, with a pool of one connection
 //! and a five-second wait (see `common::retrieval`): the statements one request
 //! runs share a Postgres session, and a connection the plugin fails to return
-//! shows up as `pool-exhausted` inside the request.
+//! shows up as `pool-exhausted` inside the request. The one test that watches a
+//! transaction from a second session gets two connections.
 //!
 //! Every test is `#[ignore]`d, as each needs a database with pgvector:
 //! `BETTY_RETRIEVAL_TEST_DATABASE_URL`, or Docker for a
@@ -26,13 +27,24 @@ use common::retrieval::{
     test_database,
 };
 
-/// Start a host whose plugin embeds with `embedder`, and return the fixture's
-/// answer to `path`, which must come back 200.
-async fn answer(database_url: &str, embedder: Arc<FakeEmbedder>, path: &str) -> Result<String> {
-    let (addr, _host) = start_retrieval_workload(database_url, embedder).await?;
+/// Start a host whose plugin embeds with `embedder` from a pool of `pool_size`
+/// connections, and return the fixture's answer to `path`, which must come
+/// back 200.
+async fn answer_from_pool(
+    database_url: &str,
+    embedder: Arc<FakeEmbedder>,
+    pool_size: usize,
+    path: &str,
+) -> Result<String> {
+    let (addr, _host) = start_retrieval_workload(database_url, embedder, pool_size).await?;
     let (status, body) = req(&reqwest::Client::new(), &addr, HOST_HEADER, path).await?;
     ensure!(status.is_success(), "{path} answered {status}: {body}");
     Ok(body)
+}
+
+/// [`answer_from_pool`] with one connection.
+async fn answer(database_url: &str, embedder: Arc<FakeEmbedder>, path: &str) -> Result<String> {
+    answer_from_pool(database_url, embedder, 1, path).await
 }
 
 /// [`answer`] on the test database, with an embedder nothing else counts.
@@ -183,6 +195,43 @@ async fn an_array_bound_to_a_scalar_placeholder_is_invalid_params_not_a_panic() 
     // The pool's one connection served the next statement, so the refused one
     // did not panic the host mid-call.
     assert!(body.ends_with(" then=1"), "{body}");
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "needs a pgvector database; run with `-- --ignored`"]
+async fn a_batch_closes_the_portal_a_transactions_query_left_open() -> Result<()> {
+    let db = test_database().await?;
+    // A snapshot still held here is one `REINDEX INDEX CONCURRENTLY` on another
+    // session waits out, for as long as the transaction stays open.
+    assert_eq!(
+        answer_from_pool(&db.url, fake_embedder(), 2, "/batch-closes-portal").await?,
+        "state=idle in transaction snapshot=released"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "needs a pgvector database; run with `-- --ignored`"]
+async fn execute_answers_the_rows_its_statement_affected() -> Result<()> {
+    let db = test_database().await?;
+    let table = ScratchTable::create(&db.url, "execute").await?;
+    let path = format!("/execute-rows-affected?table={}", table.name);
+    assert_eq!(
+        answer(&db.url, fake_embedder(), &path).await?,
+        "inserted=3 updated=2"
+    );
+    assert_eq!(table.values().await?, ["a", "b!", "c!"]);
+    table.drop_table().await
+}
+
+#[tokio::test]
+#[ignore = "needs a pgvector database; run with `-- --ignored`"]
+async fn a_large_transaction_query_does_not_hold_up_its_commit() -> Result<()> {
+    assert_eq!(
+        ask("/large-transaction-query").await?,
+        "committed rows=5000 last=5000"
+    );
     Ok(())
 }
 

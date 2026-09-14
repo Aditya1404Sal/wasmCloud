@@ -21,9 +21,16 @@
 //!   - `/array-for-scalar` — an `int4-array` value bound to a scalar
 //!     `$1::int4`, then the next statement on the same pool.
 //!   - `/undecodable-column` — a column no `pg-value` can hold.
+//!   - `/batch-closes-portal` — another session's view of a transaction's
+//!     snapshot after a query and then a `batch` on it.
+//!   - `/execute-rows-affected?table=` — what `execute` answers for an insert
+//!     of three rows and then an update of two.
+//!   - `/large-transaction-query` — a transaction's query of 5000 rows,
+//!     committed before a row is read, then read.
 //!
 //! The test runs the plugin with a pool of one connection, so the statements a
-//! route runs share one Postgres session unless the plugin replaced it.
+//! route runs share one Postgres session unless the plugin replaced it; two for
+//! `/batch-closes-portal`, whose transaction a second session watches.
 
 mod bindings {
     wit_bindgen::generate!({ generate_all });
@@ -71,6 +78,9 @@ async fn run(path: &str) -> Result<String, String> {
         "/placeholder-mismatch" => placeholder_mismatch().await,
         "/array-for-scalar" => array_for_scalar().await,
         "/undecodable-column" => undecodable_column().await,
+        "/batch-closes-portal" => batch_closes_portal().await,
+        "/execute-rows-affected" => execute_rows_affected(&table(query)?).await,
+        "/large-transaction-query" => large_transaction_query().await,
         other => Err(format!("no route {other}")),
     }
 }
@@ -254,6 +264,84 @@ async fn undecodable_column() -> Result<String, String> {
     }
 }
 
+/// The query runs on the extended protocol, whose portal outlives it with its
+/// snapshot; a `batch` runs on the simple protocol, which closes that portal.
+async fn batch_closes_portal() -> Result<String, String> {
+    let tx = begin().await?;
+    let pid = integer(only(
+        &transaction_rows(&tx, "SELECT pg_backend_pid()").await?,
+    )?)?;
+    tx.batch("SELECT 1".to_string()).await.map_err(debug)?;
+    let observed = rows(
+        "SELECT state, backend_xmin IS NULL FROM pg_stat_activity WHERE pid = $1::int8",
+        vec![Param::Value(PgValue::Int8(pid))],
+    )
+    .await?;
+    Transaction::commit(tx).await.map_err(debug)?;
+    match observed.as_slice() {
+        [row] => match row.as_slice() {
+            [PgValue::Text(state), PgValue::Bool(released)] => {
+                let snapshot = if *released { "released" } else { "held" };
+                Ok(format!("state={state} snapshot={snapshot}"))
+            }
+            _ => Err(format!("expected a state and a bool, got {row:?}")),
+        },
+        _ => Err(format!(
+            "expected one pg_stat_activity row, got {observed:?}"
+        )),
+    }
+}
+
+async fn execute_rows_affected(table: &str) -> Result<String, String> {
+    let inserted = store::execute(
+        format!("INSERT INTO {table} (v) VALUES ($1), ($2), ($3)"),
+        vec![text("a"), text("b"), text("c")],
+    )
+    .await
+    .map_err(debug)?;
+    let updated = store::execute(
+        format!("UPDATE {table} SET v = v || '!' WHERE v <> $1"),
+        vec![text("a")],
+    )
+    .await
+    .map_err(debug)?;
+    Ok(format!("inserted={inserted} updated={updated}"))
+}
+
+/// More rows than any buffer between the statement and the guest holds.
+const LARGE_QUERY_ROWS: u32 = 5000;
+
+/// How long the commit after that query may take.
+const COMMIT_WITHIN_NS: u64 = 5_000_000_000;
+
+/// Committed before a row is read: rows still coming off the transaction's
+/// connection would keep the commit waiting behind them.
+async fn large_transaction_query() -> Result<String, String> {
+    let tx = begin().await?;
+    let (_columns, mut stream, completion) = tx
+        .query(
+            format!("SELECT g FROM generate_series(1, {LARGE_QUERY_ROWS}) AS g"),
+            Vec::new(),
+        )
+        .await
+        .map_err(debug)?;
+    let commit = Box::pin(Transaction::commit(tx));
+    let timer = Box::pin(monotonic_clock::wait_for(COMMIT_WITHIN_NS));
+    match select(commit, timer).await {
+        Either::Left((committed, _)) => committed.map_err(debug)?,
+        Either::Right(_) => {
+            return Err(format!("the commit took over {COMMIT_WITHIN_NS} ns"));
+        }
+    }
+    let (mut count, mut last) = (0, 0);
+    while let Some(row) = stream.next().await {
+        count += 1;
+        last = integer(row.first().ok_or("a row has no columns")?)?;
+    }
+    completion.await.map_err(debug)?;
+    Ok(format!("committed rows={count} last={last}"))
+}
+
 /// Commit `tx`, expecting the database error an aborted transaction reports.
 async fn failed_commit(tx: Transaction) -> Result<String, String> {
     match Transaction::commit(tx).await {
@@ -271,6 +359,18 @@ async fn failed_commit(tx: Transaction) -> Result<String, String> {
 async fn rows(sql: &str, params: Vec<Param>) -> Result<Vec<Vec<PgValue>>, String> {
     let (_columns, mut stream, completion) =
         store::query(sql.to_string(), params).await.map_err(debug)?;
+    let mut rows = Vec::new();
+    while let Some(row) = stream.next().await {
+        rows.push(row);
+    }
+    completion.await.map_err(debug)?;
+    Ok(rows)
+}
+
+/// Every row of `sql` run on `tx`, once its completion reports success.
+async fn transaction_rows(tx: &Transaction, sql: &str) -> Result<Vec<Vec<PgValue>>, String> {
+    let (_columns, mut stream, completion) =
+        tx.query(sql.to_string(), Vec::new()).await.map_err(debug)?;
     let mut rows = Vec::new();
     while let Some(row) = stream.next().await {
         rows.push(row);

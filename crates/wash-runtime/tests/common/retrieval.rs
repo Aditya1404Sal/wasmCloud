@@ -108,27 +108,33 @@ async fn create_vector_extension(database_url: &str) -> Result<()> {
         .context("create the vector extension")
 }
 
-/// One connection, so the statements one request runs share a Postgres
-/// session unless the plugin replaced it; a five-second wait, so a connection
+/// A pool of `pool_size` connections and a five-second wait, so a connection
 /// the plugin never returns makes the next checkout `pool-exhausted` well
-/// inside the request.
-fn plugin(database_url: &str, embedder: Arc<FakeEmbedder>) -> Result<BettyRetrieval> {
+/// inside the request. With one connection, the statements one request runs
+/// share a Postgres session unless the plugin replaced it.
+fn plugin(
+    database_url: &str,
+    embedder: Arc<FakeEmbedder>,
+    pool_size: usize,
+) -> Result<BettyRetrieval> {
     let mut config = BettyRetrievalConfig::new(
         database_url.to_string(),
         // `with_embedder` takes the embedder ready-made, so nothing reads this.
         PathBuf::from("unused-model-config.json"),
     );
-    config.pool_size = 1;
+    config.pool_size = pool_size;
     config.connect_timeout = Duration::from_secs(5);
     BettyRetrieval::with_embedder(config, embedder, fake_space())
 }
 
-/// Stand up a host with the betty-retrieval plugin over `database_url`,
-/// embedding with `embedder`, plus an HTTP entrypoint, and start the
-/// `retrieval-store-p3` workload under [`HOST_HEADER`].
+/// Stand up a host with the betty-retrieval plugin over `database_url`, with a
+/// pool of `pool_size` connections and embedding with `embedder`, plus an HTTP
+/// entrypoint, and start the `retrieval-store-p3` workload under
+/// [`HOST_HEADER`].
 pub async fn start_retrieval_workload(
     database_url: &str,
     embedder: Arc<FakeEmbedder>,
+    pool_size: usize,
 ) -> Result<(std::net::SocketAddr, impl HostApi + use<>)> {
     let engine = Engine::builder().build()?;
     let ingress = Ingress::new(DevRouter::default(), "127.0.0.1:0".parse()?).await?;
@@ -137,7 +143,7 @@ pub async fn start_retrieval_workload(
     let host = HostBuilder::new()
         .with_engine(engine)
         .with_http_handler(Arc::new(ingress))
-        .with_plugin(Arc::new(plugin(database_url, embedder)?))?
+        .with_plugin(Arc::new(plugin(database_url, embedder, pool_size)?))?
         .build()?;
     let host = host.start().await.context("failed to start host")?;
 
