@@ -167,7 +167,7 @@ ulid = { optional = true, workspace = true, features = ["std"] }
 # dependency even when it is optional or dev-only, so without that checkout the
 # whole workspace fails to resolve, with this feature off too. Vendor or publish
 # `genius-embed` before this branch is merged.
-genius-embed = { path = "../../../bettyblocks/context-provider-poc/genius-embed", optional = true }
+genius-embed = { path = "../../../bettyblocks/context-provider-poc/genius-embed", features = ["fetch"], optional = true }
 pgvector = { version = "=0.4.1", default-features = false, features = ["postgres"], optional = true }
 
 # SMTP dependencies (optional, behind 'wasmcloud-smtp' feature)

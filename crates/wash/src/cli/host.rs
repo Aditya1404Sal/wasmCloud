@@ -10,7 +10,9 @@ use wash_runtime::{
 };
 
 #[cfg(feature = "betty-retrieval")]
-use crate::cli::retrieval::{BettyRetrievalOverrides, build_betty_retrieval_config};
+use crate::cli::retrieval::{
+    BettyRetrievalOverrides, ModelSettings, build_betty_retrieval_config, model_selection,
+};
 use crate::cli::{CliCommand, CliContext, CommandOutput, signal};
 use crate::config::{HttpClientTrustRoots, load_config};
 
@@ -329,11 +331,38 @@ pub struct HostCommand {
     #[arg(long = "retrieval-database-url", env = "WASH_RETRIEVAL_DATABASE_URL")]
     pub retrieval_database_url: Option<String>,
 
-    /// Path to the granite embedding model's descriptor (MODEL.json) for the
+    /// Path to an embedding model's descriptor (MODEL.json) for the
     /// betty-blocks:retrieval plugin. Also requires `--retrieval-database-url`.
+    /// Prefer `--retrieval-model`, which takes either a path or a name.
     #[cfg(feature = "betty-retrieval")]
     #[arg(long = "retrieval-model-config", env = "WASH_RETRIEVAL_MODEL_CONFIG")]
     pub retrieval_model_config: Option<PathBuf>,
+
+    /// Which embedding model the betty-blocks:retrieval plugin runs: a model
+    /// NAME to look up in `--retrieval-model-catalog`, or the path to a
+    /// descriptor. Changing models is changing this value, not rebuilding.
+    #[cfg(feature = "betty-retrieval")]
+    #[arg(long = "retrieval-model", env = "WASH_RETRIEVAL_MODEL")]
+    pub retrieval_model: Option<String>,
+
+    /// Where model names are looked up: a directory, or an http(s) base URL,
+    /// holding one `<name>.json` descriptor per model.
+    #[cfg(feature = "betty-retrieval")]
+    #[arg(long = "retrieval-model-catalog", env = "WASH_RETRIEVAL_MODEL_CATALOG")]
+    pub retrieval_model_catalog: Option<String>,
+
+    /// Where fetched model artifacts are kept. Unset uses the user's cache
+    /// directory, so a second checkout does not download them again.
+    #[cfg(feature = "betty-retrieval")]
+    #[arg(long = "retrieval-model-cache", env = "WASH_RETRIEVAL_MODEL_CACHE")]
+    pub retrieval_model_cache: Option<PathBuf>,
+
+    /// Download model artifacts from here instead of the address their
+    /// descriptor names, for a machine that cannot reach the public one. The
+    /// pinned digests still decide whether the bytes are accepted.
+    #[cfg(feature = "betty-retrieval")]
+    #[arg(long = "retrieval-model-mirror", env = "WASH_RETRIEVAL_MODEL_MIRROR")]
+    pub retrieval_model_mirror: Option<String>,
 
     /// Maximum size of the betty-blocks:retrieval plugin's connection pool.
     /// Unset keeps the plugin's own default (8).
@@ -881,11 +910,19 @@ impl CliCommand for HostCommand {
         }
 
         #[cfg(feature = "betty-retrieval")]
-        match (&self.retrieval_database_url, &self.retrieval_model_config) {
-            (Some(database_url), Some(model_config)) => {
+        let retrieval_model = model_selection(ModelSettings {
+            model: self.retrieval_model.clone(),
+            model_config: self.retrieval_model_config.clone(),
+            catalog: self.retrieval_model_catalog.clone(),
+            cache: self.retrieval_model_cache.clone(),
+            mirror: self.retrieval_model_mirror.clone(),
+        });
+        #[cfg(feature = "betty-retrieval")]
+        match (&self.retrieval_database_url, retrieval_model) {
+            (Some(database_url), Some(model)) => {
                 let retrieval_config = build_betty_retrieval_config(
                     database_url.clone(),
-                    model_config.clone(),
+                    model,
                     BettyRetrievalOverrides {
                         pool_size: self.retrieval_pool_size,
                         connect_timeout_secs: self.retrieval_connect_timeout_secs,
@@ -901,11 +938,12 @@ impl CliCommand for HostCommand {
                 ))?;
             }
             (Some(_), None) => anyhow::bail!(
-                "--retrieval-database-url (or WASH_RETRIEVAL_DATABASE_URL) requires \
-                 --retrieval-model-config (or WASH_RETRIEVAL_MODEL_CONFIG) to also be set"
+                "--retrieval-database-url (or WASH_RETRIEVAL_DATABASE_URL) requires a model: \
+                 set --retrieval-model (or WASH_RETRIEVAL_MODEL) to a model name or a \
+                 descriptor path"
             ),
             (None, Some(_)) => anyhow::bail!(
-                "--retrieval-model-config (or WASH_RETRIEVAL_MODEL_CONFIG) requires \
+                "--retrieval-model (or WASH_RETRIEVAL_MODEL) requires \
                  --retrieval-database-url (or WASH_RETRIEVAL_DATABASE_URL) to also be set"
             ),
             (None, None) => {}

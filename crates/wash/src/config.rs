@@ -1325,13 +1325,42 @@ pub struct DevConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub retrieval_database_url: Option<String>,
 
-    /// Path to the granite embedding model's descriptor (MODEL.json) for the
+    /// Path to an embedding model's descriptor (MODEL.json) for the
     /// betty-blocks:retrieval plugin. Relative paths resolve against the
     /// project directory. Requires `dev.retrieval_database_url` to also be
     /// set. Only takes effect in a wash build with the `betty-retrieval`
     /// feature.
+    ///
+    /// Prefer `dev.retrieval_model`, which takes a model name as well as a
+    /// path, and which `WASH_RETRIEVAL_MODEL` can override.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub retrieval_model_config: Option<PathBuf>,
+
+    /// Which embedding model the betty-blocks:retrieval plugin runs: a model
+    /// NAME looked up in `dev.retrieval_model_catalog`, or a path to a
+    /// descriptor (relative paths resolve against the project directory).
+    ///
+    /// `WASH_RETRIEVAL_MODEL` overrides it, so changing models is an
+    /// environment change rather than an edit to a committed config file.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retrieval_model: Option<String>,
+
+    /// Where model names are looked up: a directory, or an http(s) base URL,
+    /// holding one `<name>.json` descriptor per model. Overridden by
+    /// `WASH_RETRIEVAL_MODEL_CATALOG`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retrieval_model_catalog: Option<String>,
+
+    /// Where fetched model artifacts are kept. Unset uses the user's cache
+    /// directory. Overridden by `WASH_RETRIEVAL_MODEL_CACHE`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retrieval_model_cache: Option<PathBuf>,
+
+    /// Download model artifacts from here instead of the address their
+    /// descriptor names. The pinned digests still decide whether the bytes are
+    /// accepted. Overridden by `WASH_RETRIEVAL_MODEL_MIRROR`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retrieval_model_mirror: Option<String>,
 
     /// Maximum size of the betty-blocks:retrieval plugin's connection pool.
     /// Unset keeps the plugin's own default (8).
@@ -1495,6 +1524,49 @@ impl DevConfig {
             .map(|path| project_dir.join(path))
     }
 
+    /// Which model `wash dev` should run, letting the environment win over the
+    /// config file.
+    ///
+    /// `wash dev` reads nested `dev.*` keys from files, which wash's own
+    /// `WASH_`-prefixed environment merging cannot reach; these four are read
+    /// here by hand so that the same `WASH_RETRIEVAL_MODEL*` variables work in
+    /// `wash dev` and `wash host`. Without that, changing models under
+    /// `wash dev` would mean editing a committed file.
+    ///
+    /// A value that names an existing file is anchored to `project_dir` the
+    /// way the path key always was; a model name is left alone.
+    pub fn retrieval_model_settings(&self, project_dir: &Path) -> RetrievalModelSettings {
+        self.retrieval_model_settings_from(project_dir, |key| std::env::var(key).ok())
+    }
+
+    /// [`DevConfig::retrieval_model_settings`] with the environment handed in,
+    /// so the precedence rule is testable without mutating a real process's
+    /// variables from parallel tests.
+    pub(crate) fn retrieval_model_settings_from(
+        &self,
+        project_dir: &Path,
+        read_env: impl Fn(&str) -> Option<String>,
+    ) -> RetrievalModelSettings {
+        let env = |key: &str| {
+            read_env(key)
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+        };
+        let model = env("WASH_RETRIEVAL_MODEL").or_else(|| self.retrieval_model.clone());
+        let model = model.map(|spec| anchor_model_spec(spec, project_dir));
+        RetrievalModelSettings {
+            model,
+            model_config: self.retrieval_model_config_path(project_dir),
+            catalog: env("WASH_RETRIEVAL_MODEL_CATALOG")
+                .or_else(|| self.retrieval_model_catalog.clone()),
+            cache: env("WASH_RETRIEVAL_MODEL_CACHE")
+                .map(PathBuf::from)
+                .or_else(|| self.retrieval_model_cache.clone()),
+            mirror: env("WASH_RETRIEVAL_MODEL_MIRROR")
+                .or_else(|| self.retrieval_model_mirror.clone()),
+        }
+    }
+
     pub fn validate(&self) -> Result<()> {
         let mut errors: Vec<String> = Vec::new();
 
@@ -1612,6 +1684,27 @@ impl DevConfig {
             bail!("{}", errors.join("\n"))
         }
     }
+}
+
+/// What `wash dev` settled on for the betty-blocks:retrieval plugin's model.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RetrievalModelSettings {
+    pub model: Option<String>,
+    pub model_config: Option<PathBuf>,
+    pub catalog: Option<String>,
+    pub cache: Option<PathBuf>,
+    pub mirror: Option<String>,
+}
+
+/// A model spec that is a relative PATH is joined onto the project directory,
+/// as `dev.retrieval_model_config` always has been. A name is left as written:
+/// it is looked up in a catalog, not on this filesystem.
+fn anchor_model_spec(spec: String, project_dir: &Path) -> String {
+    let path = Path::new(&spec);
+    if path.is_absolute() || !(spec.contains('/') || spec.ends_with(".json")) {
+        return spec;
+    }
+    project_dir.join(path).to_string_lossy().into_owned()
 }
 
 /// Load configuration with hierarchical merging
@@ -2376,6 +2469,64 @@ workload:
         };
         let err = cfg.validate().unwrap_err().to_string();
         assert!(err.contains("retrieval_model_config"), "{err}");
+    }
+
+    #[test]
+    fn the_environment_names_the_model_over_the_config_file() {
+        // Why this exists: `wash dev` reads nested `dev.*` keys from files,
+        // which wash's WASH_-prefixed env merging cannot reach. Without this,
+        // switching models under `wash dev` would mean editing a committed
+        // file.
+        let dev = DevConfig {
+            retrieval_model: Some("from-the-file".to_string()),
+            retrieval_model_catalog: Some("/catalog/from/file".to_string()),
+            ..Default::default()
+        };
+        let project = Path::new("/project");
+
+        let from_file = dev.retrieval_model_settings(project);
+        assert_eq!(from_file.model.as_deref(), Some("from-the-file"));
+
+        let settled = dev.retrieval_model_settings_from(project, |key| match key {
+            "WASH_RETRIEVAL_MODEL" => Some("from-the-environment".to_string()),
+            "WASH_RETRIEVAL_MODEL_CATALOG" => Some("/catalog/from/env".to_string()),
+            _ => None,
+        });
+        assert_eq!(settled.model.as_deref(), Some("from-the-environment"));
+        assert_eq!(settled.catalog.as_deref(), Some("/catalog/from/env"));
+
+        // An env var set to the empty string is a shell saying "unset" by
+        // accident; the file's value must survive it.
+        let blank = dev.retrieval_model_settings_from(project, |key| {
+            (key == "WASH_RETRIEVAL_MODEL").then(|| "  ".to_string())
+        });
+        assert_eq!(blank.model.as_deref(), Some("from-the-file"));
+    }
+
+    #[test]
+    fn a_model_path_is_anchored_to_the_project_but_a_model_name_is_not() {
+        let dev = DevConfig::default();
+        let project = Path::new("/project");
+        let named = |value: &'static str| {
+            dev.retrieval_model_settings_from(project, move |key| {
+                (key == "WASH_RETRIEVAL_MODEL").then(|| value.to_string())
+            })
+        };
+        assert_eq!(
+            named("models/granite.json").model.as_deref(),
+            Some("/project/models/granite.json"),
+            "a relative descriptor path resolves against the project, as the path key always did"
+        );
+        assert_eq!(
+            named("granite-107m").model.as_deref(),
+            Some("granite-107m"),
+            "a name is looked up in a catalog, not on this filesystem"
+        );
+        assert_eq!(
+            named("/models/granite.json").model.as_deref(),
+            Some("/models/granite.json"),
+            "an absolute path is left alone"
+        );
     }
 
     #[test]

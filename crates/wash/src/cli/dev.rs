@@ -23,7 +23,9 @@ use wash_runtime::{
 };
 
 #[cfg(feature = "betty-retrieval")]
-use crate::cli::retrieval::{BettyRetrievalOverrides, build_betty_retrieval_config};
+use crate::cli::retrieval::{
+    BettyRetrievalOverrides, ModelSettings, build_betty_retrieval_config, model_selection,
+};
 use crate::{
     cli::{
         CliCommand, CliContext, CommandOutput, component_build::build_dev_component,
@@ -362,14 +364,22 @@ impl CliCommand for DevCommand {
 
         // Add the betty-blocks:retrieval plugin if configured
         #[cfg(feature = "betty-retrieval")]
-        match (
-            &dev_config.retrieval_database_url,
-            dev_config.retrieval_model_config_path(project_dir),
-        ) {
-            (Some(database_url), Some(model_config)) => {
+        let retrieval_model = {
+            let settings = dev_config.retrieval_model_settings(project_dir);
+            model_selection(ModelSettings {
+                model: settings.model,
+                model_config: settings.model_config,
+                catalog: settings.catalog,
+                cache: settings.cache,
+                mirror: settings.mirror,
+            })
+        };
+        #[cfg(feature = "betty-retrieval")]
+        match (&dev_config.retrieval_database_url, retrieval_model) {
+            (Some(database_url), Some(model)) => {
                 let retrieval_config = build_betty_retrieval_config(
                     database_url.clone(),
-                    model_config,
+                    model,
                     BettyRetrievalOverrides {
                         pool_size: dev_config.retrieval_pool_size,
                         connect_timeout_secs: dev_config.retrieval_connect_timeout_secs,
@@ -385,11 +395,12 @@ impl CliCommand for DevCommand {
                 ))?;
                 debug!("betty-blocks:retrieval plugin registered");
             }
-            (Some(_), None) => {
-                bail!("dev.retrieval_database_url is set but dev.retrieval_model_config is missing")
-            }
+            (Some(_), None) => bail!(
+                "dev.retrieval_database_url is set but no model is: set dev.retrieval_model \
+                 (or WASH_RETRIEVAL_MODEL) to a model name or a descriptor path"
+            ),
             (None, Some(_)) => {
-                bail!("dev.retrieval_model_config is set but dev.retrieval_database_url is missing")
+                bail!("a retrieval model is set but dev.retrieval_database_url is missing")
             }
             (None, None) => {}
         }

@@ -2244,6 +2244,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "tokenizers",
+ "ureq",
 ]
 
 [[package]]
@@ -6806,6 +6807,7 @@ checksum = "972d7902c8735f2695410b8aed7df6ed12a47394aa1c8d7af49f0497b731a94d"
 dependencies = [
  "base64 0.23.1",
  "der 0.8.2",
+ "flate2",
  "log",
  "native-tls",
  "percent-encoding",
@@ -6815,6 +6817,7 @@ dependencies = [
  "ureq-proto",
  "utf8-zero",
  "webpki-root-certs",
+ "webpki-roots 1.0.9",
 ]
 
 [[package]]

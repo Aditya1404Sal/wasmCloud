@@ -8,12 +8,39 @@ use std::time::Duration;
 use anyhow::{Context as _, bail};
 use url::Url;
 
+/// Which embedding model to run, and where to find it.
+///
+/// A `spec` is either a path to a model descriptor — how this has always
+/// worked — or a model NAME looked up in `catalog` and fetched into `cache`
+/// when the right bytes are not already there. Naming a model is what lets an
+/// operator change models by changing the environment rather than by
+/// rebuilding this host.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ModelSelection {
+    pub spec: String,
+    pub catalog: Option<String>,
+    pub cache: Option<PathBuf>,
+    pub mirror: Option<String>,
+}
+
+impl ModelSelection {
+    /// A descriptor already on disk: no catalog, nothing to fetch.
+    pub fn from_path(path: PathBuf) -> Self {
+        Self {
+            spec: path.to_string_lossy().into_owned(),
+            catalog: None,
+            cache: None,
+            mirror: None,
+        }
+    }
+}
+
 /// How the plugin connects to Postgres, tunes HNSW search, and finds the
-/// granite embedding model on disk.
+/// embedding model.
 #[derive(Clone, Debug)]
 pub struct BettyRetrievalConfig {
     pub database_url: String,
-    pub model_config: PathBuf,
+    pub model: ModelSelection,
     pub pool_size: usize,
     pub connect_timeout: Duration,
     pub ef_search: u32,
@@ -22,13 +49,20 @@ pub struct BettyRetrievalConfig {
 }
 
 impl BettyRetrievalConfig {
-    /// `database_url` and `model_config` with the native provider's defaults
-    /// for everything else: pool 8, 10s connect timeout, `ef_search` 200,
-    /// `max_scan_tuples` 20000, 4 embed threads.
+    /// `database_url` and a model descriptor path, with the native provider's
+    /// defaults for everything else: pool 8, 10s connect timeout, `ef_search`
+    /// 200, `max_scan_tuples` 20000, 4 embed threads. Use
+    /// [`BettyRetrievalConfig::with_model`] to name a model instead.
     pub fn new(database_url: String, model_config: PathBuf) -> Self {
+        Self::with_model(database_url, ModelSelection::from_path(model_config))
+    }
+
+    /// As [`BettyRetrievalConfig::new`], for a model that may be named rather
+    /// than placed.
+    pub fn with_model(database_url: String, model: ModelSelection) -> Self {
         Self {
             database_url,
-            model_config,
+            model,
             pool_size: 8,
             connect_timeout: Duration::from_secs(10),
             ef_search: 200,
@@ -37,10 +71,13 @@ impl BettyRetrievalConfig {
         }
     }
 
-    /// Refuses a zero pool size, connect timeout, embed thread count,
-    /// `ef_search` or `max_scan_tuples`, and a `database_url` that is not
-    /// `postgres`/`postgresql`.
+    /// Refuses an unnamed model, a zero pool size, connect timeout, embed
+    /// thread count, `ef_search` or `max_scan_tuples`, and a `database_url`
+    /// that is not `postgres`/`postgresql`.
     pub fn validate(&self) -> anyhow::Result<()> {
+        if self.model.spec.trim().is_empty() {
+            bail!("no embedding model was named: give a model name or a descriptor path");
+        }
         if self.pool_size == 0 {
             bail!("pool_size must be greater than zero");
         }

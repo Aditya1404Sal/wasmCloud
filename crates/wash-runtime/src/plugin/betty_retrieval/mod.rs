@@ -24,7 +24,7 @@ use std::sync::Arc;
 
 use anyhow::{Context as _, anyhow, bail};
 use deadpool_postgres::{Hook, HookError, Manager, ManagerConfig, Pool, RecyclingMethod};
-use genius_embed::{Adapter, Embedder, ModelConfig, space_identity};
+use genius_embed::{Adapter, Embedder, space_identity};
 use tokio::sync::OnceCell;
 use url::Url;
 
@@ -33,7 +33,7 @@ use crate::engine::workload::WorkloadItem;
 use crate::plugin::{HostPlugin, WitInterfaces};
 use crate::wit::{WitInterface, WitWorld};
 
-pub use config::BettyRetrievalConfig;
+pub use config::{BettyRetrievalConfig, ModelSelection};
 
 pub(crate) const PLUGIN_BETTY_RETRIEVAL_ID: &str = "betty-blocks-retrieval";
 
@@ -60,21 +60,39 @@ pub struct BettyRetrieval {
 }
 
 impl BettyRetrieval {
-    /// Load the granite model from `config.model_config` and derive its
-    /// [`SpaceInfo`]. The pool is not opened until [`HostPlugin::start`] runs.
+    /// Resolve the configured model — a descriptor path, or a name fetched
+    /// from a catalog — load it, and derive its [`SpaceInfo`]. The pool is not
+    /// opened until [`HostPlugin::start`] runs.
+    ///
+    /// Resolving happens here, at startup, on the thread that is about to load
+    /// hundreds of megabytes of model anyway: a fetch is a once-per-machine
+    /// cost, and everything after it reads from the cache.
     pub fn new(config: BettyRetrievalConfig) -> anyhow::Result<Self> {
         config.validate()?;
-        let model = ModelConfig::load_anchored(&config.model_config)
-            .context("load the betty-retrieval model config")?;
-        model
-            .verify_artifacts()
-            .context("verify the betty-retrieval model artifacts")?;
+        let resolved = genius_embed::resolve(&genius_embed::ResolveRequest {
+            spec: config.model.spec.clone(),
+            catalog: config.model.catalog.clone(),
+            cache: config.model.cache.clone(),
+            mirror: config.model.mirror.clone(),
+        })
+        .context("resolve the betty-retrieval embedding model")?;
+        let model = resolved.config;
+        // `resolve` has already checked the artifacts against the digests the
+        // descriptor pins, whichever way it found them.
         let adapter = Adapter::load_with_threads(&model, config.embed_threads, None)
             .context("load the betty-retrieval embedding model")?;
         let dimension = adapter.dim();
         let space_id = space_identity(&model, dimension)
             .context("derive the betty-retrieval embedding space identity")?
             .space_id();
+        tracing::info!(
+            event = "retrieval_model_resolved",
+            model_id = %model.model_id,
+            space_id = %space_id,
+            from = resolved.origin.as_str(),
+            descriptor = %resolved.descriptor.display(),
+            "betty-retrieval embedding model resolved"
+        );
         let space = SpaceInfo {
             space_id,
             model_id: model.model_id,
