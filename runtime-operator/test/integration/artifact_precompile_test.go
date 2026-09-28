@@ -16,6 +16,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
 
@@ -38,9 +39,12 @@ var testArtifactStore = runtimectrl.ArtifactStoreConfig{
 }
 
 var (
-	testEnv   *envtest.Environment
-	k8sClient client.Client
-	cancelMgr context.CancelFunc
+	testEnv       *envtest.Environment
+	k8sClient     client.Client
+	cancelMgr     context.CancelFunc
+	testCache     client.Reader
+	testHost      = newFakeHost()
+	testCacheHold = newCacheHold()
 )
 
 func TestIntegration(t *testing.T) {
@@ -63,7 +67,13 @@ var _ = BeforeSuite(func() {
 	k8sClient, err = client.New(cfg, client.Options{Scheme: scheme})
 	Expect(err).NotTo(HaveOccurred())
 
-	mgr, err := ctrl.NewManager(cfg, ctrl.Options{Scheme: scheme})
+	// Lets the finalize test hold a deleted Workload back from the cache (see cacheHold).
+	mgr, err := ctrl.NewManager(cfg, ctrl.Options{
+		Scheme: scheme,
+		Cache: cache.Options{ByObject: map[client.Object]cache.ByObject{
+			&runtimev1alpha1.Workload{}: {Transform: testCacheHold.transform},
+		}},
+	})
 	Expect(err).NotTo(HaveOccurred())
 
 	Expect((&runtimectrl.PrecompileReconciler{
@@ -74,6 +84,15 @@ var _ = BeforeSuite(func() {
 		Target:          testTarget,
 		WasmtimeVersion: testWasmtimeVersion,
 	}).SetupWithManager(mgr)).To(Succeed())
+
+	// Runs the Workload controller against fakeHost; testCache lets the finalize
+	// test see what the controller sees.
+	Expect((&runtimectrl.WorkloadReconciler{
+		Client: mgr.GetClient(),
+		Scheme: mgr.GetScheme(),
+		Bus:    testHost,
+	}).SetupWithManager(mgr)).To(Succeed())
+	testCache = mgr.GetCache()
 
 	var mgrCtx context.Context
 	mgrCtx, cancelMgr = context.WithCancel(context.Background())
