@@ -63,14 +63,16 @@ nats:
     repository: nats
     pull_policy: Always
     tag: "2.12.8-alpine"
-  # -- Compute resources for the NATS container. Idle ~6Mi (profiled); the
-  # bundled NATS is light control-plane use, so the limit is sized accordingly.
+  # -- Compute resources for the NATS container. Idle ~6Mi (profiled), but
+  # with `operator.precompile` enabled and no separate `precompile.natsURL`,
+  # compiled components are pushed through this server's JetStream object
+  # store, which spikes memory well past idle. The limit leaves room for that.
   resources:
     requests:
       cpu: "100m"
-      memory: "64Mi"
-    limits:
       memory: "128Mi"
+    limits:
+      memory: "512Mi"
   # -- The bundled NATS server does not use the Kubernetes API.
   automountServiceAccountToken: false
   # -- Pod-level securityContext. Hardened by default; override any field via values.
