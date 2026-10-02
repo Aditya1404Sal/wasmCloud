@@ -228,7 +228,7 @@ pub mod host_memory;
 pub(crate) mod linked_call;
 pub(crate) mod store;
 mod value;
-mod volumes;
+pub(crate) mod volumes;
 pub mod workload;
 
 /// How often the engine's epoch advances.
