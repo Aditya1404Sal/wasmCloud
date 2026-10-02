@@ -8,10 +8,7 @@ package wasmcloud:llm@0.1.0-draft;
 /// a model loaded in-process, and switching between them is a deploy-time
 /// decision.
 interface inference {
-  use types.{
-    message, generation-options, assistant-message, tool-call, finish-reason,
-    usage, error,
-  };
+  use types.{message, generation-options, assistant-message, tool-call, finish-reason, usage, error};
 
   /// A finished generation.
   record completion {
@@ -22,43 +19,50 @@ interface inference {
     usage: option<usage>,
   }
 
-  /// One increment of a streamed generation.
-  variant delta {
-    /// Response text, to be appended to what came before.
-    text(string),
-    /// Reasoning text, for models that expose it separately from the answer.
-    reasoning(string),
-    /// A tool call, delivered whole once its arguments have fully arrived — the
-    /// implementation reassembles any argument fragments the backend streams.
-    tool-call(tool-call),
-  }
-
-  /// How a streamed generation ended.
+  /// How a streamed generation ended, and what it produced besides text.
   record summary {
+    /// The model that actually served the request, as the backend names it.
     model: string,
     finish-reason: finish-reason,
     usage: option<usage>,
+    /// Reasoning the model produced before its answer, for models that expose
+    /// it separately. Never part of the text stream.
+    reasoning: option<string>,
+    /// Tools the model asked to run, each with its arguments complete.
+    tool-calls: list<tool-call>,
+  }
+
+  /// A streamed generation in progress.
+  resource generation {
+    /// Wait for the generation to end and report how it did, including an
+    /// error that occurred after text began to stream — which the stream
+    /// itself has no way to carry.
+    ///
+    /// Generation produces only as fast as its text stream is read, so drain
+    /// the stream (or drop it, which cancels) before awaiting this.
+    finish: async func() -> result<summary, error>;
   }
 
   /// Generate the next assistant turn for `messages`.
-  complete: async func(messages: list<message>, options: generation-options)
-    -> result<completion, error>;
+  complete: async func(messages: list<message>, options: generation-options) -> result<completion, error>;
 
-  /// Generate the next assistant turn for `messages`, delivered as it is
-  /// produced.
+  /// Generate the next assistant turn for `messages`, delivering its text as it
+  /// is produced.
   ///
   /// On success the result is delivered in two parts:
   ///
-  /// 1. `stream<delta>` — the output, produced incrementally. The caller owns
-  ///    the stream; dropping it early cancels generation, which stops the
-  ///    backend from spending further tokens.
-  /// 2. `future<result<summary, error>>` — resolves once the stream is
-  ///    exhausted. It reports an error that occurred *after* output began (e.g.
-  ///    the backend dropped mid-generation), which the stream itself has no way
-  ///    to surface.
+  /// 1. `stream<string>` — the response text, in pieces to be concatenated.
+  ///    Dropping it early cancels generation, which stops the backend from
+  ///    spending further tokens.
+  /// 2. `generation` — reports how the generation ended, once it has.
   ///
   /// The outer `result` reports failures before any output, such as a refused
   /// model or rejected credentials.
-  complete-streaming: async func(messages: list<message>, options: generation-options)
-    -> result<tuple<stream<delta>, future<result<summary, error>>>, error>;
+  ///
+  /// Text streams as `string` rather than a variant of text, reasoning, and
+  /// tool calls because that is what crosses a store boundary today: a host
+  /// component plugin serving this interface runs in its own store, and the
+  /// host relays only streams of scalars and strings between stores.
+  /// Everything else a generation yields arrives with `generation.finish`.
+  complete-streaming: async func(messages: list<message>, options: generation-options) -> result<tuple<stream<string>, generation>, error>;
 }
