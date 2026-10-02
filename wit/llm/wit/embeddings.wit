@@ -1,0 +1,22 @@
+package wasmcloud:llm@0.1.0-draft;
+
+/// Vector embeddings of text, for retrieval and similarity search.
+///
+/// A separate interface from `inference` so a plugin serving only a chat model
+/// (or only an embedding model) exports just what it has, and a workload
+/// imports just what it needs.
+interface embeddings {
+  use types.{error};
+
+  record embedding-options {
+    /// The embedding model to run. `none` uses the binding's
+    /// `embedding-model` config; `allowed-models` applies as for `inference`.
+    model: option<string>,
+    /// Requested vector length, for models that can truncate their output.
+    dimensions: option<u32>,
+  }
+
+  /// One vector per input, in input order.
+  embed: async func(inputs: list<string>, options: embedding-options)
+    -> result<list<list<f32>>, error>;
+}

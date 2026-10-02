@@ -1,0 +1,64 @@
+package wasmcloud:llm@0.1.0-draft;
+
+/// Chat-style text generation against whichever model the binding names.
+///
+/// The component never sees an endpoint, an API key, or model weights: those
+/// are the binding's config, set by the operator. The same component therefore
+/// runs unchanged against a hosted provider, a model server on the cluster, or
+/// a model loaded in-process, and switching between them is a deploy-time
+/// decision.
+interface inference {
+  use types.{
+    message, generation-options, assistant-message, tool-call, finish-reason,
+    usage, error,
+  };
+
+  /// A finished generation.
+  record completion {
+    /// The model that actually served the request, as the backend names it.
+    model: string,
+    message: assistant-message,
+    finish-reason: finish-reason,
+    usage: option<usage>,
+  }
+
+  /// One increment of a streamed generation.
+  variant delta {
+    /// Response text, to be appended to what came before.
+    text(string),
+    /// Reasoning text, for models that expose it separately from the answer.
+    reasoning(string),
+    /// A tool call, delivered whole once its arguments have fully arrived — the
+    /// implementation reassembles any argument fragments the backend streams.
+    tool-call(tool-call),
+  }
+
+  /// How a streamed generation ended.
+  record summary {
+    model: string,
+    finish-reason: finish-reason,
+    usage: option<usage>,
+  }
+
+  /// Generate the next assistant turn for `messages`.
+  complete: async func(messages: list<message>, options: generation-options)
+    -> result<completion, error>;
+
+  /// Generate the next assistant turn for `messages`, delivered as it is
+  /// produced.
+  ///
+  /// On success the result is delivered in two parts:
+  ///
+  /// 1. `stream<delta>` — the output, produced incrementally. The caller owns
+  ///    the stream; dropping it early cancels generation, which stops the
+  ///    backend from spending further tokens.
+  /// 2. `future<result<summary, error>>` — resolves once the stream is
+  ///    exhausted. It reports an error that occurred *after* output began (e.g.
+  ///    the backend dropped mid-generation), which the stream itself has no way
+  ///    to surface.
+  ///
+  /// The outer `result` reports failures before any output, such as a refused
+  /// model or rejected credentials.
+  complete-streaming: async func(messages: list<message>, options: generation-options)
+    -> result<tuple<stream<delta>, future<result<summary, error>>>, error>;
+}

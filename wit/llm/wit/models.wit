@@ -1,0 +1,21 @@
+package wasmcloud:llm@0.1.0-draft;
+
+/// What the binding can serve.
+interface models {
+  use types.{error};
+
+  record model-info {
+    /// The id to pass as `generation-options.model`.
+    id: string,
+    /// Maximum tokens of input plus output, when the backend reports it.
+    context-length: option<u32>,
+    /// Whether the model accepts `tool-definition`s.
+    supports-tools: bool,
+    /// Whether the model accepts `media` content parts.
+    supports-media: bool,
+  }
+
+  /// The models this binding permits the caller to use: the backend's models,
+  /// narrowed to the binding's `allowed-models` when one is set.
+  list-models: async func() -> result<list<model-info>, error>;
+}

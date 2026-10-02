@@ -1,0 +1,181 @@
+package wasmcloud:llm@0.1.0-draft;
+
+/// Types shared across the llm interfaces.
+///
+/// The conversation model (`message`), the request options, and the error
+/// model live here so that `inference`, `embeddings`, and `models` `use` the
+/// *same* types. That matters for `(implements ..)`: a host can route each
+/// labeled import (say `cloud` and `local`) to its own backend, and the values
+/// flowing through one label unify with every other because they all reference
+/// this one `types` interface.
+///
+/// The shapes are the intersection the major chat APIs (OpenAI-compatible
+/// servers, Anthropic, Ollama, llama.cpp) and in-process runtimes (Candle,
+/// llama.cpp compiled to wasm) can all serve. Anything a backend supports beyond
+/// that travels through `generation-options.extra` rather than widening the
+/// contract.
+interface types {
+  /// Binary media attached to a message, for models that accept it (vision,
+  /// audio). A backend whose model cannot take the part rejects the request
+  /// with `invalid-request` rather than silently dropping it.
+  record media {
+    /// IANA media type, e.g. `image/png` or `audio/wav`.
+    mime-type: string,
+    data: list<u8>,
+  }
+
+  /// One piece of a message's content.
+  variant content-part {
+    text(string),
+    media(media),
+  }
+
+  /// A tool the model may ask the caller to run.
+  record tool-definition {
+    /// Name the model calls the tool by. Unique within one request.
+    name: string,
+    /// What the tool does, written for the model.
+    description: string,
+    /// JSON Schema describing the tool's arguments, as a JSON document.
+    parameters-schema: string,
+  }
+
+  /// A tool invocation the model requested.
+  record tool-call {
+    /// Backend-assigned id, echoed back in the matching `tool-result`.
+    id: string,
+    /// The `tool-definition.name` being called.
+    name: string,
+    /// The arguments, as a JSON document conforming to the tool's schema. The
+    /// model produced this, so validate it before acting on it.
+    arguments: string,
+  }
+
+  /// The output of a tool the caller ran, fed back to the model.
+  record tool-result {
+    /// The `tool-call.id` this answers.
+    call-id: string,
+    content: list<content-part>,
+    /// Whether the tool failed; `content` then describes the failure.
+    is-error: bool,
+  }
+
+  /// What the model produced on one turn.
+  record assistant-message {
+    content: list<content-part>,
+    /// Tools the model asked to run, in order. Empty when it asked for none.
+    tool-calls: list<tool-call>,
+  }
+
+  /// One turn of a conversation.
+  variant message {
+    /// Instructions that frame the conversation. Backends whose API has a
+    /// dedicated system field hoist these into it.
+    system(string),
+    user(list<content-part>),
+    assistant(assistant-message),
+    tool(tool-result),
+  }
+
+  /// Whether, and which, tool the model must call.
+  variant tool-choice {
+    /// The model decides.
+    auto,
+    /// The model must not call a tool.
+    none,
+    /// The model must call at least one tool.
+    required,
+    /// The model must call the named tool.
+    named(string),
+  }
+
+  /// The shape the response text must take.
+  variant response-format {
+    text,
+    /// Any valid JSON document.
+    json,
+    /// A JSON document conforming to this JSON Schema.
+    json-schema(string),
+  }
+
+  /// Per-request generation settings. Every field is optional: an unset field
+  /// takes the binding's configured default, then the backend's own.
+  record generation-options {
+    /// The model to run. `none` uses the binding's `model` config. A model
+    /// outside the binding's `allowed-models` is refused with
+    /// `model-not-allowed`, so an operator — not the component — decides what a
+    /// workload may spend.
+    model: option<string>,
+    /// Upper bound on generated tokens.
+    max-tokens: option<u32>,
+    temperature: option<f32>,
+    top-p: option<f32>,
+    /// Sequences that end generation when produced.
+    stop: list<string>,
+    /// Seed for backends that support reproducible sampling.
+    seed: option<u64>,
+    /// Tools the model may call. Empty offers none.
+    tools: list<tool-definition>,
+    tool-choice: option<tool-choice>,
+    response-format: option<response-format>,
+    /// Backend-specific settings as `(key, JSON value)` pairs, passed through to
+    /// backends that recognize the key and ignored by the rest. The escape hatch
+    /// that keeps provider features (thinking budgets, cache control, ...) from
+    /// forcing a contract change.
+    extra: list<tuple<string, string>>,
+  }
+
+  /// Why generation ended.
+  enum finish-reason {
+    /// The model finished, or produced a `stop` sequence.
+    stop,
+    /// `max-tokens` or the context window was reached.
+    length,
+    /// The model is waiting on the results of the tool calls it made.
+    tool-calls,
+    /// The backend withheld the output.
+    content-filter,
+    /// A reason this version does not name.
+    other,
+  }
+
+  /// Token accounting as the backend reported it.
+  record usage {
+    input-tokens: u32,
+    output-tokens: u32,
+  }
+
+  /// The set of errors functions in this package may return.
+  ///
+  /// Following the wasip3 convention, this names specific cases rather than
+  /// leaning on stringly-typed errors. It is intentionally non-exhaustive:
+  /// future versions may add cases, so consumers must always include a
+  /// catch-all arm. Backend-specific failures that do not map to a named case
+  /// are reported via `other`.
+  variant error {
+    /// The request was malformed or asked for something the backend does not
+    /// support (e.g. `media` on a text-only model).
+    invalid-request(string),
+    /// The model is not one the binding permits this workload to use.
+    model-not-allowed(string),
+    /// The model is not known to the backend, or a local model failed to load.
+    model-unavailable(string),
+    /// The backend refused the binding's credentials.
+    unauthorized(string),
+    /// The backend is throttling this binding. Carries the backend's suggested
+    /// wait in milliseconds, when it gave one.
+    rate-limited(option<u64>),
+    /// The conversation plus `max-tokens` does not fit the model's context
+    /// window.
+    context-length-exceeded(string),
+    /// The backend refused the content.
+    content-filtered(string),
+    /// The backend could not be reached or failed while serving.
+    backend-failed(string),
+    /// The operation did not complete within the host- or backend-imposed time
+    /// limit.
+    timeout,
+    /// Some other implementation-specific error.
+    other(string),
+  }
+}

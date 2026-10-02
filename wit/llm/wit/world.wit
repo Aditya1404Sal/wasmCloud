@@ -1,0 +1,51 @@
+package wasmcloud:llm@0.1.0-draft;
+
+/// The `wasmcloud:llm/imports` world gives a component access to language
+/// models as a capability. Components targeting this world can:
+///
+/// 1. Generate chat completions, whole or streamed (`inference`).
+/// 2. Embed text as vectors (`embeddings`).
+/// 3. Discover which models their binding permits (`models`).
+///
+/// Every operation is an `async func`, so a component can keep many
+/// generations in flight concurrently.
+///
+/// Which model answers is decided by the binding, not the component. A binding
+/// is configured by the operator with these keys (backends may define more):
+///
+/// | key               | meaning                                                         |
+/// |-------------------|-----------------------------------------------------------------|
+/// | `backend`         | which implementation serves the binding, e.g. `openai`,         |
+/// |                   | `anthropic`, `openai-compatible`, or `local`                    |
+/// | `endpoint`        | base URL of a remote backend                                    |
+/// | `api-key`         | credential for a remote backend; supply it via `secretFrom`     |
+/// | `model`           | default chat model                                              |
+/// | `embedding-model` | default embedding model                                         |
+/// | `allowed-models`  | comma-separated ceiling on what a request may name              |
+///
+/// `endpoint`, `api-key`, and `allowed-models` are the operator's: under
+/// `workloadConfig: deny` a workload cannot set them, so it cannot point a
+/// credential at a host of its choosing or lift its own spending limit.
+///
+/// A workload that needs more than one model imports `inference` under
+/// `(implements <label>)` labels — say `cloud` and `local` — and the operator
+/// declares a binding of the same name for each.
+world imports {
+  import types;
+  import inference;
+  import embeddings;
+  import models;
+}
+
+/// What a plugin serving language models exports. A plugin that has no
+/// embedding model, say, exports a narrower world of its own instead.
+///
+/// `types` is exported, not merely used: a host component plugin is matched to
+/// a workload by what it exports, and the workload imports `types` alongside
+/// the interfaces that use it, so the plugin has to answer for it too.
+world backend {
+  export types;
+  export inference;
+  export embeddings;
+  export models;
+}
