@@ -105,7 +105,8 @@ impl HostControlDefaults {
 /// A start or status the loop has no room for is not answered: its caller
 /// times out and retries, as it does when the host is unreachable. An error
 /// reply would name a workload this host never claimed, and a status would
-/// report a running workload as failed. A stop is never shed.
+/// report a running workload as failed. A stop is never shed, and neither is
+/// a heartbeat: it is the operator's liveness probe for this host.
 ///
 /// Methods run concurrently and may be cancelled after the shutdown drain.
 /// Keep side effects cancellation-safe; do not detach work from these futures.
@@ -1151,7 +1152,18 @@ fn spawn_control_loop(
                                 // a stop is cheap next to a start, so turning
                                 // one away risks a workload left running with
                                 // nobody tracking it for little gain.
-                                Err(_) if command == "workload.stop" => None,
+                                //
+                                // So does a heartbeat. It is the operator's own
+                                // liveness verdict for this host: reconcileReporting
+                                // asks fresh every reconcile and reads no answer as
+                                // "not reporting", whatever the last self-pushed
+                                // heartbeat said. Shedding one under a status flood
+                                // would flip the Host to not ready for being busy,
+                                // which is the false positive the control-plane
+                                // runtime split exists to prevent.
+                                Err(_) if command == "workload.stop" || command == "heartbeat" => {
+                                    None
+                                }
                                 // Shed without a reply, so the caller times out
                                 // and retries. Any typed reply would be read as
                                 // the workload's own state: an errored start

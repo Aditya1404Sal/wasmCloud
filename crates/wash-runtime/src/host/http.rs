@@ -4115,12 +4115,12 @@ impl IntoBodyError for wasmtime_wasi_http::Error {
 /// Send a gRPC request over its own HTTP/2 connection. `tls` must already carry
 /// the h2 ALPN (see [`h2_client_config`]).
 async fn send_grpc_request(
-    mut request: hyper::Request<WasiBody>,
+    request: hyper::Request<WasiBody>,
     options: Option<RequestOptions>,
     tls: Arc<rustls::ClientConfig>,
 ) -> SendResult {
     use crate::host::http_client::{
-        connect_http_tcp, connect_http_tls, request_authority, spawn_conn_worker, to_origin_form,
+        connect_http_tcp, connect_http_tls, request_authority, spawn_conn_worker,
     };
     use tokio::time::timeout;
     use wasmtime_wasi_http::Error;
@@ -4163,8 +4163,11 @@ async fn send_grpc_request(
         (sender, spawn_conn_worker(conn))
     };
 
-    to_origin_form(&mut request);
-
+    // Sent in absolute form, on purpose. HTTP/2 carries the scheme as the
+    // `:scheme` pseudo-header, which RFC 9113 §8.3.1 requires on every
+    // non-CONNECT request, and `h2` only emits it when the URI has one; a
+    // strict gRPC peer rejects a request without it. The authority goes out
+    // as `:authority`, which is what the Host header is to HTTP/2.
     let resp = timeout(first_byte_timeout, sender.send_request(request))
         .await
         .map_err(|_| Error::ConnectionReadTimeout)??

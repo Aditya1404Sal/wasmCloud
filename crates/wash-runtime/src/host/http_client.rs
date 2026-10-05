@@ -542,24 +542,6 @@ pub(crate) fn request_authority<B>(request: &hyper::Request<B>, use_tls: bool) -
     })
 }
 
-/// Rewrite the request URI to origin form (path + query only). The scheme and
-/// authority belong on the wire only when addressing a proxy, and
-/// `SendRequest::send_request` does not strip them for us.
-pub(crate) fn to_origin_form<B>(request: &mut hyper::Request<B>) {
-    if let Ok(uri) = hyper::Uri::builder()
-        .path_and_query(
-            request
-                .uri()
-                .path_and_query()
-                .map(|p| p.as_str())
-                .unwrap_or("/"),
-        )
-        .build()
-    {
-        *request.uri_mut() = uri;
-    }
-}
-
 /// Parse the host portion of `authority` into a TLS server name for SNI.
 fn tls_server_name(authority: &str) -> Option<rustls::pki_types::ServerName<'static>> {
     // `authority` always carries a port here (request_authority adds one), and

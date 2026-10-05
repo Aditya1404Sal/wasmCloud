@@ -1774,10 +1774,11 @@ pub struct HostConfig {
     /// precompiled fetch and a compile all happen inside it, each with its own
     /// (shorter) bound. It is the backstop for the case none of those catch.
     ///
-    /// A start cancelled this way may leave plugins bound under the id, since
-    /// it is dropped part-way through binding them. That is the trade: a
-    /// possible leaked binding on a host that is already failing, against an
-    /// id that can never be used again.
+    /// A start cancelled this way is dropped part-way through binding its
+    /// plugins. Its start journal records each binding before the await that
+    /// follows it, and the cleanup guard that drop fires hands the journal to
+    /// a recovery that retries the teardown until the id is free again, so
+    /// nothing stays bound under an id that can never be used again.
     pub workload_start_timeout: Option<Duration>,
     /// PEM CA bundles to trust for OCI pulls, on top of the OS trust store and
     /// `SSL_CERT_FILE` / `SSL_CERT_DIR`. Needed to reach a registry behind a
