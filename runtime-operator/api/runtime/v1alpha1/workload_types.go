@@ -237,6 +237,9 @@ type HostInterface struct {
 	// so two imports of the same namespace:package can resolve to different
 	// backends.
 	// Required when multiple entries of the same namespace:package exist.
+	// A name declared here takes precedence over a component of the same
+	// name in the same Workload: the host serves the label, and the
+	// component's export is not linked for it.
 	// +kubebuilder:validation:Optional
 	// +kubebuilder:validation:Pattern=`^[a-z0-9][a-z0-9-]*$`
 	// +kubebuilder:validation:MaxLength=64
@@ -325,6 +328,18 @@ type WorkloadSpec struct {
 	//      distinct `name`s to route multiple imports of the same package to
 	//      different backends. Semver-incompatible versions of the same package
 	//      may coexist (they are distinct interfaces).
+	//
+	// Declaring an interface here does not by itself guarantee the host serves
+	// it. A Workload serves itself first: where exactly one component in the
+	// Workload exports a declared interface, that component answers its
+	// siblings' unlabelled imports of it, and the host binds only the
+	// exporting component (an export is how the host reaches into a Workload).
+	// Two or more exporters are ambiguous and fall back to the host.
+	//
+	// Both routes can be stated explicitly, and an explicit route always wins.
+	// Give the entry a `name` and import under that `(implements <name>)`
+	// label to reach the host; import under a label naming a component to
+	// reach that component.
 	// +kubebuilder:validation:Optional
 	// +kubebuilder:validation:MaxItems=64
 	// +kubebuilder:validation:XValidation:rule="self.all(x, self.exists_one(y, y.__namespace__ == x.__namespace__ && y.__package__ == x.__package__ && (has(y.name) ? y.name : '') == (has(x.name) ? x.name : '') && (has(y.version) ? y.version : '') == (has(x.version) ? x.version : '')))",message="hostInterfaces must not contain duplicate entries with the same namespace, package, name, and version"
@@ -375,8 +390,9 @@ func (s *WorkloadSpec) EnsureHostInterface(iface HostInterface) {
 // canonVersion returns the canonical version prefix that determines whether two
 // interface versions are compatible for deduplication, per the component-model
 // `canonversion` rules:
+//   - with a prerelease    -> the whole version         (0.2.6-rc.1 -> "0.2.6-rc.1")
 //   - major > 0            -> "<major>"                 (1.2.3      -> "1")
-//   - major == 0, minor>0  -> "<major>.<minor>"         (0.2.6-rc.1 -> "0.2")
+//   - major == 0, minor>0  -> "<major>.<minor>"         (0.2.6      -> "0.2")
 //   - otherwise            -> "<major>.<minor>.<patch>" (0.0.1      -> "0.0.1")
 //
 // Compatible versions share a canonical prefix and so link by trivial string
@@ -392,6 +408,8 @@ func canonVersion(v string) string {
 		return v
 	}
 	switch {
+	case parsed.Prerelease() != "":
+		return fmt.Sprintf("%d.%d.%d-%s", parsed.Major(), parsed.Minor(), parsed.Patch(), parsed.Prerelease())
 	case parsed.Major() > 0:
 		return fmt.Sprintf("%d", parsed.Major())
 	case parsed.Minor() > 0:

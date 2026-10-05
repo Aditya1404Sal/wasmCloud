@@ -2,7 +2,7 @@
 
 # Build on the native builder platform and cross-compile to the target arch
 # (pure-Go, CGO disabled) so arm64 builds avoid slow QEMU emulation.
-FROM --platform=$BUILDPLATFORM golang:1.26.6 AS builder
+FROM --platform=$BUILDPLATFORM golang:1.27.1 AS builder
 WORKDIR /workspace/runtime-gateway
 
 # buildx injects these for the requested --platform target(s).

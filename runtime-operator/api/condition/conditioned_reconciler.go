@@ -6,10 +6,11 @@ import (
 	"fmt"
 	"time"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
-	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
 
@@ -176,6 +177,7 @@ type ctxKey string
 type ReconcilerContext struct {
 	ForceUpdate       bool
 	ForceRequeue      bool
+	OptimisticLock    bool
 	ReconcileInterval time.Duration
 }
 
@@ -193,6 +195,13 @@ func GetReconcilerContext(ctx context.Context) *ReconcilerContext {
 // ForceStatusUpdate forces a full "Status" update, regardless if conditions have changed.
 func ForceStatusUpdate(ctx context.Context) {
 	GetReconcilerContext(ctx).ForceUpdate = true
+}
+
+// RequireOptimisticLock makes this pass's status patch conditional on the object
+// not having changed since it was read, for a condition that records a decision
+// a stale read would make differently. A conflict requeues the object instead.
+func RequireOptimisticLock(ctx context.Context) {
+	GetReconcilerContext(ctx).OptimisticLock = true
 }
 
 // ForceRequeue forces an immediate requeue, regardless if status has changed.
@@ -219,8 +228,11 @@ func (r *ConditionedReconciler[T]) Reconcile(ctx context.Context, req reconcile.
 			return reconcile.Result{}, finalizerErr
 		}
 
-		if finalizerChanged {
-			return reconcile.Result{Requeue: true}, nil
+		// A removed finalizer leaves nothing to reconcile. An added one needs no
+		// requeue: the Patch refreshed obj, and a finalizer change doesn't bump
+		// the generation that GenerationChangedPredicate watches.
+		if finalizerChanged && !obj.GetDeletionTimestamp().IsZero() {
+			return reconcile.Result{}, nil
 		}
 	}
 
@@ -277,9 +289,16 @@ func (r *ConditionedReconciler[T]) Reconcile(ctx context.Context, req reconcile.
 	}
 
 	if reconcilerCtx.ForceUpdate {
-		if err := r.client.Status().Patch(ctx, obj, client.MergeFrom(originalObject)); err != nil {
-			logger := ctrl.LoggerFrom(ctx)
-			logger.Error(err, "failed to patch status",
+		patch := client.MergeFrom(originalObject)
+		if reconcilerCtx.OptimisticLock {
+			patch = client.MergeFromWithOptions(originalObject, client.MergeFromWithOptimisticLock{})
+		}
+		if err := r.client.Status().Patch(ctx, obj, patch); err != nil {
+			if apierrors.IsConflict(err) {
+				log.FromContext(ctx).V(1).Info("status patch built from a stale read was rejected; requeueing")
+				return reconcile.Result{RequeueAfter: time.Second}, nil
+			}
+			log.FromContext(ctx).Error(err, "failed to patch status",
 				"name", obj.GetName(),
 				"resourceVersion", originalObject.GetResourceVersion(),
 			)

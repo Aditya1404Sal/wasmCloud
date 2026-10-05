@@ -57,7 +57,7 @@ super::messaging_handler_dispatch! {
 
 use crate::engine::ctx::{ActiveCtx, SharedCtx, extract_active_ctx};
 use crate::engine::workload::{ResolvedWorkload, WorkloadItem};
-use crate::observability::Meters;
+use crate::observability::{MeterKind, Meters};
 use crate::plugin::wasmcloud_messaging::Admitted;
 use crate::plugin::{HostPlugin, WitInterfaces, WorkloadTracker};
 use crate::wit::{WitInterface, WitWorld};
@@ -136,7 +136,7 @@ impl NatsMessaging {
         Self {
             client,
             tracker: Arc::new(RwLock::new(WorkloadTracker::default())),
-            meters: Default::default(),
+            meters: Arc::new(RwLock::new(Meters::new(MeterKind::Off))),
             limits,
         }
     }
@@ -361,6 +361,8 @@ impl HostPlugin for NatsMessaging {
         let interface_consumer_group = interface.config.get(CONSUMER_GROUP_CONFIG).cloned();
         let interface_max_in_flight = interface.config.get(super::MAX_IN_FLIGHT_CONFIG).cloned();
         let interface_admission_wait = interface.config.get(super::ADMISSION_WAIT_CONFIG).cloned();
+        let interface_admission_group =
+            interface.config.get(super::ADMISSION_GROUP_CONFIG).cloned();
 
         // Bind only the revision(s) the workload actually declared: the two
         // surfaces are separate linker instances, and binding one a component
@@ -398,6 +400,11 @@ impl HostPlugin for NatsMessaging {
             .local_resources()
             .config
             .get(super::ADMISSION_WAIT_CONFIG)
+            .cloned();
+        let local_admission_group = component_handle
+            .local_resources()
+            .config
+            .get(super::ADMISSION_GROUP_CONFIG)
             .cloned();
 
         // Track a handler component OR a long-lived handler service:
@@ -439,9 +446,12 @@ impl HostPlugin for NatsMessaging {
             // something a manifest author recognizes and selects the gate, so
             // replicas of this deployment on this host share one ceiling
             // rather than getting one apiece.
+            let workload_name = super::parse_admission_group(local_admission_group.as_deref())
+                .or_else(|| super::parse_admission_group(interface_admission_group.as_deref()))
+                .unwrap_or_else(|| component_handle.stable_workload_name());
             let identity = super::AdmissionIdentity::new(
                 component_handle.workload_namespace(),
-                component_handle.workload_name(),
+                workload_name,
                 &component_name,
             );
             let admission = self
@@ -607,21 +617,43 @@ impl HostPlugin for NatsMessaging {
                         let reply_to = msg.reply.as_ref().map(|r| r.to_string());
                         let body: Vec<u8> = msg.payload.into();
 
+                        // Only the trigger-service branch below needs the
+                        // handler; a per-message component is delivered to
+                        // without it. A gone handler therefore skips that
+                        // branch rather than ending the loop — the message is
+                        // already consumed, and tearing the subscriptions down
+                        // here would drop it with nothing able to redeliver.
+                        let http_handler = workload.try_http_handler();
+
+                        // Unless nothing else can serve it either. A workload
+                        // whose handler is its trigger service has no
+                        // per-message instance to fall back to, so going on
+                        // would win this component's share of a queue group
+                        // forever and drop every message in it.
+                        if http_handler.is_none() && pre.is_none() {
+                            warn!(
+                                parent: &span,
+                                component_id = %component_id,
+                                "host is gone and this component has no per-message \
+                                 instance; ending the NATS subscriber loop"
+                            );
+                            break;
+                        }
+
                         // If this workload runs a long-lived trigger service for
                         // messaging, deliver to it (preserving its in-memory
                         // state) rather than instantiating a component per message.
-                        if workload
-                            .http_handler()
-                            .has_trigger_service_messaging(workload.id())
-                            .await
+                        if let Some(http_handler) = &http_handler
+                            && http_handler
+                                .has_trigger_service_messaging(workload.id())
+                                .await
                         {
                             let broker = crate::host::trigger_service::BrokerMessage {
                                 subject: subject.clone(),
                                 body,
                                 reply_to,
                             };
-                            match workload
-                                .http_handler()
+                            match http_handler
                                 .deliver_trigger_service_message(
                                     workload.id(),
                                     broker,

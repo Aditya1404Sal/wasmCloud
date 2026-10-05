@@ -70,6 +70,8 @@ it. `wasmcloud:nats` is configured like every other plugin, as an entry under
 host:
   plugins:
     - id: wasmcloud-nats
+      allowedHosts: [nats.default.svc:4222]
+      allowedIpNameLookups: [nats.default.svc]
       config:
         servers: nats://nats.default.svc:4222
         # Deny-by-default: without these the workload reaches nothing. A
@@ -108,7 +110,7 @@ spec:
   hostInterfaces:
     - namespace: wasmcloud
       package: nats
-      version: "0.1.0"
+      version: "0.1.2"
       interfaces: [types, jetstream, kv, jetstream-handler]
       config:
         # STREAM:filter[:policy[:queue]] — an empty policy slot is the

@@ -3,8 +3,6 @@ package integration
 import (
 	"context"
 	"fmt"
-	"path/filepath"
-	"testing"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -12,13 +10,8 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
-	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
-	ctrl "sigs.k8s.io/controller-runtime"
-	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/envtest"
 
 	runtimev1alpha1 "go.wasmcloud.dev/runtime-operator/v2/api/runtime/v1alpha1"
 	runtimectrl "go.wasmcloud.dev/runtime-operator/v2/internal/controller/runtime"
@@ -37,77 +30,6 @@ var testArtifactStore = runtimectrl.ArtifactStoreConfig{
 		{Name: "NATS_URL", Value: "nats://test-nats:4222"},
 	},
 }
-
-var (
-	testEnv       *envtest.Environment
-	k8sClient     client.Client
-	cancelMgr     context.CancelFunc
-	testCache     client.Reader
-	testHost      = newFakeHost()
-	testCacheHold = newCacheHold()
-)
-
-func TestIntegration(t *testing.T) {
-	RegisterFailHandler(Fail)
-	RunSpecs(t, "Integration Suite")
-}
-
-var _ = BeforeSuite(func() {
-	testEnv = &envtest.Environment{
-		CRDDirectoryPaths:     []string{filepath.Join("..", "..", "config", "crd", "bases")},
-		ErrorIfCRDPathMissing: true,
-	}
-	cfg, err := testEnv.Start()
-	Expect(err).NotTo(HaveOccurred())
-
-	scheme := runtime.NewScheme()
-	Expect(clientgoscheme.AddToScheme(scheme)).To(Succeed())
-	Expect(runtimev1alpha1.AddToScheme(scheme)).To(Succeed())
-
-	k8sClient, err = client.New(cfg, client.Options{Scheme: scheme})
-	Expect(err).NotTo(HaveOccurred())
-
-	// Lets the finalize test hold a deleted Workload back from the cache (see cacheHold).
-	mgr, err := ctrl.NewManager(cfg, ctrl.Options{
-		Scheme: scheme,
-		Cache: cache.Options{ByObject: map[client.Object]cache.ByObject{
-			&runtimev1alpha1.Workload{}: {Transform: testCacheHold.transform},
-		}},
-	})
-	Expect(err).NotTo(HaveOccurred())
-
-	Expect((&runtimectrl.PrecompileReconciler{
-		Client:          mgr.GetClient(),
-		Scheme:          mgr.GetScheme(),
-		WorkerImage:     testWorkerImage,
-		ArtifactStore:   testArtifactStore,
-		Target:          testTarget,
-		WasmtimeVersion: testWasmtimeVersion,
-	}).SetupWithManager(mgr)).To(Succeed())
-
-	// Runs the Workload controller against fakeHost; testCache lets the finalize
-	// test see what the controller sees.
-	Expect((&runtimectrl.WorkloadReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
-		Bus:    testHost,
-	}).SetupWithManager(mgr)).To(Succeed())
-	testCache = mgr.GetCache()
-
-	var mgrCtx context.Context
-	mgrCtx, cancelMgr = context.WithCancel(context.Background())
-	go func() {
-		defer GinkgoRecover()
-		Expect(mgr.Start(mgrCtx)).To(Succeed())
-	}()
-})
-
-var _ = AfterSuite(func() {
-	if cancelMgr != nil {
-		cancelMgr()
-	}
-	Expect(testEnv.Stop()).To(Succeed())
-})
 
 func newArtifact(ctx context.Context, name string) *runtimev1alpha1.Artifact {
 	GinkgoHelper()

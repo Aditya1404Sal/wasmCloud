@@ -1,6 +1,20 @@
 {{- $top := . }}
 {{- range .Values.runtime.hostGroups }}
 {{- $ns := default $top.Release.Namespace .namespace }}
+{{- /* Group values override chart-wide client identity fields. */}}
+{{- $identity := merge (deepCopy (.clientIdentity | default dict)) $top.Values.runtime.clientIdentity }}
+{{- /* Empty group values disable identity or refresh inheritance. */}}
+{{- $groupIdentity := .clientIdentity | default dict }}
+{{- if and (hasKey $groupIdentity "secretName") (not $groupIdentity.secretName) }}
+{{- $identity = dict }}
+{{- else if and (hasKey $groupIdentity "refreshInterval") (not $groupIdentity.refreshInterval) }}
+{{- $identity = merge (dict "refreshInterval" "") (omit $identity "refreshInterval") }}
+{{- end }}
+{{- if $identity.secretName }}
+{{- if or (not $identity.mountPath) (not $identity.certKey) (not $identity.keyKey) }}
+{{- fail (printf "hostGroup %s: clientIdentity.secretName needs mountPath, certKey and keyKey" .name) }}
+{{- end }}
+{{- end }}
 {{- /* Per-hostgroup image: `.image.{registry,repository,tag}` override the
        chart-wide runtime.image, so one release can mix host versions (e.g. an
        all-features host for one group and the shipped image for another). */}}
@@ -9,7 +23,8 @@
 {{- $imgRepo := $hi.repository | default $top.Values.runtime.image.repository }}
 {{- $imgTag := $hi.tag | default $top.Values.runtime.image.tag | default $top.Chart.AppVersion }}
 {{- /* hostPlugins entries needing a `wash host` config file (--config) —
-       config/configFrom/secretFrom/allowedHosts/allowedIpNameLookups have no
+       config/configFrom/secretFrom/allowedHosts/allowedIpNameLookups/
+       allowedHostLoopbackPorts/ports have no
        `--host-plugin` CLI-arg equivalent (deliberately: a secret must never
        land on the command line). See host-plugin-config.yaml, which renders
        the ConfigMap this deployment mounts. */}}
@@ -20,7 +35,53 @@
 {{- $resources := .resources | default $top.Values.runtime.resources | default dict }}
 {{- /* Probes, unlike `resources`, merge per field: a group naming one timing
        keeps the chart-wide values for the rest. */}}
+{{- /* The shutdown budget, checked rather than described: the host serves for
+       `drainDelaySeconds`, then drains commands for up to 5s, and SIGKILL lands
+       at `terminationGracePeriodSeconds` whatever it is doing. */}}
+{{- $drain := int ($top.Values.runtime.drainDelaySeconds | default 0) }}
+{{- if gt (add $drain 5) (int $top.Values.runtime.terminationGracePeriodSeconds) }}
+{{- fail (printf "runtime.terminationGracePeriodSeconds (%v) is under drainDelaySeconds (%v) plus the 5s command drain; the host would be killed mid-shutdown" $top.Values.runtime.terminationGracePeriodSeconds $drain) }}
+{{- end }}
 {{- $probeArgs := dict "group" .probes "chart" $top.Values.runtime.probes }}
+{{- /* The port the probes are answered on, merged per field like the timings
+       beside it: a group may turn it off or move it without restating the
+       chart-wide default. */}}
+{{- $endpoint := include "runtime-operator.hostProbe" (merge (dict "name" "endpoint") $probeArgs) | fromJson }}
+{{- /* The ports and names this chart renders itself. A group that claims one
+       again fails here, by name, rather than at the API server, which rejects
+       a duplicate containerPort by array index. */}}
+{{- $groupName := .name }}
+{{- $reserved := dict }}
+{{- $reservedNames := dict }}
+{{- if and .http .http.enabled }}
+{{- $_ := set $reserved (toString (int .http.port)) "http.port" }}
+{{- $_ := set $reservedNames "http" "http.port" }}
+{{- end }}
+{{- if $endpoint.enabled }}
+{{- $probePort := toString (int $endpoint.port) }}
+{{- with index $reserved $probePort }}
+{{- fail (printf "host group %s: probes.endpoint.port and http.port are both %v; the host would fail to bind the second" $groupName $endpoint.port) }}
+{{- end }}
+{{- $_ := set $reserved $probePort "probes.endpoint.port" }}
+{{- $_ := set $reservedNames "probes" "probes.endpoint.port" }}
+{{- end }}
+{{- range .ports }}
+{{- $port := toString (int .containerPort) }}
+{{- $name := toString .name }}
+{{- $portClash := index $reserved $port }}
+{{- if $portClash }}
+{{- fail (printf "host group %s: ports[] gives containerPort %s, already rendered from %s; drop it" $groupName $port $portClash) }}
+{{- end }}
+{{- $_ := set $reserved $port (printf "ports[].%s" $name) }}
+{{- /* A container port may be unnamed, and two of those are not a clash. */}}
+{{- if .name }}
+{{- $nameClash := index $reservedNames $name }}
+{{- if $nameClash }}
+{{- fail (printf "host group %s: ports[] gives the name %q, already rendered from %s; rename it" $groupName $name $nameClash) }}
+{{- end }}
+{{- $_ := set $reservedNames $name (printf "ports[].%s" $name) }}
+{{- end }}
+{{- end }}
 {{- $liveness := include "runtime-operator.hostProbe" (merge (dict "name" "liveness") $probeArgs) | fromJson }}
 {{- $readiness := include "runtime-operator.hostProbe" (merge (dict "name" "readiness") $probeArgs) | fromJson }}
 {{- $partition := include "runtime-operator.hostPluginPartition" . | fromJson }}
@@ -103,6 +164,14 @@ spec:
             secretName: {{ if and (.http.tls.certificate) (.http.tls.certificate.secretName) }}{{ .http.tls.certificate.secretName }}{{ else }}hostgroup-{{ .name }}-http-tls{{ end }}
         {{- end }}
         {{- end }}
+        {{- /* Client identity is independent of the chart CA. */}}
+        {{- if $identity.secretName }}
+        - name: client-identity
+          secret:
+            secretName: {{ $identity.secretName }}
+            # fsGroup grants the host read access.
+            defaultMode: 0400
+        {{- end }}
         {{- /* Optional pod volumes (e.g. ConfigMap / Secret mounts). Rendered
                unconditionally — outside the global.tls.enabled guard above —
                so they survive a TLS-off install. */}}
@@ -180,9 +249,15 @@ spec:
             - name: WASH_GUEST_MEMORY_MODE
               value: "{{ . }}"
             {{- end }}
-            {{- with $resources.maxConcurrentStarts }}
+            {{- /* Not `with`: Go templates treat the integer 0 as empty, and
+                   `0` is the most serialized setting a host can be given (it
+                   clamps to one start at a time). Tested for a number instead,
+                   so nil, "" and a mistyped bool all skip rather than reaching
+                   the host as an argument it cannot parse. */}}
+            {{- $starts := $resources.maxConcurrentStarts }}
+            {{- if or (kindIs "int64" $starts) (kindIs "float64" $starts) (and (kindIs "string" $starts) (ne $starts "")) }}
             - name: WASH_MAX_CONCURRENT_STARTS
-              value: "{{ . }}"
+              value: "{{ $starts }}"
             {{- end }}
             {{- with $top.Values.runtime.env }}
             {{- toYaml . | nindent 12 }}
@@ -231,11 +306,62 @@ spec:
             - "--wasmcloud-nats-url={{ . }}"
             {{- end }}
             - "--oci-cache-dir=/oci-cache"
+            {{- with $top.Values.runtime.drainDelaySeconds }}
+            - "--drain-delay={{ . }}s"
+            {{- end }}
+            {{- with $top.Values.runtime.natsConnectTimeoutSeconds }}
+            - "--nats-connect-timeout={{ . }}s"
+            {{- end }}
+            {{- if $endpoint.enabled }}
+            - "--probe-addr=0.0.0.0:{{ $endpoint.port }}"
+            {{- end }}
+            {{- /* `networking` is the host's half of every two-sided grant, plus
+                   the ceilings it enforces alone. A key is rendered only when
+                   the values file sets it, so an unset one keeps the host's own
+                   default rather than having the chart restate it — which
+                   matters for the derived ceilings, where "unset" and "the same
+                   number typed out" mean different things downstream. */}}
+            {{- with .networking }}
+            {{- if .allowHostLoopback }}
+            - "--allow-host-loopback"
+            {{- end }}
+            {{- with .socketEgress }}
+            - "--socket-egress={{ . }}"
+            {{- end }}
+            {{- if hasKey . "denySpecialRanges" }}
+            - "--deny-special-ranges={{ .denySpecialRanges }}"
+            {{- end }}
+            {{- if .denyPrivateRanges }}
+            - "--deny-private-ranges"
+            {{- end }}
+            {{- with .maxConnections }}
+            - "--max-connections={{ . }}"
+            {{- end }}
+            {{- with .maxHttpIngressConnections }}
+            - "--max-http-ingress-connections={{ . }}"
+            {{- end }}
+            {{- with .maxOutboundHttpConnectionsPerWorkload }}
+            - "--max-outbound-http-connections-per-workload={{ . }}"
+            {{- end }}
+            {{- with .maxOutboundSocketConnectionsPerWorkload }}
+            - "--max-outbound-socket-connections-per-workload={{ . }}"
+            {{- end }}
+            {{- with .maxInboundSocketConnectionsPerWorkload }}
+            - "--max-inbound-socket-connections-per-workload={{ . }}"
+            {{- end }}
+            {{- end }}
             {{- if and (.http) (.http.enabled) }}
             - "--http-addr=0.0.0.0:{{ .http.port }}"
             {{- if and ($top.Values.global.tls.enabled) (.http.tls) (.http.tls.enabled) }}
             - "--tls-cert-path=/tls-cert/tls.crt"
             - "--tls-key-path=/tls-cert/tls.key"
+            {{- end }}
+            {{- /* Same-host local routing: outgoing requests to a hostname
+                   this host's ingress serves are answered in-memory by the
+                   co-located workload, bypassing the cluster network (and any
+                   ingress middleware on it). Off unless explicitly enabled. */}}
+            {{- if .http.localBypassRouting }}
+            - "--http-local-routing"
             {{- end }}
             {{- end }}
             {{- /* Extra CA bundles this host trusts when pulling images. The
@@ -247,6 +373,24 @@ spec:
             {{- range concat ($top.Values.runtime.ociCaPaths | default list) (.ociCaPaths | default list) }}
             - "--oci-ca-path={{ . }}"
             {{- end }}
+            {{- /* Component egress trust, which the OCI bundles above do not
+                   cover: a third trust store that reads neither the container's
+                   system roots nor the image-pull bundles. Chart-wide entries
+                   first, then per-host-group ones. */}}
+            {{- range concat ($top.Values.runtime.httpClientCaPaths | default list) (.httpClientCaPaths | default list) }}
+            - "--http-client-ca-path={{ . }}"
+            {{- end }}
+            {{- with (.httpClientTrustRoots | default $top.Values.runtime.httpClientTrustRoots) }}
+            - "--http-client-trust-roots={{ . }}"
+            {{- end }}
+            {{- /* Identity presented for component egress. */}}
+            {{- if $identity.secretName }}
+            - "--http-client-cert-path={{ $identity.mountPath }}/{{ $identity.certKey }}"
+            - "--http-client-key-path={{ $identity.mountPath }}/{{ $identity.keyKey }}"
+            {{- with $identity.refreshInterval }}
+            - "--http-client-identity-refresh={{ . }}"
+            {{- end }}
+            {{- end }}
             {{- if and (.webgpu) (.webgpu.enabled) }}
             - "--wasi-webgpu"
             {{- end }}
@@ -256,7 +400,7 @@ spec:
             {{- range .wasmProposals }}
             - "--wasm-proposal={{ . }}"
             {{- end }}
-            {{- /* Host component plugins with no config/secretFrom/allowedHosts:
+            {{- /* Host component plugins with no config/secretFrom/egress policy:
                    one --host-plugin flag per entry, rendered into the CLI's
                    `key=value` grammar (unchanged). Entries that DO set any of
                    those render into the mounted config file instead — see
@@ -294,6 +438,11 @@ spec:
               readOnly: true
             {{- end }}
             {{- end }}
+            {{- if $identity.secretName }}
+            - name: client-identity
+              mountPath: {{ $identity.mountPath }}
+              readOnly: true
+            {{- end }}
             {{- /* Optional host-container volumeMounts (pair with .volumes
                    above). Rendered unconditionally so a TLS-off install still
                    mounts user volumes. */}}
@@ -325,6 +474,11 @@ spec:
               containerPort: {{ .http.port }}
               protocol: TCP
             {{- end }}
+            {{- if $endpoint.enabled }}
+            - name: probes
+              containerPort: {{ $endpoint.port }}
+              protocol: TCP
+            {{- end }}
             {{- /* Optional additional container ports (e.g. metrics scrape).
                    Do NOT re-list the http port — the chart renders it from
                    `.http.port` above; a duplicate containerPort fails
@@ -332,26 +486,51 @@ spec:
             {{- with .ports }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
-          {{- if and (.http) (.http.enabled) }}
-          {{- /* A host serves workload routes on this port and nothing else,
-                 so both probes can only ask whether it still accepts
-                 connections. What each one does about that answer, and why
-                 they are timed apart, is documented on `runtime.probes`. */}}
-          {{- /* Every field but `enabled` is passed through as given, so a `0`
-                 reaches the manifest and `runtime.probes` stays the one place
-                 the timings are written down. */}}
+          {{- /* With the probe endpoint on, the probes ask the host about
+                 itself: `/livez` is "restart me", `/readyz` is "stop sending me
+                 work". Without it they fall back to a TCP connect on the
+                 traffic port, which cannot tell a wedged host from a busy one
+                 and cannot say "full" at all. Every field
+                 but `enabled` is passed through as given, so a `0` reaches the
+                 manifest and `runtime.probes` stays the one place the timings
+                 are written down. */}}
+          {{- if or $endpoint.enabled (and (.http) (.http.enabled)) }}
+          {{- /* Liveness on the probe port answers only once the host has
+                 bound it, which is late in startup — after the plugin pulls
+                 and compiles. A startup probe gives that as long as it needs
+                 without loosening the liveness timings that follow it. */}}
+          {{- if and $endpoint.enabled $liveness.enabled }}
+          startupProbe:
+            httpGet:
+              path: /livez
+              port: probes
+            periodSeconds: 5
+            failureThreshold: {{ $endpoint.startupFailureThreshold }}
+          {{- end }}
           {{- if $liveness.enabled }}
           livenessProbe:
+            {{- if $endpoint.enabled }}
+            httpGet:
+              path: /livez
+              port: probes
+            {{- else }}
             tcpSocket:
               port: http
+            {{- end }}
             {{- range $field, $value := omit $liveness "enabled" }}
             {{ $field }}: {{ $value }}
             {{- end }}
           {{- end }}
           {{- if $readiness.enabled }}
           readinessProbe:
+            {{- if $endpoint.enabled }}
+            httpGet:
+              path: /readyz
+              port: probes
+            {{- else }}
             tcpSocket:
               port: http
+            {{- end }}
             {{- range $field, $value := omit $readiness "enabled" }}
             {{ $field }}: {{ $value }}
             {{- end }}

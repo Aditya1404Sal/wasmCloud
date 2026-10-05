@@ -13,6 +13,7 @@
 //! | `consumer_group` | Queue-group name, or `broadcast` for no grouping (NATS only) | A name derived from namespace/workload/component |
 //! | `max_in_flight` | Messages this component may process at once, across every replica of it on this host | The host's per-component default |
 //! | `admission_wait` | How long to wait for a slot before shedding (`45s`, `2m`, or bare seconds) | [`DEFAULT_ADMISSION_WAIT`] |
+//! | `admission_group` | Name to group replicas under for admission concurrency gates | A name derived from stable workload / deployment |
 //!
 //! ```yaml
 //! localResources:
@@ -258,8 +259,9 @@ pub(crate) fn log_delivery(result: &anyhow::Result<Result<(), String>>) {
 /// never do.
 ///
 /// The same job runs either way: a delivery the pool declines is not rebuilt,
-/// it is handed back and run in a fresh store, so a large payload is never
-/// copied to pay for the attempt.
+/// it is handed back and run in a store of its own — the one built for the
+/// pool, when the pool did not park that — so neither a large payload nor an
+/// instantiation is paid for twice.
 ///
 /// Only `@0.3.0` reaches here. The sync `@0.2.0` handler takes `&mut Store` for
 /// the length of its call, so it cannot share an instance and keeps a store per
@@ -273,7 +275,7 @@ pub(crate) async fn deliver_pooled(
     attributes: std::sync::Arc<[KeyValue]>,
 ) -> anyhow::Result<Result<(), String>> {
     use crate::engine::instance_driver::InstanceJob;
-    use crate::engine::instance_pool::{ComponentInstance, Dispatch};
+    use crate::engine::instance_pool::{ComponentInstance, Declined, Dispatch};
     use crate::host::trigger_service::{MessagingJob, MessagingTask};
 
     let (result_tx, result_rx) = tokio::sync::oneshot::channel();
@@ -301,10 +303,14 @@ pub(crate) async fn deliver_pooled(
             pool.dispatch_on_new(ComponentInstance { store, instance }, job)
                 .err()
         }
-        Dispatch::Saturated(job) => Some(job),
+        Dispatch::Saturated(job) => Some(Declined::without_instance(job)),
     };
 
-    let Some(declined) = declined else {
+    let Some(Declined {
+        job: declined,
+        instance: reclaimed,
+    }) = declined
+    else {
         return call
             .await_reply(result_rx)
             .await
@@ -313,14 +319,23 @@ pub(crate) async fn deliver_pooled(
     };
 
     // Every instance was busy and the pool is full, so run the very same job in
-    // a store of its own.
+    // a store of its own — the one built for the pool, when there is one.
     let InstanceJob::Messaging(job) = declined else {
         anyhow::bail!("instance pool returned the wrong job kind for a message");
     };
     tracing::debug!(component_id, "warm instances saturated; own store");
 
-    let mut store = workload.new_store(component_id).await?;
-    let instance = pre.instantiate_async(&mut store).await?;
+    let ComponentInstance {
+        mut store,
+        instance,
+    } = match reclaimed {
+        Some(built) => built,
+        None => {
+            let mut store = workload.new_store(component_id).await?;
+            let instance = pre.instantiate_async(&mut store).await?;
+            ComponentInstance { store, instance }
+        }
+    };
     let handler = Arc::new(
         crate::host::trigger_service::AsyncMessaging::new(&mut store, &instance).map_err(|e| {
             anyhow::anyhow!("component does not export wasmcloud:messaging/handler@0.3.0: {e:#}")
@@ -750,7 +765,7 @@ pub struct MessagingLimits {
 /// The per-component gates on this host, keyed by [`AdmissionIdentity`].
 ///
 /// **Keyed by manifest identity, not by component id.** Every replica of a
-/// deployment is a separate workload with its own `uuid::Uuid::new_v4()`
+/// deployment is a separate workload with its own `uuid::Uuid::now_v7()`
 /// component id, so keying by that gives each replica its own full ceiling:
 /// four replicas of a component at `max_in_flight: 32` could hold 128 messages
 /// on one host, against a stock host-wide total of 133. The per-component
@@ -1041,7 +1056,7 @@ const UNMATCHED_SUBSCRIPTION: &str = "<unmatched>";
 
 /// Who is shedding, in terms a manifest author and a dashboard both recognize.
 ///
-/// Deliberately **not** the component id: that is a `uuid::Uuid::new_v4()`
+/// Deliberately **not** the component id: that is a `uuid::Uuid::now_v7()`
 /// minted per workload construction (`engine::workload`), so attributing a
 /// counter with it mints a fresh time series on every restart, rolling update,
 /// and replica — unbounded growth driven by deployment churn, and a value no
@@ -1380,6 +1395,13 @@ pub(crate) fn declares_async_messaging(interfaces: &crate::plugin::WitInterfaces
 /// raise it above: [`MessagingLimits::admission`] clamps to both ceilings.
 pub(crate) const MAX_IN_FLIGHT_CONFIG: &str = "max_in_flight";
 
+/// Config key naming the admission group to collapse replicas onto for
+/// admission concurrency gates (`max_in_flight`).
+///
+/// Defaults to the stable workload name (or deployment name from orchestrator annotations),
+/// but can be set explicitly to group multiple components or override the gate key.
+pub(crate) const ADMISSION_GROUP_CONFIG: &str = "admission_group";
+
 /// Config key naming how long this component's subscriber loop waits for an
 /// admission slot before shedding.
 ///
@@ -1512,10 +1534,19 @@ pub(crate) fn parse_subscriptions(raw: Option<&str>) -> Vec<String> {
     .unwrap_or_default()
 }
 
+/// Parses an [`ADMISSION_GROUP_CONFIG`] value into a trimmed, non-empty workload admission group name.
+///
+/// Returns `None` if the value is absent, empty, or whitespace-only, allowing callers to fall
+/// back to the component's stable workload name.
+pub(crate) fn parse_admission_group(raw: Option<&str>) -> Option<&str> {
+    raw.map(str::trim).filter(|s| !s.is_empty())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        MsgError, declares_async_messaging, exports_messaging_handler, parse_subscriptions,
+        MsgError, declares_async_messaging, exports_messaging_handler, parse_admission_group,
+        parse_subscriptions,
     };
     use crate::plugin::WitInterfaces;
     use crate::wit::{WitInterface, WitWorld};
@@ -1645,6 +1676,18 @@ mod tests {
             vec!["tasks.leet".to_string(), "tasks.reverse".to_string()]
         );
         assert!(parse_subscriptions(None).is_empty());
+    }
+
+    #[test]
+    fn parses_admission_group() {
+        assert_eq!(parse_admission_group(Some("my-group")), Some("my-group"));
+        assert_eq!(
+            parse_admission_group(Some("  my-group  ")),
+            Some("my-group")
+        );
+        assert_eq!(parse_admission_group(Some("")), None);
+        assert_eq!(parse_admission_group(Some("   ")), None);
+        assert_eq!(parse_admission_group(None), None);
     }
 
     // --- Admission ceilings -------------------------------------------------

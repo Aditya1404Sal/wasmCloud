@@ -222,6 +222,7 @@ pub fn targets_wasip3_http(component: &Component) -> bool {
 
 pub mod abandon;
 pub mod ctx;
+pub mod dispatch;
 pub mod guest_memory;
 pub(crate) mod instance_driver;
 pub(crate) mod instance_pool;
@@ -301,6 +302,14 @@ pub struct Engine {
     /// Optional directory for caching compiled components as `.cwasm` files, loaded
     /// file-backed (see `persist_and_reload` for why that matters).
     pub(crate) compiled_cache_dir: Option<PathBuf>,
+    /// Compiles that actually ran on this engine.
+    ///
+    /// Test-only, and there is no way to do without it: what the digest-keyed
+    /// cache buys is that a herd of replicas shares one compile, and from
+    /// outside, one compile and fifteen racing to insert the same key leave
+    /// exactly the same single cache entry.
+    #[cfg(test)]
+    pub(crate) compiles: Arc<std::sync::atomic::AtomicUsize>,
     /// Host-level socket policy every workload on this engine inherits:
     /// enforcement mode, address ranges, whether the host-loopback door is open,
     /// the host's port table, and the connection budget. The workload-level half
@@ -478,6 +487,16 @@ impl Engine {
         &self.inner
     }
 
+    /// Whether this engine compiles fuel counters into its guests, and so
+    /// whether a store it builds can be metered by fuel at all.
+    ///
+    /// Read back from the config wasmtime resolved rather than from
+    /// [`EngineBuilder::with_fuel_consumption`], so a base config supplied
+    /// through [`EngineBuilder::with_config`] is answered for too.
+    pub fn consumes_fuel(&self) -> bool {
+        self.inner.get_consume_fuel()
+    }
+
     /// Initializes a workload by validating and preparing all its components.
     ///
     /// This function takes a workload definition and prepares it for execution by:
@@ -510,8 +529,10 @@ impl Engine {
             service,
             volumes,
             host_interfaces,
+            annotations,
             ..
         } = workload;
+        let annotations_arc = Arc::new(annotations);
 
         // Process and validate volumes - create a lookup map from volume name to validated host path
         let mut validated_volumes = std::collections::HashMap::new();
@@ -554,7 +575,7 @@ impl Engine {
             ) {
                 Ok(handle) => {
                     tracing::debug!("successfully initialized service component");
-                    Some(handle)
+                    Some(handle.with_annotations(Arc::clone(&annotations_arc)))
                 }
                 Err(e) => {
                     tracing::error!(err = ?e, "failed to initialize service component");
@@ -578,7 +599,7 @@ impl Engine {
             ) {
                 Ok(handle) => {
                     tracing::debug!("successfully initialized workload component");
-                    workload_components.push(handle);
+                    workload_components.push(handle.with_annotations(Arc::clone(&annotations_arc)));
                 }
                 Err(e) => {
                     tracing::error!(err = ?e, "failed to initialize component");
@@ -715,8 +736,12 @@ impl Engine {
                 let compiled_cache_dir = self.compiled_cache_dir.clone();
                 let heap = self.effective_heap_memory();
 
+                #[cfg(test)]
+                let compiles = Arc::clone(&self.compiles);
                 self.cache
                     .try_get_with(key, || {
+                        #[cfg(test)]
+                        compiles.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                         Self::load_or_compile(
                             inner,
                             bytes_ref,
@@ -1134,6 +1159,7 @@ pub struct EngineBuilder {
     // BettyBlocks: compiled_cache_dir builder state (retained in upstream merge).
     compiled_cache_dir: Option<PathBuf>,
     parallel_compilation: Option<bool>,
+    native_unwind_info: Option<bool>,
     socket_policy: Option<Arc<crate::sockets::policy::SocketPolicy>>,
     host_memory: Option<host_memory::HostMemoryBudgets>,
     guest_memory_mode: guest_memory::GuestMemoryMode,
@@ -1244,6 +1270,18 @@ impl EngineBuilder {
     /// makes it single-threaded again.
     pub fn with_parallel_compilation(mut self, enable: bool) -> Self {
         self.parallel_compilation = Some(enable);
+        self
+    }
+
+    /// Whether compiled code registers unwind tables with the system unwinder,
+    /// which only native debuggers and profilers that unwind by DWARF read.
+    ///
+    /// On, as in wasmtime, unless this or `WASMTIME_NATIVE_UNWIND_INFO` turns
+    /// it off. Under LLVM's libunwind (macOS; musl and zig-built Linux
+    /// binaries) every component drop scans a process-wide table of them, so
+    /// a host holding many components wants it off. Windows requires them.
+    pub fn with_native_unwind_info(mut self, enable: bool) -> Self {
+        self.native_unwind_info = Some(enable);
         self
     }
 
@@ -1464,8 +1502,19 @@ impl EngineBuilder {
         // every `.cwasm` and checked when one is loaded, so `wash-precompile`
         // has to set it the same way per target and artifacts precompiled with
         // it on have to be regenerated.
+        //
+        // Unwind tables are wasmtime's own default, so this only carries an
+        // explicit choice through — on musl the default is "off" for the
+        // reason above, and an explicit choice still wins. Windows refuses to
+        // drop them, so an "off" is ignored there instead of failing `build`.
+        let native_unwind_info = self
+            .native_unwind_info
+            .or_else(|| getenv::<bool>("WASMTIME_NATIVE_UNWIND_INFO"));
         #[cfg(target_env = "musl")]
-        config.native_unwind_info(false);
+        let native_unwind_info = native_unwind_info.or(Some(false));
+        if let Some(unwind) = native_unwind_info {
+            config.native_unwind_info(unwind || cfg!(windows));
+        }
 
         for proposal in &self.proposals {
             proposal.apply(&mut config);
@@ -1495,6 +1544,8 @@ impl EngineBuilder {
             cache,
             // BettyBlocks: compiled_cache_dir (retained in upstream merge).
             compiled_cache_dir: self.compiled_cache_dir,
+            #[cfg(test)]
+            compiles: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             socket_policy: self.socket_policy.unwrap_or_default(),
             host_memory,
             guest_memory: {
@@ -1828,6 +1879,20 @@ mod tests {
         assert!(!engine.inner().get_parallel_compilation());
     }
 
+    // Unwind tables are on unless a host turns them off, and turning them off
+    // reaches the engine everywhere but Windows, which requires them.
+    #[test]
+    fn native_unwind_info_is_on_and_can_be_turned_off() {
+        let engine = Engine::builder().build().expect("default should build");
+        assert_eq!(engine.inner().get_native_unwind_info(), Some(true));
+
+        let engine = Engine::builder()
+            .with_native_unwind_info(false)
+            .build()
+            .expect("turning unwind info off should build");
+        assert_eq!(engine.inner().get_native_unwind_info(), Some(cfg!(windows)));
+    }
+
     // A custom base config can now be combined with the pooling allocator and
     // instance limits, which previously errored out of `build()`.
     #[test]
@@ -1905,6 +1970,80 @@ mod tests {
 
         let engine = Engine::builder().build().expect("engine should build");
         Component::new(&engine.inner, &bytes).expect("map component should compile");
+    }
+
+    /// A component built against a newer WASI patch than the host links still
+    /// resolves, provided it only uses what the host's version defines.
+    #[test]
+    fn a_newer_compatible_wasi_import_links_against_the_host() {
+        let engine = Engine::builder().build().expect("engine should build");
+        let mut linker: Linker<SharedCtx> = Linker::new(&engine.inner);
+        add_wasi_to_linker(&mut linker).expect("WASI should link");
+        let importing = |version: &str| {
+            let wat = format!(
+                r#"(component (import "wasi:random/random@{version}"
+                    (instance (export "get-random-u64" (func (result u64))))))"#
+            );
+            let bytes = wat::parse_str(wat).expect("component should assemble");
+            Component::new(&engine.inner, &bytes).expect("component should compile")
+        };
+
+        for version in ["0.2.0", "0.2.99", "0.3.0", "0.3.3"] {
+            linker
+                .instantiate_pre(&importing(version))
+                .unwrap_or_else(|e| panic!("wasi:random@{version} should link: {e:#}"));
+        }
+        assert!(linker.instantiate_pre(&importing("0.4.0")).is_err());
+    }
+
+    // A scheduler placing N replicas of one image sends N starts carrying one
+    // digest, and the herd is affordable only because they share a compile.
+    // Keying the cache on anything that differs between replicas — a workload
+    // id, a component name — would put a Cranelift compile behind every one of
+    // them, and nothing in a deployment's behaviour would say so.
+    #[test]
+    fn a_herd_of_replicas_shares_one_compiled_component() {
+        const HERD: usize = 15;
+        const DIGEST: &str = "sha256:one-image";
+
+        let bytes = wat::parse_str("(component)").expect("component should assemble");
+        let engine = Engine::builder().build().expect("engine should build");
+
+        std::thread::scope(|scope| {
+            for _ in 0..HERD {
+                scope.spawn(|| {
+                    engine
+                        .load_component_bytes(&bytes, Some(DIGEST))
+                        .map(|_| ())
+                        .expect("every member of the herd should load");
+                });
+            }
+        });
+
+        // The claim is that the herd shares a compile, not merely that it ends
+        // up with one entry: a loader that compiled per caller and let them
+        // race to insert the same key would leave one entry too, and this test
+        // would have said nothing about the cost it exists to prevent.
+        assert_eq!(
+            engine.compiles.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "{HERD} replicas of one image ran more than one compile"
+        );
+
+        engine.cache.run_pending_tasks();
+        assert_eq!(
+            engine.cache.entry_count(),
+            1,
+            "{HERD} replicas of one image left more than one cache entry"
+        );
+
+        // A hit is served without looking at the bytes, so bytes that could
+        // never compile are what prove the entry came back from the cache
+        // rather than from a compile of its own.
+        engine
+            .load_component_bytes(b"definitely not a wasm component", Some(DIGEST))
+            .map(|_| ())
+            .expect("a digest the herd already compiled should be served from the cache");
     }
 
     // A compile failure that goes through the cache reports everything the

@@ -1,4 +1,4 @@
-package wasmcloud:host@0.1.3;
+package wasmcloud:host@0.1.4;
 
 /// Optionally exported by a host component plugin. The host calls these as
 /// workloads that import the plugin's capabilities are bound and unbound,
@@ -77,20 +77,21 @@ interface workload-lifecycle {
         /// same namespace:package, if any. Component-facing: what the component
         /// calls this import.
         ///
-        /// Two gaps for a **wasm** host component plugin specifically (a
-        /// Rust built-in plugin doesn't have either): a workload with more
-        /// than one *named* binding on the same namespace:package is
-        /// rejected before bind unless the plugin implements
-        /// `supports_named_instances()` — no wasm plugin can opt into that
-        /// today, so this field only ever arrives as at most one populated
-        /// `name` per namespace:package per workload in practice. And even
-        /// where it is populated, it reaches `on-workload-bind` but is not
-        /// threaded through to the capability call itself — nothing on a
-        /// later `store.get`-style call says which binding it's for, only
-        /// `wasmcloud:host/identity`'s workload/component id. A plugin that
-        /// needs to serve two *unnamed* bindings of the same
-        /// namespace:package differently has no way to disambiguate them at
-        /// all today.
+        /// For a **wasm** host component plugin, a label routes here when the
+        /// operator declares it under the plugin's `host.plugins` entry's
+        /// `bindings`. The workload names it on an entry and the component
+        /// imports the interface under that `(implements ..)` label; the name
+        /// then reaches this hook with the binding's resolved `config`, and
+        /// every call the label routes as
+        /// `wasmcloud:host/identity#get-binding-name`. An import matching no
+        /// entry of its shape — a label no entry names, or a plain import
+        /// where every entry is named — fails the bind rather than binding
+        /// unnamed.
+        ///
+        /// Declare nothing and the plugin serves plain imports as before, and
+        /// a workload naming more than one binding of a package is refused.
+        /// Two *unnamed* entries of one namespace:package are one binding, for
+        /// any plugin; give them labels.
         name: option<string>,
         /// Platform-facing id the binding was declared with, if any — what the
         /// platform's configuration calls the same instance.

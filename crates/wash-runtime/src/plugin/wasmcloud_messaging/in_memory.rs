@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use crate::engine::ctx::{ActiveCtx, SharedCtx, extract_active_ctx};
 use crate::engine::workload::{ResolvedWorkload, UnresolvedWorkload, WorkloadItem};
-use crate::observability::Meters;
+use crate::observability::{MeterKind, Meters};
 use crate::plugin::{HostPlugin, WitInterfaces};
 use crate::wit::{WitInterface, WitWorld};
 use anyhow::Context;
@@ -309,7 +309,7 @@ impl InMemoryMessaging {
     pub fn with_limits(limits: super::MessagingLimits) -> Self {
         Self {
             tracker: Arc::new(RwLock::new(WorkloadTracker::default())),
-            meters: Default::default(),
+            meters: Arc::new(RwLock::new(Meters::new(MeterKind::Off))),
             limits,
         }
     }
@@ -551,6 +551,11 @@ impl HostPlugin for InMemoryMessaging {
                 .get(super::ADMISSION_WAIT_CONFIG)
                 .map(String::as_str),
         );
+        let admission_group = component_handle
+            .local_resources()
+            .config
+            .get(super::ADMISSION_GROUP_CONFIG)
+            .cloned();
 
         // Track a handler component OR a long-lived handler service:
         // `WorkloadItem` derefs to the underlying metadata for both, so the
@@ -565,9 +570,11 @@ impl HostPlugin for InMemoryMessaging {
                 WorkloadItem::Component(component) => component.name().to_string(),
                 WorkloadItem::Service(_) => "service".to_string(),
             };
+            let workload_name = super::parse_admission_group(admission_group.as_deref())
+                .unwrap_or_else(|| component_handle.stable_workload_name());
             let identity = super::AdmissionIdentity::new(
                 component_handle.workload_namespace(),
-                component_handle.workload_name(),
+                workload_name,
                 &component_name,
             );
             let admission = self
@@ -678,21 +685,45 @@ impl HostPlugin for InMemoryMessaging {
 
                         debug!(subject = %msg.subject, reply_to = %msg.reply_to.as_deref().unwrap_or("<none>"), "Processing message");
 
+                        // Only the trigger-service branch below needs the
+                        // handler; a per-message component is delivered to
+                        // without it. So a gone handler skips that branch
+                        // rather than ending the drain — unless nothing else
+                        // can serve the message either, in which case the task
+                        // ends rather than waking per message forever. A
+                        // requester waiting on this one is failed on the way
+                        // out, as the shed path below does.
+                        let http_handler = workload.try_http_handler();
+                        if http_handler.is_none() && pre.is_none() {
+                            warn!(
+                                component_id = %component_id,
+                                "host is gone and this component has no per-message \
+                                 instance; ending the in-memory receive loop"
+                            );
+                            if sole_subscriber
+                                && let (Some(reply_to), Some(pending)) =
+                                    (&msg.reply_to, &pending_requests)
+                                && let Some(sender) = pending.write().await.remove(reply_to)
+                            {
+                                let _ = sender.send(Err(super::shed_error()));
+                            }
+                            break 'task;
+                        }
+
                         // If this workload runs a long-lived trigger service for
                         // messaging, deliver to it (preserving its in-memory
                         // state) rather than instantiating a component per message.
-                        if workload
-                            .http_handler()
-                            .has_trigger_service_messaging(workload.id())
-                            .await
+                        if let Some(http_handler) = &http_handler
+                            && http_handler
+                                .has_trigger_service_messaging(workload.id())
+                                .await
                         {
                             let broker = crate::host::trigger_service::BrokerMessage {
                                 subject: msg.subject.clone(),
                                 body: msg.body.clone(),
                                 reply_to: msg.reply_to.clone(),
                             };
-                            match workload
-                                .http_handler()
+                            match http_handler
                                 .deliver_trigger_service_message(
                                     workload.id(),
                                     broker,

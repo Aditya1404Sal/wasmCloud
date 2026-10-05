@@ -68,6 +68,7 @@ epoch-interruption = []
 [dependencies]
 anyhow = { workspace = true }
 arc-swap = { workspace = true }
+x509-parser = { workspace = true }
 async-nats = { workspace = true, features = ["aws-lc-rs", "server_2_10", "server_2_11", "server_2_12"] }
 dashmap = { version = "6" }
 async-trait = { workspace = true }
@@ -91,7 +92,12 @@ semver = { workspace = true }
 sysinfo = { workspace = true }
 uuid = { workspace = true, features = ["v4", "v7"] }
 tempfile = { workspace = true }
-tokio = { workspace = true, features = ["sync", "net", "macros", "fs"] }
+# Every tokio feature this library relies on is named here, for the reason the
+# `wasmtime` list below gives: `time`, `rt`, `fs` and `io-util` all reach this
+# crate today through `tokio-util`, `async-nats` and `hyper-util`, and would
+# leave with any of them. `[dev-dependencies]` takes `full`, so a test build
+# cannot show the gap either.
+tokio = { workspace = true, features = ["sync", "net", "macros", "time", "rt", "fs", "io-util"] }
 tracing = { workspace = true }
 zeroize = { workspace = true }
 # Every wasmtime feature this host relies on is named here rather than left to
@@ -104,8 +110,6 @@ wasmtime-wasi = { workspace = true, features = ["p3"] }
 wasmtime-wasi-io = { workspace = true }
 wasmtime-wasi-http = { workspace = true, features = ["default-send-request", "p2", "p3", "component-model-async"] }
 wasmtime-wasi-tls = { workspace = true, optional = true, features = ["p3", "rustls"] }
-cap-net-ext = { workspace = true }
-cap-std = { workspace = true }
 io-lifetimes = { workspace = true }
 rustix = { workspace = true }
 rustls = { workspace = true, features = ["std", "tls12"] }
@@ -135,7 +139,7 @@ opentelemetry_sdk = { workspace = true, features = ["logs"] }
 opentelemetry-http = { workspace = true }
 
 # Otel dependencies (optional, behind 'wasi-otel' feature)
-opentelemetry-otlp = { workspace = true, features = ["grpc-tonic","http-proto", "trace", "metrics", "logs"] }
+opentelemetry-otlp = { workspace = true, features = ["grpc-tonic","http-proto", "tls-aws-lc", "trace", "metrics", "logs"] }
 opentelemetry-semantic-conventions = { workspace = true, features = ["semconv_experimental"] }
 
 # OCI dependencies (optional, behind 'oci' feature)
@@ -170,7 +174,7 @@ webpki-roots = { workspace = true }
 # fails to build on Windows and s390x, so the deps are gated to match the
 # `#[cfg]` on `plugin::wasi_webgpu`.
 [target.'cfg(all(not(target_os = "windows"), not(target_arch = "s390x")))'.dependencies]
-wasi-webgpu-wasmtime = { version = "0.2", optional = true }
+wasi-webgpu-wasmtime = { version = "0.3", optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full"] }
@@ -187,7 +191,7 @@ reqwest = { workspace = true, features = ["stream"] }
 wat = { workspace = true, features = ["component-model"] }
 bytes = { workspace = true }
 http-body-util = { workspace = true }
-hyper = { workspace = true }
+hyper = { workspace = true, features = ["client", "http1"] }
 wasmtime-wasi-http = { workspace = true, features = ["p2"] }
 gag = "1.0"
 rcgen = { version = "0.14.7", default-features = false, features = ["crypto", "aws_lc_rs", "pem"] }
@@ -197,11 +201,148 @@ redis = { workspace = true }
 # postgres client for admin setup (create roles/tables) in tests
 tokio-postgres = { workspace = true, features = ["runtime"] }
 criterion = { version = "0.5", features = ["async_tokio", "html_reports"] }
-# Pinned to match the gungraun-runner version the bench host's Ansible
-# playbook installs (scripts/bench/ansible/provision.yml). gungraun
-# enforces equality between this crate version and the runner binary at
-# run time.
-gungraun = "0.19.1"
+# gungraun requires a gungraun-runner of exactly the version resolved in
+# Cargo.lock. The bench host's provision.yml installs it, and
+# scripts/bench/run-bench.sh installs a matching one when the lock moves.
+gungraun = "0.20.0"
+
+# Integration tests that build a host through `tests/common`'s standard
+# plugin set (in-memory blobstore + keyvalue, tracing logger, dynamic
+# config) or import one of those plugins directly. `required-features`
+# lets `--no-default-features` skip these cleanly instead of failing to
+# compile `tests/common/mod.rs`; every name below is already on by default,
+# so this changes nothing for a default or CI (`OPTIONAL_FEATURES`) build.
+[[test]]
+name = "integration_abandoned_calls"
+required-features = ["wasi-blobstore", "wasi-config", "wasi-keyvalue", "wasi-logging"]
+
+[[test]]
+name = "integration_abandonment_grace_ratio"
+required-features = ["wasi-blobstore", "wasi-config", "wasi-keyvalue", "wasi-logging"]
+
+[[test]]
+name = "integration_cross_store_bridge"
+required-features = ["wasi-blobstore", "wasi-config", "wasi-keyvalue", "wasi-logging"]
+
+[[test]]
+name = "integration_http_call_timeout"
+required-features = ["wasi-blobstore", "wasi-config", "wasi-keyvalue", "wasi-logging"]
+
+[[test]]
+name = "integration_http_counter"
+required-features = ["wasi-blobstore", "wasi-config", "wasi-keyvalue", "wasi-logging"]
+
+[[test]]
+name = "integration_http_ip_name_lookup"
+required-features = ["wasi-blobstore", "wasi-config", "wasi-keyvalue", "wasi-logging"]
+
+[[test]]
+name = "integration_http_tls"
+required-features = ["wasi-blobstore", "wasi-config", "wasi-keyvalue", "wasi-logging"]
+
+[[test]]
+name = "integration_instance_concurrency"
+required-features = ["wasi-blobstore", "wasi-config", "wasi-keyvalue", "wasi-logging"]
+
+[[test]]
+name = "integration_messaging_async"
+required-features = ["wasi-blobstore", "wasi-config", "wasi-keyvalue", "wasi-logging"]
+
+[[test]]
+name = "integration_messaging_concurrency"
+required-features = ["wasi-blobstore", "wasi-config", "wasi-keyvalue", "wasi-logging"]
+
+[[test]]
+name = "integration_p2_p3_matrix"
+required-features = ["wasi-blobstore", "wasi-config", "wasi-keyvalue", "wasi-logging"]
+
+[[test]]
+name = "integration_p3_ephemeral"
+required-features = ["wasi-blobstore", "wasi-config", "wasi-keyvalue", "wasi-logging"]
+
+[[test]]
+name = "integration_p3_loopback_service"
+required-features = ["wasi-blobstore", "wasi-config", "wasi-keyvalue", "wasi-logging"]
+
+[[test]]
+name = "integration_p3_resources"
+required-features = ["wasi-blobstore", "wasi-config", "wasi-keyvalue", "wasi-logging"]
+
+[[test]]
+name = "integration_p3_streams"
+required-features = ["wasi-blobstore", "wasi-config", "wasi-keyvalue", "wasi-logging"]
+
+[[test]]
+name = "integration_router_dev"
+required-features = ["wasi-blobstore", "wasi-config", "wasi-keyvalue", "wasi-logging"]
+
+[[test]]
+name = "integration_router_dynamic"
+required-features = ["wasi-blobstore", "wasi-config", "wasi-keyvalue", "wasi-logging"]
+
+[[test]]
+name = "integration_thundering_herd"
+required-features = ["wasi-blobstore", "wasi-config", "wasi-keyvalue", "wasi-logging"]
+
+[[test]]
+name = "integration_secrets_plugin"
+required-features = ["wasi-blobstore", "wasi-config", "wasi-keyvalue", "wasi-logging"]
+
+[[test]]
+name = "integration_service_http"
+required-features = ["wasi-blobstore", "wasi-config", "wasi-keyvalue", "wasi-logging"]
+
+[[test]]
+name = "integration_service_no_cli_run"
+required-features = ["wasi-blobstore", "wasi-config", "wasi-keyvalue", "wasi-logging"]
+
+[[test]]
+name = "integration_trigger_service_messaging"
+required-features = ["wasi-blobstore", "wasi-config", "wasi-keyvalue", "wasi-logging"]
+
+[[test]]
+name = "integration_warm_instances"
+required-features = ["wasi-blobstore", "wasi-config", "wasi-keyvalue", "wasi-logging"]
+
+[[test]]
+name = "integration_wasip3"
+required-features = ["wasi-blobstore", "wasi-config", "wasi-keyvalue", "wasi-logging"]
+
+[[test]]
+name = "integration_blobstore_span_names"
+required-features = ["wasi-blobstore"]
+
+[[test]]
+name = "integration_http_blobstore"
+required-features = ["wasi-blobstore"]
+
+[[test]]
+name = "integration_nats_blobstore"
+required-features = ["wasi-blobstore"]
+
+[[test]]
+name = "integration_guest_memory_budget"
+required-features = ["wasi-config", "wasi-logging"]
+
+[[test]]
+name = "integration_http_allowed_hosts"
+required-features = ["wasi-config", "wasi-logging"]
+
+[[test]]
+name = "integration_http_egress_pooling"
+required-features = ["wasi-config", "wasi-logging"]
+
+[[test]]
+name = "integration_multi_component_config"
+required-features = ["wasi-config"]
+
+[[test]]
+name = "integration_inter_component_call"
+required-features = ["wasi-config", "wasi-keyvalue"]
+
+[[test]]
+name = "integration_nats_plugin"
+required-features = ["wasmcloud-nats"]
 
 [[bench]]
 name = "http_invoke"
@@ -228,4 +369,3 @@ harness = false
 [[bench]]
 name = "gungraun_plugin"
 harness = false
-

@@ -341,8 +341,8 @@ impl ExecutionCredit {
 /// That is why this credits `guest.execution.total` itself, here, where the
 /// execution is observed and the store is known: a store several calls share
 /// has no per-call answer to give, but it has one of its own. A per-call
-/// histogram sample is left to the calls that can prove they had the store
-/// alone — see [`Self::enter`].
+/// histogram sample is left to
+/// [`crate::engine::instance_driver::InvocationSample`].
 ///
 /// The counter is a **floor**, for the same reason the histogram is and one
 /// more. It is credited only from callback fires, so execution below one
@@ -353,17 +353,49 @@ impl ExecutionCredit {
 #[derive(Default, Debug)]
 pub struct GuestExecution {
     millis: AtomicU64,
-    /// Whose execution this store runs, stamped once when it is built. Absent
-    /// only on a store built outside a workload — the engine's own probes.
+    /// How this store's calls are measured, stamped once when it is built.
+    /// Absent on a store built outside a workload — the engine's own probes —
+    /// and on one whose host measures nothing.
     ///
     /// Kept here because the store outlives every call on it, which is what
-    /// lets a task on the store name itself without the dispatcher that sent
-    /// it having to know: a service's HTTP ingress has no workload handle to
-    /// look one up from, and does not need one.
-    /// Whose execution this store runs. Read by a task on the store that has
-    /// to name itself — a service's HTTP ingress has no workload handle to look
-    /// one up from.
-    stamp: std::sync::OnceLock<crate::observability::WorkloadIdentity>,
+    /// lets a task on the store name and record itself without the dispatcher
+    /// that sent it having to know: a service's HTTP ingress has no workload
+    /// handle to look either one up from.
+    stamp: std::sync::OnceLock<StoreMetering>,
+}
+
+/// Whose execution a store runs, and the meter of the host running it.
+///
+/// The two travel together because they are stamped together and every reader
+/// needs both: the identity names the series, the meter is the one that must
+/// record it. Reading the meter from a process-wide global instead would credit
+/// one host's calls to whichever host in the process published itself first,
+/// and would have a host built with [`crate::observability::MeterKind::Off`]
+/// recording after all.
+pub struct StoreMetering {
+    identity: crate::observability::WorkloadIdentity,
+    invocation: crate::observability::InvocationMeter,
+}
+
+/// The meter has no `Debug` of its own — an OTel instrument is opaque — so it
+/// shows as whether it records.
+impl std::fmt::Debug for StoreMetering {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StoreMetering")
+            .field("identity", &self.identity)
+            .field("recording", &self.invocation.is_enabled())
+            .finish()
+    }
+}
+
+impl StoreMetering {
+    pub fn identity(&self) -> &crate::observability::WorkloadIdentity {
+        &self.identity
+    }
+
+    pub fn invocation(&self) -> &crate::observability::InvocationMeter {
+        &self.invocation
+    }
 }
 
 impl GuestExecution {
@@ -372,16 +404,36 @@ impl GuestExecution {
         self.millis.load(Ordering::Relaxed)
     }
 
-    /// Stamp whose execution this store runs. First stamp wins; a store's
-    /// identity does not change under it.
-    pub fn set_identity(&self, identity: crate::observability::WorkloadIdentity) {
-        let _ = self.stamp.set(identity);
+    /// Stamp whose execution this store runs and which meter records it. First
+    /// stamp wins; neither changes under a store.
+    ///
+    /// A meter that records nothing leaves the store unstamped, which is what
+    /// makes a stamp's presence the whole answer to "is anything measuring
+    /// this store" — readers ask once and allocate only if it is.
+    pub fn set_identity(
+        &self,
+        identity: crate::observability::WorkloadIdentity,
+        invocation: crate::observability::InvocationMeter,
+    ) {
+        if !invocation.is_enabled() {
+            return;
+        }
+        let _ = self.stamp.set(StoreMetering {
+            identity,
+            invocation,
+        });
     }
 
-    /// Whose execution this store runs, for a task on it that has to name
-    /// itself. `None` on a store built outside a workload.
-    pub fn identity(&self) -> Option<&crate::observability::WorkloadIdentity> {
+    /// How this store's calls are measured, for a task on it that has to name
+    /// and record itself. `None` when nothing is measuring this store.
+    pub fn metering(&self) -> Option<&StoreMetering> {
         self.stamp.get()
+    }
+
+    /// Whose execution this store runs. `None` on a store built outside a
+    /// workload, or one nothing is measuring.
+    pub fn identity(&self) -> Option<&crate::observability::WorkloadIdentity> {
+        self.stamp.get().map(StoreMetering::identity)
     }
 
     fn add(&self, millis: u64) {
@@ -613,6 +665,9 @@ pub(crate) enum AbandonedCallPolicy {
 /// armed flag alone only says nobody wants the result, which a client
 /// disconnect is enough to cause. The module docs ([`crate::engine::abandon`])
 /// cover it.
+///
+/// Being the only place the host can still end guest work, it also ends a
+/// store whose host is gone, which no flag arms and no call abandons.
 pub(crate) fn arm_epoch_deadline(
     store: &mut wasmtime::Store<SharedCtx>,
     policy: AbandonedCallPolicy,
@@ -620,6 +675,7 @@ pub(crate) fn arm_epoch_deadline(
     let abandoned = Arc::clone(&store.data().abandoned);
     let executed = Arc::clone(&store.data().executed);
     let store_id = Arc::clone(&store.data().active_ctx.store_id);
+    let host = store.data().active_ctx.host_link();
     let grace = crate::timeouts::abandoned_call_grace();
     let escalation = crate::timeouts::abandoned_call_escalation();
     let grace_millis = u64::try_from(grace.as_millis()).unwrap_or(u64::MAX);
@@ -657,6 +713,18 @@ pub(crate) fn arm_epoch_deadline(
             credit.reset();
             Ok(wasmtime::UpdateDeadline::Yield(EPOCH_DEADLINE_TICKS))
         };
+
+        // Nothing can reach a store whose host is gone: its ingress is
+        // unbound, and its egress has no handler behind it. The `wasi:http`
+        // hooks cannot trap, so a guest that keeps calling out would otherwise
+        // run on unnoticed, retrying against a host that no longer exists.
+        if host.host_is_gone() {
+            tracing::error!(
+                store_id = %store_id,
+                "the host that built this store is gone; trapping its guest"
+            );
+            return Ok(wasmtime::UpdateDeadline::Interrupt);
+        }
 
         // The conditions below must all hold at the same instant to justify
         // trapping, so read them once.
@@ -699,6 +767,62 @@ pub(crate) fn arm_epoch_deadline(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A store nobody stamped answers "not measured" to both questions its
+    /// readers ask, so no reader has to consult anything process-wide to find
+    /// out.
+    #[test]
+    fn an_unstamped_store_is_measured_by_nobody() {
+        let executed = GuestExecution::default();
+        assert!(
+            executed.metering().is_none(),
+            "an unstamped store has no meter to record through"
+        );
+        assert!(
+            executed.identity().is_none(),
+            "and no identity to record under"
+        );
+    }
+
+    /// The stamp carries the meter of the host that built the store, so two
+    /// hosts in one process cannot record through each other's.
+    #[test]
+    fn a_stamp_carries_the_meter_of_the_host_that_set_it() {
+        let executed = GuestExecution::default();
+        let identity = crate::observability::WorkloadIdentity::new("ns", "name", "component");
+        executed.set_identity(identity, crate::observability::InvocationMeter::new(true));
+
+        let metering = executed.metering().expect("the store was just stamped");
+        assert!(
+            metering.invocation().is_enabled(),
+            "the stamped meter must be the recording one it was given"
+        );
+        assert_eq!(metering.identity().name.as_ref(), "name");
+
+        // First stamp wins, so a later call cannot redirect a store's calls
+        // into a different host's histogram.
+        executed.set_identity(
+            crate::observability::WorkloadIdentity::new("other", "other", "other"),
+            crate::observability::InvocationMeter::new(true),
+        );
+        let metering = executed.metering().expect("still stamped");
+        assert_eq!(metering.identity().name.as_ref(), "name");
+    }
+
+    /// A meter that records nothing must not stamp at all, so readers can treat
+    /// "stamped" as "measured" without also asking whether the meter is live.
+    #[test]
+    fn a_meter_that_records_nothing_leaves_the_store_unstamped() {
+        let executed = GuestExecution::default();
+        executed.set_identity(
+            crate::observability::WorkloadIdentity::new("ns", "name", "component"),
+            crate::observability::InvocationMeter::new(false),
+        );
+        assert!(
+            executed.metering().is_none(),
+            "a host measuring nothing must leave its stores unstamped"
+        );
+    }
 
     /// A flag armed and then deregistered must be invisible: this is what makes
     /// arming safe on every completion path (disconnects included) rather than
