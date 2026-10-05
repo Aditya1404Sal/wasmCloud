@@ -139,11 +139,12 @@ func NewEmbeddedOperator(
 		cfg.HeartbeatTTL = MinHeartbeatTTL
 	}
 
-	nc, err := wasmbus.NatsConnect(cfg.NatsURL, cfg.NatsOptions...)
+	nc, err := wasmbus.NatsConnectContext(ctx, cfg.NatsURL, cfg.NatsOptions...)
 	if err != nil {
 		return nil, err
 	}
 	bus := wasmbus.NewNatsBus(nc)
+	retiredHosts := &runtime_controllers.RetiredHosts{}
 
 	if !cfg.DisableArtifactController {
 		if err = (&runtime_controllers.ArtifactReconciler{
@@ -209,6 +210,7 @@ func NewEmbeddedOperator(
 		MemoryThreshold:         cfg.HostMemoryThreshold,
 		OperatorNamespace:       cfg.Namespace,
 		MaxConcurrentReconciles: cfg.WorkloadConcurrency,
+		RetiredHosts:            retiredHosts,
 	}).SetupWithManager(mgr); err != nil {
 		return nil, err
 	}
@@ -217,6 +219,7 @@ func NewEmbeddedOperator(
 		Client:            mgr.GetClient(),
 		Scheme:            mgr.GetScheme(),
 		OperatorNamespace: cfg.Namespace,
+		RetiredHosts:      retiredHosts,
 	}).SetupWithManager(mgr); err != nil {
 		return nil, err
 	}

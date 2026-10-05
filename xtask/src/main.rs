@@ -94,6 +94,10 @@ const P2_FIXTURES: &[&str] = &[
     "inter-component-call-caller",
     "inter-component-call-callee",
     "inter-component-call-middleware",
+    "borrow-producer-p2",
+    "borrow-consumer-p2",
+    "borrow-middleware-p2",
+    "borrow-caller-p2",
     "config-caller",
     "config-callee",
     "http-allowed-hosts",
@@ -102,6 +106,9 @@ const P2_FIXTURES: &[&str] = &[
     "keyvalue-counter",
     "keyvalue-implements",
     "postgres-implements",
+    "feeds-callee-a",
+    "feeds-callee-b",
+    "feeds-caller",
     "smtp-demo",
 ];
 
@@ -112,6 +119,7 @@ const P3_FIXTURES: &[&str] = &[
     "nats-implements-p3",
     "messaging-dual-handler",
     "http-handler-p3",
+    "http-local-caller-p3",
     "http-memory-grow",
     "http-ip-name-lookup-p3",
     "http-blobstore-p3",
@@ -130,6 +138,10 @@ const P3_FIXTURES: &[&str] = &[
     "res-producer-p3",
     "res-sink-p3",
     "res-caller-p3",
+    "borrow-producer-p3",
+    "borrow-consumer-p3",
+    "borrow-middleware-p3",
+    "borrow-caller-p3",
     "ephemeral-callee-p3",
     "ephemeral-caller-p3",
     "blobstore-implements-p3",
@@ -149,6 +161,7 @@ const P3_FIXTURES: &[&str] = &[
     "http-webgpu",
     "kv-plugin",
     "kv-plugin-caller",
+    "kv-plugin-implements-caller",
     "kv-plugin-service",
     "badlifecycle",
     "secrets-caller",
@@ -158,6 +171,8 @@ const P3_FIXTURES: &[&str] = &[
     "http-egress-plugin-caller",
     "events-plugin",
     "events-caller",
+    "events-service",
+    "dispatch-target",
 ];
 
 fn build_fixtures(workspace: &Path) -> Result<()> {

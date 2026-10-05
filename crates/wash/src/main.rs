@@ -275,12 +275,15 @@ async fn main() {
     let matches = wash_cmd.get_matches();
     let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
 
-    trace!(cli = ?cli, "parsed CLI");
+    // Only the subcommand name: the parsed arguments carry credentials
+    // (`--postgres-url`, NATS URLs, `oci --password`).
+    trace!(command = matches.subcommand_name(), "parsed CLI");
 
     // Implements clap_markdown for markdown generation of command line documentation. Most straightforward way to invoke is probably `wash app get --help-markdown > help.md`
     if cli.help_markdown {
         let help_output = clap_markdown::help_markdown_command(&help_cmd);
         println!("{help_output}");
+        wash_runtime::observability::flush();
         std::process::exit(0);
     }
 
@@ -325,15 +328,18 @@ async fn main() {
 /// Helper function to execute a command that impl's [`CliCommand`], returning the output
 async fn run_command<C>(ctx: CliContext, command: C) -> anyhow::Result<CommandOutput>
 where
-    C: CliCommand + std::fmt::Debug,
+    C: CliCommand,
 {
-    trace!(command = ?command, "handling command");
     command.handle(&ctx).await
 }
 
 /// Helper function to ensure that we're exiting the program consistently and with the correct output format.
 #[allow(clippy::expect_used)] // Panicking on stdout failure during exit is acceptable
 fn exit_with_output(stdout: &mut impl std::io::Write, output: CommandOutput) -> ! {
+    // Every early exit above reaches the process's end through here, after
+    // `initialize_observability`; without this they drop what the exporters
+    // still hold. Idempotent, so the success path's own call stands.
+    wash_runtime::observability::flush();
     let (message, success) = output.render();
     writeln!(stdout, "{message}").expect("failed to write output to stdout");
     stdout.flush().expect("failed to flush stdout");

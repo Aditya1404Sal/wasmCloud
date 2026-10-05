@@ -9,10 +9,8 @@ use std::task::{Context, Poll};
 
 use http_body_util::BodyExt;
 use wasmtime::component::{Accessor, AccessorTask};
-use wasmtime_wasi_http::p2::bindings::http::types::ErrorCode as P2ErrorCode;
-use wasmtime_wasi_http::p2::body::HyperOutgoingBody;
 use wasmtime_wasi_http::p3::bindings::Service;
-use wasmtime_wasi_http::p3::bindings::http::types::ErrorCode;
+use wasmtime_wasi_http::{Error, WasiBody};
 
 use crate::engine::ctx::SharedCtx;
 
@@ -21,12 +19,12 @@ use crate::engine::ctx::SharedCtx;
 /// instead of being buffered. End-of-stream is signalled when the task drops the
 /// sender (body complete, or the task aborted because the client disconnected).
 struct ChannelBody {
-    rx: tokio::sync::mpsc::Receiver<Result<hyper::body::Frame<bytes::Bytes>, P2ErrorCode>>,
+    rx: tokio::sync::mpsc::Receiver<Result<hyper::body::Frame<bytes::Bytes>, Error>>,
 }
 
 impl hyper::body::Body for ChannelBody {
     type Data = bytes::Bytes;
-    type Error = P2ErrorCode;
+    type Error = Error;
 
     fn poll_frame(
         mut self: Pin<&mut Self>,
@@ -59,9 +57,8 @@ impl hyper::body::Body for ChannelBody {
 /// re-registers) a fresh instance. See `test_trigger_service_http_restarts_on_fault`.
 pub(crate) struct HttpTask {
     pub(crate) service: Arc<Service>,
-    pub(crate) req: hyper::Request<hyper::body::Incoming>,
-    pub(crate) resp_tx:
-        tokio::sync::oneshot::Sender<anyhow::Result<hyper::Response<HyperOutgoingBody>>>,
+    pub(crate) req: hyper::Request<WasiBody>,
+    pub(crate) resp_tx: tokio::sync::oneshot::Sender<anyhow::Result<hyper::Response<WasiBody>>>,
     /// Armed by the dispatcher once it has stopped waiting for this response.
     /// It is registered on the store for the life of the call so the epoch
     /// callback can see it — the only way to end a guest that never yields.
@@ -84,34 +81,31 @@ impl AccessorTask<SharedCtx> for HttpTask {
 
         // The epoch deadline measures this call's own execution, so re-arm it
         // here. `watch_until_abandoned` below owns the registration.
-        let calls = accessor.with(|mut access| {
+        // Named and recorded from the store this runs on, stamped with whose
+        // execution it is when it was built: a service's ingress has no
+        // workload handle to look either one up from. An unstamped store is a
+        // host measuring nothing, and costs neither the attributes nor the
+        // sample.
+        let (calls, executed) = accessor.with(|mut access| {
             crate::engine::abandon::rearm_for_call(&mut access);
-            std::sync::Arc::clone(&access.get().abandoned)
+            (
+                std::sync::Arc::clone(&access.get().abandoned),
+                std::sync::Arc::clone(&access.get().executed),
+            )
         });
-        // Named from the store this runs on, which was stamped with whose
-        // execution it is when it was built — a service's ingress has no
-        // workload handle to look one up from. Whether the sample is recorded
-        // is `InvocationSample`'s call, not this one's: a service shares its
-        // store, so its samples are dropped in favour of the store's own
-        // counter, and a pooled instance's are kept when it ran alone.
-        let attributes = accessor.with(|mut access| {
-            crate::host::http::stored_http_attributes(&access.get().executed, req.method())
-        });
-        let _sample = crate::engine::instance_driver::InvocationSample::start(attributes);
+        let attributes = crate::host::http::stored_http_attributes(&executed, req.method());
+        let _sample =
+            crate::engine::instance_driver::InvocationSample::start(&executed, attributes);
 
-        let (parts, body) = req.into_parts();
-        let body = body
-            .map_err(|e| ErrorCode::InternalError(Some(e.to_string())))
-            .boxed_unsync();
-        let req = hyper::Request::from_parts(parts, body);
-        let (wasi_req, req_io) = wasmtime_wasi_http::p3::Request::from_http(req);
+        let (wasi_req, req_io) =
+            accessor.with(|mut access| crate::host::http::p3_request(access.get(), req));
 
         // Bounded channel for response-body frames: the head is delivered to the
         // HTTP server as soon as the handler returns it, while the body keeps
         // streaming. The small capacity back-pressures the guest so frames don't
         // accumulate without bound.
         let (frame_tx, frame_rx) =
-            tokio::sync::mpsc::channel::<Result<hyper::body::Frame<bytes::Bytes>, P2ErrorCode>>(4);
+            tokio::sync::mpsc::channel::<Result<hyper::body::Frame<bytes::Bytes>, Error>>(4);
         let mut resp_tx = Some(resp_tx);
 
         let handler_fut = async move {
@@ -122,7 +116,7 @@ impl AccessorTask<SharedCtx> for HttpTask {
                     if let Some(tx) = resp_tx.take() {
                         let resp = hyper::Response::builder()
                             .status(500)
-                            .body(HyperOutgoingBody::default())
+                            .body(WasiBody::default())
                             .map_err(anyhow::Error::from);
                         let _ = tx.send(resp);
                     }
@@ -139,7 +133,7 @@ impl AccessorTask<SharedCtx> for HttpTask {
 
             // `into_http`'s future reports the body-delivery outcome back to the
             // guest; resolve it once the body has been fully forwarded.
-            let (finish_tx, finish_rx) = tokio::sync::oneshot::channel::<Result<(), ErrorCode>>();
+            let (finish_tx, finish_rx) = tokio::sync::oneshot::channel::<Result<(), Error>>();
             let http_response = match accessor
                 .with(|s| response.into_http(s, async move { finish_rx.await.unwrap_or(Ok(())) }))
             {
@@ -156,14 +150,13 @@ impl AccessorTask<SharedCtx> for HttpTask {
 
             // Deliver the head + streaming body to the HTTP server now.
             if let Some(tx) = resp_tx.take() {
-                let stream_body =
-                    HyperOutgoingBody::new(ChannelBody { rx: frame_rx }.boxed_unsync());
+                let stream_body = ChannelBody { rx: frame_rx }.boxed_unsync();
                 if tx
                     .send(Ok(hyper::Response::from_parts(head, stream_body)))
                     .is_err()
                 {
                     // Caller dropped the receiver; report the failed delivery.
-                    let _ = finish_tx.send(Err(ErrorCode::ConnectionTerminated));
+                    let _ = finish_tx.send(Err(Error::ConnectionTerminated));
                     return Ok(());
                 }
             }
@@ -171,10 +164,8 @@ impl AccessorTask<SharedCtx> for HttpTask {
             // Forward body frames incrementally; stop if the client disconnects.
             let mut delivery = Ok(());
             while let Some(frame) = body.frame().await {
-                // Frames carry the p3 `ErrorCode`; the server body wants the p2 one.
-                let frame = frame.map_err(|e| P2ErrorCode::InternalError(Some(format!("{e:?}"))));
                 if frame_tx.send(frame).await.is_err() {
-                    delivery = Err(ErrorCode::ConnectionTerminated);
+                    delivery = Err(Error::ConnectionTerminated);
                     break;
                 }
             }
@@ -245,7 +236,7 @@ mod tests {
     /// delivered response from an abandoned one.
     #[tokio::test]
     async fn channel_body_reports_end_of_stream_at_rest() {
-        let (tx, rx) = tokio::sync::mpsc::channel::<Result<Frame<Bytes>, P2ErrorCode>>(4);
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<Frame<Bytes>, Error>>(4);
         let mut body = ChannelBody { rx };
         assert!(!hyper::body::Body::is_end_stream(&body));
 
@@ -274,7 +265,7 @@ mod tests {
     /// checks that end-of-stream is signalled when the producer drops its sender.
     #[tokio::test]
     async fn channel_body_streams_frames_incrementally() {
-        let (tx, rx) = tokio::sync::mpsc::channel::<Result<Frame<Bytes>, P2ErrorCode>>(4);
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<Frame<Bytes>, Error>>(4);
         // Gates the producer's second frame on the consumer acknowledging the
         // first, proving the first was delivered before the producer completed.
         let (ack_tx, ack_rx) = tokio::sync::oneshot::channel::<()>();

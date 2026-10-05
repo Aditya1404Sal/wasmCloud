@@ -27,6 +27,7 @@ use std::collections::HashMap;
 use std::future::Future;
 #[cfg(any(feature = "wasi-blobstore", feature = "wasi-keyvalue"))]
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use crate::engine::workload::WorkloadItem;
 use crate::{
@@ -61,6 +62,9 @@ pub mod cancellation_broker;
 pub mod wasmcloud_messaging;
 
 pub mod wasmcloud_secrets;
+
+mod egress;
+pub use egress::PluginEgressPolicy;
 
 /// NATS-native capability: core pub/sub, JetStream, and KV.
 #[cfg(feature = "wasmcloud-nats")]
@@ -192,7 +196,7 @@ mod roster_tests {
 /// decides whether a workload may write over it.
 pub mod bindings;
 pub use bindings::{
-    BindingSchema, KeyOwnership, PluginBindingSet, PluginBindings, WorkloadConfigPolicy,
+    BindingSchema, KeyOwnership, PluginBindingSet, PluginBindings, WorkloadConfigPolicy, binding_of,
 };
 
 /// Shared `(implements ..)` multiplexing core
@@ -417,6 +421,23 @@ pub trait HostPlugin: std::any::Any + Send + Sync + 'static {
         BindingSchema::empty()
     }
 
+    /// Installs the network ceiling declared for this native plugin.
+    ///
+    /// Native networking bypasses WASI socket hooks, so a plugin must retain
+    /// this policy and check every endpoint before connecting. The default
+    /// rejects the declaration instead of accepting an unenforced policy, so an
+    /// operator who writes a ceiling is never told it holds when nothing reads
+    /// it. Only a plugin that dials out has one to install; this is reached
+    /// only for an entry that names a list.
+    fn configure_egress_policy(&self, _policy: Arc<PluginEgressPolicy>) -> anyhow::Result<()> {
+        anyhow::bail!(
+            "plugin '{}' does not connect out, so it cannot enforce allowedHosts, \
+             allowedIpNameLookups, or allowedHostLoopbackPorts. Drop those fields from its \
+             `host.plugins` entry — the rest of the entry still applies",
+            self.id()
+        )
+    }
+
     /// Check the operator's declaration for this plugin at host startup.
     ///
     /// Called once by [`crate::host::HostBuilder::build`] with whatever
@@ -475,7 +496,22 @@ pub trait HostPlugin: std::any::Any + Send + Sync + 'static {
         false
     }
 
+    /// Whether a plain, unlabeled import is handed to another plugin that
+    /// serves it plainly. Defaults to [`HostPlugin::supports_named_instances`]:
+    /// a closed multiplexer routes labels between backends it names in code,
+    /// so a single-backend plugin is the better answer for an import with no
+    /// label. A plugin serving both off one backend returns `false`.
+    fn defers_unnamed_instances(&self) -> bool {
+        self.supports_named_instances()
+    }
+
     /// Injects metrics into the plugin.
+    ///
+    /// A plugin holding meters starts out at
+    /// [`MeterKind::Off`](crate::observability::MeterKind::Off), not
+    /// [`Meters::default`](crate::observability::Meters::default): until the
+    /// host hands its own over here, the plugin must not build instruments from
+    /// whichever OTel provider happened to exist when it was constructed.
     ///
     /// # Arguments
     /// * `meters` - A `Meters` object containing the metrics to inject.
@@ -555,6 +591,14 @@ pub trait HostPlugin: std::any::Any + Send + Sync + 'static {
     /// This optional callback allows plugins to perform actions after a workload
     /// has been successfully bound and resolved. The default implementation
     /// does nothing.
+    ///
+    /// A plugin that *calls into* the workload — pushing an event stream at an
+    /// interface the workload exports, rather than serving one it imports —
+    /// resolves its [`ResolvedWorkload::dispatch_target`] here and holds it for
+    /// the life of the binding. Here specifically: the workload has not started
+    /// yet, which is what lets a target naming its long-lived service reserve
+    /// the ingress the service will serve calls on. See
+    /// [`crate::engine::dispatch`].
     ///
     /// # Arguments
     /// * `workload` - The fully resolved workload

@@ -43,8 +43,6 @@
 //! with it, so every call in flight on that instance fails rather than just
 //! one. That is bounded by `max_concurrency`, and by `1/pool_size` of the pool.
 
-use std::future::Future;
-use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -53,6 +51,7 @@ use wasmtime::error::Context as _;
 use wasmtime_wasi_http::p3::bindings::Service;
 
 use crate::engine::ctx::SharedCtx;
+use crate::engine::dispatch::{GuestJob, GuestTask, Placement};
 use crate::engine::instance_pool::ComponentInstance;
 use crate::host::http::ServiceHttpJob;
 use crate::host::trigger_service::HttpTask;
@@ -77,7 +76,7 @@ pub(crate) struct LinkedJob {
 
 /// Work an instance can be given. Every shape runs as a concurrent task on the
 /// same instance, so a component reached several ways shares one warm set
-/// rather than keeping one per trigger.
+/// rather than keeping one per way in.
 pub(crate) enum InstanceJob {
     /// An inbound HTTP request (`wasi:http/handler@0.3`). Boxed to keep the
     /// variants a similar size; a declined job carries the whole request back.
@@ -92,37 +91,16 @@ pub(crate) enum InstanceJob {
     /// `max_concurrency`; the sync `@0.2.0` export holds `&mut Store` for the
     /// length of its call and keeps its per-message store.
     Messaging(Box<crate::host::trigger_service::MessagingJob>),
-    /// A call a host plugin supplies, made on a pooled instance.
+    /// A call a host plugin dispatched into this component (see
+    /// [`crate::engine::dispatch`]).
     ///
     /// The engine routes it like any other job and never looks inside: the
     /// plugin keeps its own payload and makes its own typed call. That is what
     /// lets a delivery carry, say, a NATS message's bytes rather than the one
     /// 48-byte [`Val`] per byte a store-independent lowering would cost.
-    #[cfg_attr(not(feature = "wasmcloud-nats"), allow(dead_code))]
-    Plugin(Box<dyn PluginJob>),
-}
-
-/// A call a plugin hands to the pool, run on whichever instance is free.
-///
-/// Implemented by the plugin so the engine needs none of its types. The
-/// plugin's own bindgen call takes an [`Accessor`] rather than a `&mut Store`,
-/// so it runs inside the driver's long-lived `run_concurrent` exactly as a
-/// linked call does — several at a time on one instance, up to
-/// `max_concurrency`.
-pub(crate) trait PluginJob: Send + 'static {
-    /// Names this job in a driver log line.
-    #[cfg_attr(not(feature = "wasmcloud-nats"), allow(dead_code))]
-    fn describe(&self) -> &str;
-
-    /// Runs the call. Owns replying to whoever is waiting for it, and may
-    /// retire the instance through `slot` when it ends leaving guest state
-    /// indeterminate — the same contract [`LinkedTask`] follows.
-    fn run<'a>(
-        self: Box<Self>,
-        accessor: &'a Accessor<SharedCtx>,
-        instance: Instance,
-        slot: Option<PoolSlot>,
-    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
+    /// Unboxed: it is a handful of pointers, and the call it carries is already
+    /// behind one.
+    Guest(GuestJob),
 }
 
 /// Times one guest invocation, and records it when dropped.
@@ -141,16 +119,29 @@ pub(crate) trait PluginJob: Send + 'static {
 /// Costs nothing on a host that is not metering: the meter is looked up once at
 /// the start, and finding none skips the clock as well as the record.
 pub(crate) struct InvocationSample {
-    /// `None` when nothing will record this, which is the default host.
+    /// Both `None` when nothing is measuring this store, which is what a host
+    /// metering nothing gives every call on it.
+    meter: Option<crate::observability::InvocationMeter>,
     started: Option<std::time::Instant>,
     attributes: Arc<[opentelemetry::KeyValue]>,
     error: Option<&'static str>,
 }
 
 impl InvocationSample {
-    pub(crate) fn start(attributes: Arc<[opentelemetry::KeyValue]>) -> Self {
+    /// Measure one call on a store, through the meter of the host that built
+    /// it. `executed` is the store's own — taken from a process-wide meter
+    /// instead, a host metering nothing would record into whichever host in the
+    /// process published itself first.
+    pub(crate) fn start(
+        executed: &crate::engine::abandon::GuestExecution,
+        attributes: Arc<[opentelemetry::KeyValue]>,
+    ) -> Self {
+        // A stamp is only ever set with a recording meter, so its presence is
+        // the whole test.
+        let meter = executed.metering().map(|m| m.invocation().clone());
         Self {
-            started: crate::observability::invocation_meter().map(|_| std::time::Instant::now()),
+            started: meter.as_ref().map(|_| std::time::Instant::now()),
+            meter,
             attributes,
             error: None,
         }
@@ -165,26 +156,10 @@ impl InvocationSample {
 
 impl Drop for InvocationSample {
     fn drop(&mut self) {
-        let Some(started) = self.started else {
+        let (Some(started), Some(meter)) = (self.started, self.meter.as_ref()) else {
             return;
         };
-        if let Some(meter) = crate::observability::invocation_meter() {
-            meter.record(&self.attributes, started.elapsed(), self.error);
-        }
-    }
-}
-
-/// Drives one [`PluginJob`] as an ordinary pooled task.
-struct PluginTask {
-    instance: Instance,
-    job: Box<dyn PluginJob>,
-    slot: PoolSlot,
-}
-
-impl AccessorTask<SharedCtx> for PluginTask {
-    async fn run(self, accessor: &Accessor<SharedCtx>) -> wasmtime::Result<()> {
-        self.job.run(accessor, self.instance, Some(self.slot)).await;
-        Ok(())
+        meter.record(&self.attributes, started.elapsed(), self.error);
     }
 }
 
@@ -225,20 +200,10 @@ pub(crate) struct PoolSlot {
 }
 
 impl PoolSlot {
-    /// Stop this instance admitting: it drains what it took, ends its run loop,
-    /// and its store's teardown ends any guest work still running on it.
+    /// Stops admissions and drops the store after active calls drain.
     ///
-    /// Only as far as the last call returning, though: every path to `drained`
-    /// runs through a call's task ending, so a guest that never yields holds the
-    /// store open regardless. That one is ended by its abandoned call instead
-    /// (see [`crate::engine::abandon`]).
-    ///
-    /// TODO: retirement is a stand-in for cancelling the one bad call. The
-    /// host cannot cancel a guest `call_concurrent` subtask
-    /// (bytecodealliance/wasmtime#11833), so ending a wedged call's work means
-    /// condemning the whole instance and every warm state it held. Once that
-    /// API exists, a timed-out call should cancel just its own task and leave
-    /// the instance serving.
+    /// Wasmtime cannot cancel one `call_concurrent` task, so a wedged task
+    /// requires retiring its instance (bytecodealliance/wasmtime#11833).
     pub(crate) fn retire_instance(&self) {
         self.state.retire();
     }
@@ -268,9 +233,12 @@ impl AccessorTask<SharedCtx> for LinkedTask {
 
         // The epoch deadline measures this call's own execution, so re-arm it
         // here. `watch_until_abandoned` below owns the registration.
-        let calls = accessor.with(|mut access| {
+        let (calls, executed) = accessor.with(|mut access| {
             crate::engine::abandon::rearm_for_call(&mut access);
-            Arc::clone(&access.get().abandoned)
+            (
+                Arc::clone(&access.get().abandoned),
+                Arc::clone(&access.get().executed),
+            )
         });
         let func = accessor.with(|mut access| {
             instance
@@ -284,7 +252,7 @@ impl AccessorTask<SharedCtx> for LinkedTask {
                 return Ok(());
             }
         };
-        let _sample = InvocationSample::start(attributes);
+        let _sample = InvocationSample::start(&executed, attributes);
 
         let mut results = vec![Val::Bool(false); results_len];
         let call_timeout = crate::timeouts::ephemeral_call();
@@ -416,30 +384,47 @@ impl Accepts {
     /// Whether this instance can be given `job` at all.
     ///
     /// A linked call names the export index it resolved against this very
-    /// component, and a plugin job binds its own view when it runs, so neither
-    /// is gated here.
+    /// component, and a dispatched call binds its own view when it runs, so
+    /// neither is gated here.
     fn takes(self, job: &InstanceJob) -> bool {
         match job {
             InstanceJob::Http(_) => self.http,
             InstanceJob::Messaging(_) => self.messaging,
-            InstanceJob::Linked(_) | InstanceJob::Plugin(_) => true,
+            InstanceJob::Linked(_) | InstanceJob::Guest(_) => true,
         }
     }
 }
 
 impl InstanceDriver {
-    /// Build an instantiated store's driver and start it. The caller
-    /// instantiates, so a component that fails to do so reports that failure
-    /// where it can still be returned to whoever asked for the call.
+    /// Build an instantiated store's driver and start it, to serve `job`
+    /// first. The caller instantiates, so a component that fails to do so
+    /// reports that failure where it can still be returned to whoever asked
+    /// for the call.
+    ///
+    /// An instance that does not export what `job` needs comes straight back
+    /// instead: parking it would leave a warm instance that could only ever
+    /// refuse this kind of call, and every later one of the kind would spawn
+    /// another beside it.
     pub(crate) fn spawn(
         instance: ComponentInstance,
+        job: &InstanceJob,
         max_concurrency: usize,
         max_invocations: Option<usize>,
-    ) -> Self {
+    ) -> Result<Self, ComponentInstance> {
         let ComponentInstance {
             mut store,
             instance,
         } = instance;
+
+        // Built before the run loop so admission knows what this instance can
+        // take at all, rather than accepting work it could only drop. The views
+        // move into the run loop; admission keeps only their presence.
+        let bound = BoundExports::bind(&mut store, &instance);
+        let accepts = bound.accepts();
+        if !accepts.takes(job) {
+            return Err(ComponentInstance { store, instance });
+        }
+
         let (tx, mut rx) =
             tokio::sync::mpsc::channel::<(InstanceJob, InFlightGuard)>(max_concurrency.max(1));
         let state = Arc::new(DriverState {
@@ -448,12 +433,6 @@ impl InstanceDriver {
             drained: tokio::sync::Notify::new(),
         });
         let task_state = Arc::clone(&state);
-
-        // Built before the run loop so admission knows what this instance can
-        // take at all, rather than accepting work it could only drop. The views
-        // move into the run loop; admission keeps only their presence.
-        let bound = BoundExports::bind(&mut store, &instance);
-        let accepts = bound.accepts();
 
         tokio::spawn(async move {
             // One `run_concurrent` for the life of the instance. Each call is
@@ -473,6 +452,13 @@ impl InstanceDriver {
                             // store, which is what ends guest work a
                             // timed-out call left running.
                             _ = task_state.drained.notified() => break,
+                        };
+                        // One slot for whichever arm runs: it holds this call's
+                        // in-flight guard, so it is moved exactly once and the
+                        // arm that declines a job drops it right here.
+                        let slot = PoolSlot {
+                            state: Arc::clone(&task_state),
+                            _in_flight: guard,
                         };
                         let spawned = match job {
                             InstanceJob::Http(job) => {
@@ -496,10 +482,7 @@ impl InstanceDriver {
                                     req,
                                     resp_tx,
                                     abandoned,
-                                    pool_slot: Some(PoolSlot {
-                                        state: Arc::clone(&task_state),
-                                        _in_flight: guard,
-                                    }),
+                                    pool_slot: Some(slot),
                                 })
                             }
                             InstanceJob::Messaging(job) => {
@@ -526,27 +509,18 @@ impl InstanceDriver {
                                     result_tx,
                                     abandoned,
                                     attributes,
-                                    pool_slot: Some(PoolSlot {
-                                        state: Arc::clone(&task_state),
-                                        _in_flight: guard,
-                                    }),
+                                    pool_slot: Some(slot),
                                 })
                             }
                             InstanceJob::Linked(job) => accessor.spawn(LinkedTask {
                                 instance,
                                 job,
-                                slot: PoolSlot {
-                                    state: Arc::clone(&task_state),
-                                    _in_flight: guard,
-                                },
+                                slot,
                             }),
-                            InstanceJob::Plugin(job) => accessor.spawn(PluginTask {
+                            InstanceJob::Guest(job) => accessor.spawn(GuestTask {
                                 instance,
                                 job,
-                                slot: PoolSlot {
-                                    state: Arc::clone(&task_state),
-                                    _in_flight: guard,
-                                },
+                                placement: Placement::Pooled(slot),
                             }),
                         };
                         if let Err(e) = spawned {
@@ -563,14 +537,14 @@ impl InstanceDriver {
             }
         });
 
-        Self {
+        Ok(Self {
             tx,
             state,
             admitted: AtomicUsize::new(0),
             max_concurrency,
             max_invocations,
             accepts,
-        }
+        })
     }
 
     /// Calls in flight on this instance right now.
@@ -610,7 +584,7 @@ impl InstanceDriver {
         let claimed = self
             .state
             .in_flight
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
                 (n < self.max_concurrency).then_some(n + 1)
             })
             .is_ok();
@@ -621,14 +595,14 @@ impl InstanceDriver {
 
         // Count the call against this instance's budget. Admission past the
         // limit is refused, not just noted: racing callers can all get here
-        // before any of them marks the instance retired, and `fetch_update`
+        // before any of them marks the instance retired, and `try_update`
         // is what keeps the budget exact under that race. The instance then
         // drains what it admitted rather than being dropped mid-call the way
         // a checked-out store could be.
         if let Some(limit) = self.max_invocations {
             match self
                 .admitted
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
                     (n < limit).then_some(n + 1)
                 }) {
                 Ok(previous) => {
@@ -734,7 +708,7 @@ mod tests {
         );
     }
 
-    /// The budget refuses over-admission even when callers race: `fetch_update`
+    /// The budget refuses over-admission even when callers race: `try_update`
     /// consumes the budget atomically, so exactly `max_invocations` admissions
     /// can ever succeed no matter how the threads interleave. (The sequential
     /// test above cannot distinguish this from bumping a counter after the

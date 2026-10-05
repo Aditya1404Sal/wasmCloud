@@ -183,9 +183,6 @@ async fn start_http_component_with(
                 source: wash_runtime::types::Source::Compile(bytes::Bytes::from_static(
                     SVC_NO_RUN_WASM,
                 )),
-                max_concurrency: 0,
-                reclaim_window_seconds: 0,
-                reclaim_min_instances: 0,
                 local_resources: LocalResources::default(),
                 ..limits
             }],

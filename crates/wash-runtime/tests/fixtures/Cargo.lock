@@ -54,6 +54,62 @@ dependencies = [
 ]
 
 [[package]]
+name = "borrow-caller-p2"
+version = "0.0.0"
+dependencies = [
+ "wit-bindgen 0.60.0",
+]
+
+[[package]]
+name = "borrow-caller-p3"
+version = "0.0.0"
+dependencies = [
+ "wit-bindgen 0.60.0",
+]
+
+[[package]]
+name = "borrow-consumer-p2"
+version = "0.0.0"
+dependencies = [
+ "wit-bindgen 0.60.0",
+]
+
+[[package]]
+name = "borrow-consumer-p3"
+version = "0.0.0"
+dependencies = [
+ "wit-bindgen 0.60.0",
+]
+
+[[package]]
+name = "borrow-middleware-p2"
+version = "0.0.0"
+dependencies = [
+ "wit-bindgen 0.60.0",
+]
+
+[[package]]
+name = "borrow-middleware-p3"
+version = "0.0.0"
+dependencies = [
+ "wit-bindgen 0.60.0",
+]
+
+[[package]]
+name = "borrow-producer-p2"
+version = "0.0.0"
+dependencies = [
+ "wit-bindgen 0.60.0",
+]
+
+[[package]]
+name = "borrow-producer-p3"
+version = "0.0.0"
+dependencies = [
+ "wit-bindgen 0.60.0",
+]
+
+[[package]]
 name = "bridge-backend"
 version = "0.0.0"
 dependencies = [
@@ -161,6 +217,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "dispatch-target"
+version = "0.0.0"
+dependencies = [
+ "wit-bindgen 0.60.0",
+]
+
+[[package]]
 name = "ephemeral-callee-p3"
 version = "0.0.0"
 dependencies = [
@@ -195,12 +258,40 @@ dependencies = [
 ]
 
 [[package]]
+name = "events-service"
+version = "0.0.0"
+dependencies = [
+ "wit-bindgen 0.60.0",
+]
+
+[[package]]
 name = "fastrand"
 version = "1.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e51093e27b0797c359783294ca4f0a911c270184cb10f85783b118614a1501be"
 dependencies = [
  "instant",
+]
+
+[[package]]
+name = "feeds-callee-a"
+version = "0.0.0"
+dependencies = [
+ "wit-bindgen 0.60.0",
+]
+
+[[package]]
+name = "feeds-callee-b"
+version = "0.0.0"
+dependencies = [
+ "wit-bindgen 0.60.0",
+]
+
+[[package]]
+name = "feeds-caller"
+version = "0.0.0"
+dependencies = [
+ "wit-bindgen 0.60.0",
 ]
 
 [[package]]
@@ -437,6 +528,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "http-local-caller-p3"
+version = "0.0.0"
+dependencies = [
+ "wit-bindgen 0.60.0",
+]
+
+[[package]]
 name = "http-loopback-gateway"
 version = "0.0.0"
 dependencies = [
@@ -573,6 +671,13 @@ dependencies = [
 
 [[package]]
 name = "kv-plugin-caller"
+version = "0.0.0"
+dependencies = [
+ "wit-bindgen 0.60.0",
+]
+
+[[package]]
+name = "kv-plugin-implements-caller"
 version = "0.0.0"
 dependencies = [
  "wit-bindgen 0.60.0",
