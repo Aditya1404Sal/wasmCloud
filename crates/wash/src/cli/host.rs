@@ -9,8 +9,14 @@ use wash_runtime::{
     plugin::{self},
 };
 
+#[cfg(feature = "betty-retrieval")]
+use crate::cli::retrieval::{
+    BettyRetrievalOverrides, ModelSettings, build_betty_retrieval_config, model_selection,
+};
 use crate::cli::{CliCommand, CliContext, CommandOutput, signal};
 
+#[cfg(feature = "betty-retrieval")]
+use crate::config::SecretUrl;
 use crate::config::{HttpClientTrustRoots, load_config};
 
 const COMPILED_CACHE_SUBDIR: &str = "cwasm";
@@ -414,6 +420,89 @@ pub struct HostCommand {
         value_parser = SecretUrlParser
     )]
     pub postgres_url: Option<url::Url>,
+
+    /// PostgreSQL connection URL for the betty-blocks:retrieval plugin's own
+    /// pool. Also requires a model: `--retrieval-model`, or
+    /// `--retrieval-model-config`.
+    ///
+    /// The value carries the database password, so `--help` does not print
+    /// the environment variable's value and `Debug` prints a placeholder.
+    #[cfg(feature = "betty-retrieval")]
+    #[arg(
+        long = "retrieval-database-url",
+        env = "WASH_RETRIEVAL_DATABASE_URL",
+        hide_env_values = true
+    )]
+    pub retrieval_database_url: Option<SecretUrl>,
+
+    /// Path to an embedding model's descriptor (MODEL.json) for the
+    /// betty-blocks:retrieval plugin. Also requires `--retrieval-database-url`.
+    /// Prefer `--retrieval-model`, which takes either a path or a name.
+    #[cfg(feature = "betty-retrieval")]
+    #[arg(long = "retrieval-model-config", env = "WASH_RETRIEVAL_MODEL_CONFIG")]
+    pub retrieval_model_config: Option<PathBuf>,
+
+    /// Which embedding model the betty-blocks:retrieval plugin runs: a model
+    /// NAME to look up in `--retrieval-model-catalog`, or the path to a
+    /// descriptor. Changing models is changing this value, not rebuilding.
+    #[cfg(feature = "betty-retrieval")]
+    #[arg(long = "retrieval-model", env = "WASH_RETRIEVAL_MODEL")]
+    pub retrieval_model: Option<String>,
+
+    /// Where model names are looked up: a directory, or an http(s) base URL,
+    /// holding one `<name>.json` descriptor per model.
+    #[cfg(feature = "betty-retrieval")]
+    #[arg(long = "retrieval-model-catalog", env = "WASH_RETRIEVAL_MODEL_CATALOG")]
+    pub retrieval_model_catalog: Option<String>,
+
+    /// Where fetched model artifacts are kept. Unset uses the user's cache
+    /// directory, so a second checkout does not download them again.
+    #[cfg(feature = "betty-retrieval")]
+    #[arg(long = "retrieval-model-cache", env = "WASH_RETRIEVAL_MODEL_CACHE")]
+    pub retrieval_model_cache: Option<PathBuf>,
+
+    /// Download model artifacts from here instead of the address their
+    /// descriptor names, for a machine that cannot reach the public one. The
+    /// pinned digests still decide whether the bytes are accepted.
+    #[cfg(feature = "betty-retrieval")]
+    #[arg(long = "retrieval-model-mirror", env = "WASH_RETRIEVAL_MODEL_MIRROR")]
+    pub retrieval_model_mirror: Option<String>,
+
+    /// Maximum size of the betty-blocks:retrieval plugin's connection pool.
+    /// Unset keeps the plugin's own default (8).
+    #[cfg(feature = "betty-retrieval")]
+    #[arg(long = "retrieval-pool-size", env = "WASH_RETRIEVAL_POOL_SIZE")]
+    pub retrieval_pool_size: Option<usize>,
+
+    /// How long the betty-blocks:retrieval plugin's pool waits for a new
+    /// connection before failing. Unset keeps the plugin's own default (10s).
+    #[cfg(feature = "betty-retrieval")]
+    #[arg(
+        long = "retrieval-connect-timeout-secs",
+        env = "WASH_RETRIEVAL_CONNECT_TIMEOUT_SECS"
+    )]
+    pub retrieval_connect_timeout_secs: Option<u64>,
+
+    /// `hnsw.ef_search` the betty-blocks:retrieval plugin sets on every
+    /// pooled connection. Unset keeps the plugin's own default (200).
+    #[cfg(feature = "betty-retrieval")]
+    #[arg(long = "retrieval-ef-search", env = "WASH_RETRIEVAL_EF_SEARCH")]
+    pub retrieval_ef_search: Option<u32>,
+
+    /// `hnsw.max_scan_tuples` the betty-blocks:retrieval plugin sets on every
+    /// pooled connection. Unset keeps the plugin's own default (20000).
+    #[cfg(feature = "betty-retrieval")]
+    #[arg(
+        long = "retrieval-max-scan-tuples",
+        env = "WASH_RETRIEVAL_MAX_SCAN_TUPLES"
+    )]
+    pub retrieval_max_scan_tuples: Option<u32>,
+
+    /// Threads the betty-blocks:retrieval plugin's embedder uses. Unset
+    /// keeps the plugin's own default (4).
+    #[cfg(feature = "betty-retrieval")]
+    #[arg(long = "retrieval-embed-threads", env = "WASH_RETRIEVAL_EMBED_THREADS")]
+    pub retrieval_embed_threads: Option<usize>,
 
     /// Allow insecure OCI registries: when a component pull fails over HTTPS,
     /// retry it over plain HTTP (e.g. an in-cluster registry that serves no
@@ -1084,6 +1173,46 @@ impl CliCommand for HostCommand {
             }
         }
 
+        #[cfg(feature = "betty-retrieval")]
+        let retrieval_model = model_selection(ModelSettings {
+            model: self.retrieval_model.clone(),
+            model_config: self.retrieval_model_config.clone(),
+            catalog: self.retrieval_model_catalog.clone(),
+            cache: self.retrieval_model_cache.clone(),
+            mirror: self.retrieval_model_mirror.clone(),
+        });
+        #[cfg(feature = "betty-retrieval")]
+        match (&self.retrieval_database_url, retrieval_model) {
+            (Some(database_url), Some(model)) => {
+                let retrieval_config = build_betty_retrieval_config(
+                    database_url.expose().to_string(),
+                    model,
+                    BettyRetrievalOverrides {
+                        pool_size: self.retrieval_pool_size,
+                        connect_timeout_secs: self.retrieval_connect_timeout_secs,
+                        ef_search: self.retrieval_ef_search,
+                        max_scan_tuples: self.retrieval_max_scan_tuples,
+                        embed_threads: self.retrieval_embed_threads,
+                    },
+                )
+                .context("failed to configure the betty-blocks retrieval plugin")?;
+                cluster_host_builder = cluster_host_builder.with_plugin(Arc::new(
+                    plugin::betty_retrieval::BettyRetrieval::new(retrieval_config)
+                        .context("failed to configure the betty-blocks retrieval plugin")?,
+                ))?;
+            }
+            (Some(_), None) => anyhow::bail!(
+                "--retrieval-database-url (or WASH_RETRIEVAL_DATABASE_URL) requires a model: \
+                 set --retrieval-model (or WASH_RETRIEVAL_MODEL) to a model name or a \
+                 descriptor path"
+            ),
+            (None, Some(_)) => anyhow::bail!(
+                "--retrieval-model (or WASH_RETRIEVAL_MODEL) requires \
+                 --retrieval-database-url (or WASH_RETRIEVAL_DATABASE_URL) to also be set"
+            ),
+            (None, None) => {}
+        }
+
         if let Some(interval) = self.oci_cleanup_interval {
             cluster_host_builder = cluster_host_builder.with_cleanup_interval(interval);
         }
@@ -1591,6 +1720,155 @@ mod tests {
         // credentials — never a basic auth with an empty half.
         assert_eq!(host_plugin_registry_credentials(Some("user"), None), None);
         assert_eq!(host_plugin_registry_credentials(None, Some("pass")), None);
+    }
+}
+
+#[cfg(all(test, feature = "betty-retrieval"))]
+mod retrieval_tests {
+    use clap::{CommandFactory, Parser};
+
+    use super::HostCommand;
+
+    /// `HostCommand` is an `Args` group, so give it a `Parser` to parse under.
+    #[derive(Debug, Parser)]
+    struct TestCli {
+        #[command(flatten)]
+        host: HostCommand,
+    }
+
+    fn parse(args: &[&str]) -> HostCommand {
+        TestCli::parse_from(std::iter::once("wash-host").chain(args.iter().copied())).host
+    }
+
+    #[test]
+    fn the_retrieval_flags_parse() {
+        let host = parse(&[
+            "--retrieval-database-url",
+            "postgres://genius:genius@127.0.0.1:55433/genius_retrieval",
+            "--retrieval-model-config",
+            "models/granite-embedding-107m-multilingual.json",
+            "--retrieval-pool-size",
+            "16",
+            "--retrieval-connect-timeout-secs",
+            "5",
+            "--retrieval-ef-search",
+            "100",
+            "--retrieval-max-scan-tuples",
+            "500",
+            "--retrieval-embed-threads",
+            "2",
+        ]);
+        assert_eq!(
+            host.retrieval_database_url
+                .as_ref()
+                .map(crate::config::SecretUrl::expose),
+            Some("postgres://genius:genius@127.0.0.1:55433/genius_retrieval")
+        );
+        assert_eq!(
+            host.retrieval_model_config,
+            Some(std::path::PathBuf::from(
+                "models/granite-embedding-107m-multilingual.json"
+            ))
+        );
+        assert_eq!(host.retrieval_pool_size, Some(16));
+        assert_eq!(host.retrieval_connect_timeout_secs, Some(5));
+        assert_eq!(host.retrieval_ef_search, Some(100));
+        assert_eq!(host.retrieval_max_scan_tuples, Some(500));
+        assert_eq!(host.retrieval_embed_threads, Some(2));
+    }
+
+    #[test]
+    fn the_retrieval_flags_default_to_unset() {
+        let host = parse(&[]);
+        assert_eq!(host.retrieval_database_url, None);
+        assert_eq!(host.retrieval_model_config, None);
+        assert_eq!(host.retrieval_pool_size, None);
+        assert_eq!(host.retrieval_connect_timeout_secs, None);
+        assert_eq!(host.retrieval_ef_search, None);
+        assert_eq!(host.retrieval_max_scan_tuples, None);
+        assert_eq!(host.retrieval_embed_threads, None);
+    }
+
+    #[test]
+    fn debug_leaves_out_the_retrieval_database_url() {
+        for url in [
+            "postgres://genius:hunter2@db.internal:5432/retrieval?sslmode=require",
+            // libpq also takes the password as a query parameter.
+            "postgres://db.internal:5432/retrieval?user=genius&password=hunter2",
+        ] {
+            let host = parse(&[
+                "--retrieval-database-url",
+                url,
+                "--retrieval-model",
+                "granite-embedding-107m-multilingual",
+            ]);
+            for printed in [format!("{host:?}"), format!("{host:#?}")] {
+                assert!(!printed.contains("hunter2"), "{printed}");
+                assert!(!printed.contains("db.internal"), "{printed}");
+                assert!(
+                    printed.contains("retrieval_database_url: Some(")
+                        && printed.contains("<redacted>"),
+                    "{printed}"
+                );
+                // Everything else still prints.
+                assert!(
+                    printed.contains("granite-embedding-107m-multilingual"),
+                    "{printed}"
+                );
+            }
+            // Only printing changes: the plugin is still handed the value.
+            assert_eq!(
+                host.retrieval_database_url
+                    .as_ref()
+                    .map(crate::config::SecretUrl::expose),
+                Some(url)
+            );
+        }
+    }
+
+    /// clap prints an env-backed flag's current value in `--help`, and this
+    /// one's value holds a password.
+    #[test]
+    fn help_does_not_print_the_retrieval_database_urls_environment_value() {
+        let command = TestCli::command();
+        let arg = command
+            .get_arguments()
+            .find(|a| a.get_long() == Some("retrieval-database-url"))
+            .expect("--retrieval-database-url must be a defined flag");
+        assert!(arg.is_hide_env_values_set());
+    }
+
+    /// Locks in the env var names `wash host --help` documents and that
+    /// operators rely on to configure retrieval without a flag per process.
+    #[test]
+    fn the_retrieval_flags_are_wired_to_their_env_vars() {
+        let command = TestCli::command();
+        let expected = [
+            ("retrieval-database-url", "WASH_RETRIEVAL_DATABASE_URL"),
+            ("retrieval-model-config", "WASH_RETRIEVAL_MODEL_CONFIG"),
+            ("retrieval-pool-size", "WASH_RETRIEVAL_POOL_SIZE"),
+            (
+                "retrieval-connect-timeout-secs",
+                "WASH_RETRIEVAL_CONNECT_TIMEOUT_SECS",
+            ),
+            ("retrieval-ef-search", "WASH_RETRIEVAL_EF_SEARCH"),
+            (
+                "retrieval-max-scan-tuples",
+                "WASH_RETRIEVAL_MAX_SCAN_TUPLES",
+            ),
+            ("retrieval-embed-threads", "WASH_RETRIEVAL_EMBED_THREADS"),
+        ];
+        for (long, env) in expected {
+            let arg = command
+                .get_arguments()
+                .find(|a| a.get_long() == Some(long))
+                .unwrap_or_else(|| panic!("--{long} must be a defined flag"));
+            assert_eq!(
+                arg.get_env().and_then(|e| e.to_str()),
+                Some(env),
+                "--{long} must read from {env}"
+            );
+        }
     }
 }
 
