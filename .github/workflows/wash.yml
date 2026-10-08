@@ -26,7 +26,7 @@ env:
   # The non-default features every `cargo test` and `cargo clippy` here runs
   # with. Spelled per-package: bare names apply to every selected package, so
   # the two would drift apart.
-  OPTIONAL_FEATURES: wash-runtime/wasi-tls,wash/host-component-plugins
+  OPTIONAL_FEATURES: wash-runtime/wasi-tls,wash/host-component-plugins,wash-runtime/betty-retrieval,wash/betty-retrieval
   # Drop most DWARF; keep enough for usable backtraces. Shrinks target/ by
   # several GB on this workspace (wasmtime, OTel, oci-client).
   CARGO_PROFILE_DEV_DEBUG: line-tables-only
