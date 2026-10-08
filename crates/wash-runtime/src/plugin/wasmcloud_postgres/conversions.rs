@@ -17,7 +17,7 @@ use std::collections::HashMap;
 use std::error::Error;
 use std::str::FromStr;
 
-use anyhow::{Context as _, bail};
+use anyhow::Context as _;
 use bigdecimal::num_traits::Float;
 use bit_vec::BitVec;
 use bytes::{BufMut, BytesMut};
@@ -60,28 +60,125 @@ fn rect_to_hashable_f64s(r: Rect<f64>) -> ((HashableF64, HashableF64), (Hashable
     )
 }
 
-/// Convert a [`LineString`] (expected to have exactly two points) into a tuple of `HashableF64` pairs
-fn linestring_to_hashable_f64s_tuple(
-    l: LineString<f64>,
-) -> anyhow::Result<((HashableF64, HashableF64), (HashableF64, HashableF64))> {
-    match linestring_to_hashable_f64s(l)[..] {
-        [start, end] => Ok((start, end)),
-        _ => bail!("unexpected number of points in line string"),
-    }
-}
-
-/// Convert a [`LineString`] into a vector of point pairs
-fn linestring_to_hashable_f64s(l: LineString<f64>) -> Vec<(HashableF64, HashableF64)> {
-    l.into_points()
-        .into_iter()
-        .map(point_to_hashable_f64s)
-        .collect::<Vec<_>>()
-}
-
 /// Convert a [`Point`] into two `HashableF64`s
 fn point_to_hashable_f64s(p: Point<f64>) -> (HashableF64, HashableF64) {
     let (x, y) = p.x_y();
     (x.integer_decode(), y.integer_decode())
+}
+
+/// The points of one `path` or `polygon`, as `pg-value` holds them.
+type PointList = Vec<(HashableF64, HashableF64)>;
+
+/// The points of a `path` or `polygon` value, from its binary form: a point
+/// count, then two big-endian `float8`s a point. A `path` carries one byte
+/// ahead of the count saying whether it is closed, which `pg-value` has no
+/// place for and which is dropped.
+///
+/// Neither type is an array, so neither may be handed to postgres-types'
+/// `Vec` decoder: that one panics on any type that is not.
+fn points_from_sql(ty: &PgType, raw: &[u8]) -> Result<PointList, Box<dyn Error + Sync + Send>> {
+    let counted = if *ty == PgType::PATH {
+        raw.split_first()
+            .map(|(_closed, counted)| counted)
+            .ok_or_else(|| format!("a {ty} value holds no bytes"))?
+    } else {
+        raw
+    };
+    let (count, coordinates) = counted
+        .split_first_chunk::<4>()
+        .ok_or_else(|| format!("a {ty} value is too short to hold its point count"))?;
+    let count = i32::from_be_bytes(*count);
+    let (floats, rest) = coordinates.as_chunks::<8>();
+    let whole = rest.is_empty()
+        && usize::try_from(count)
+            .ok()
+            .and_then(|count| count.checked_mul(2))
+            == Some(floats.len());
+    if !whole {
+        return Err(format!(
+            "a {ty} value says it holds {count} points but carries {} bytes of them",
+            coordinates.len()
+        )
+        .into());
+    }
+    Ok(floats
+        .chunks_exact(2)
+        .filter_map(|point| match point {
+            [x, y] => Some((
+                f64::from_be_bytes(*x).integer_decode(),
+                f64::from_be_bytes(*y).integer_decode(),
+            )),
+            _ => None,
+        })
+        .collect())
+}
+
+/// The two end points of one `lseg`, as `pg-value` holds them.
+type PointPair = ((HashableF64, HashableF64), (HashableF64, HashableF64));
+
+/// The end points of an `lseg` value, from its binary form: four big-endian
+/// `float8`s, the first point's `x` and `y` and then the second's.
+///
+/// Not postgres-types' `LineString` decoder, which reads a `path`: it takes
+/// the first of these bytes for a closed flag and the next four for a point
+/// count, and reserving room for that many points panics.
+fn lseg_from_sql(ty: &PgType, raw: &[u8]) -> Result<PointPair, Box<dyn Error + Sync + Send>> {
+    match raw.as_chunks::<8>() {
+        ([start_x, start_y, end_x, end_y], []) => Ok((
+            (
+                f64::from_be_bytes(*start_x).integer_decode(),
+                f64::from_be_bytes(*start_y).integer_decode(),
+            ),
+            (
+                f64::from_be_bytes(*end_x).integer_decode(),
+                f64::from_be_bytes(*end_y).integer_decode(),
+            ),
+        )),
+        _ => Err(format!(
+            "a {ty} value carries {} bytes, not the 32 of its two points",
+            raw.len()
+        )
+        .into()),
+    }
+}
+
+/// An `lseg` as a member of an array, so that `lseg[]` decodes as a `Vec` of
+/// these.
+struct PgLseg(PointPair);
+
+impl FromSql<'_> for PgLseg {
+    fn from_sql(ty: &PgType, raw: &[u8]) -> Result<Self, Box<dyn Error + Sync + Send>> {
+        lseg_from_sql(ty, raw).map(Self)
+    }
+
+    fn accepts(ty: &PgType) -> bool {
+        *ty == PgType::LSEG
+    }
+}
+
+/// A `path` or `polygon` as a member of an array, so that `path[]` and
+/// `polygon[]` decode as a `Vec` of these.
+struct PgPoints(PointList);
+
+impl FromSql<'_> for PgPoints {
+    fn from_sql(ty: &PgType, raw: &[u8]) -> Result<Self, Box<dyn Error + Sync + Send>> {
+        points_from_sql(ty, raw).map(Self)
+    }
+
+    fn accepts(ty: &PgType) -> bool {
+        matches!(*ty, PgType::PATH | PgType::POLYGON)
+    }
+}
+
+/// The members of a `path[]` or `polygon[]` value, each as its points.
+fn point_lists_from_sql(
+    ty: &PgType,
+    raw: &[u8],
+) -> Result<Vec<PointList>, Box<dyn Error + Sync + Send>> {
+    Ok(Vec::<PgPoints>::from_sql(ty, raw)?
+        .into_iter()
+        .map(|points| points.0)
+        .collect())
 }
 
 // ── MAC address helpers ─────────────────────────────────────────────────────
@@ -800,36 +897,24 @@ impl FromSql<'_> for PgValue {
             &tokio_postgres::types::Type::CIRCLE | &tokio_postgres::types::Type::CIRCLE_ARRAY => {
                 Err("circle & circle[] are not supported".into())
             }
-            &tokio_postgres::types::Type::LINE => Ok(PgValue::Line(
-                linestring_to_hashable_f64s_tuple(LineString::<f64>::from_sql(ty, raw)?)?,
-            )),
-            &tokio_postgres::types::Type::LINE_ARRAY => Ok(PgValue::LineArray(
-                Vec::<LineString<f64>>::from_sql(ty, raw)?
-                    .into_iter()
-                    .map(linestring_to_hashable_f64s_tuple)
-                    .collect::<Result<Vec<_>, _>>()?,
-            )),
-            &tokio_postgres::types::Type::LSEG => Ok(PgValue::Lseg(
-                linestring_to_hashable_f64s_tuple(LineString::<f64>::from_sql(ty, raw)?)?,
-            )),
+            // Postgres stores a line as the three coefficients of
+            // `Ax + By + C = 0`, which the two points `pg-value` has for one
+            // cannot say without choosing two points on it.
+            &tokio_postgres::types::Type::LINE | &tokio_postgres::types::Type::LINE_ARRAY => Err(
+                "line & line[] are not supported (consider using a cast like 'value'::text)"
+                    .into(),
+            ),
+            &tokio_postgres::types::Type::LSEG => Ok(PgValue::Lseg(lseg_from_sql(ty, raw)?)),
             &tokio_postgres::types::Type::LSEG_ARRAY => Ok(PgValue::LsegArray(
-                Vec::<LineString<f64>>::from_sql(ty, raw)?
+                Vec::<PgLseg>::from_sql(ty, raw)?
                     .into_iter()
-                    .map(linestring_to_hashable_f64s_tuple)
-                    .collect::<Result<Vec<_>, _>>()?,
+                    .map(|lseg| lseg.0)
+                    .collect(),
             )),
-            &tokio_postgres::types::Type::PATH => Ok(PgValue::Path(
-                Vec::<Point<f64>>::from_sql(ty, raw)?
-                    .into_iter()
-                    .map(point_to_hashable_f64s)
-                    .collect::<Vec<_>>(),
-            )),
-            &tokio_postgres::types::Type::PATH_ARRAY => Ok(PgValue::PathArray(
-                Vec::<Vec<Point<f64>>>::from_sql(ty, raw)?
-                    .into_iter()
-                    .map(|points| points.into_iter().map(point_to_hashable_f64s).collect())
-                    .collect::<Vec<_>>(),
-            )),
+            &tokio_postgres::types::Type::PATH => Ok(PgValue::Path(points_from_sql(ty, raw)?)),
+            &tokio_postgres::types::Type::PATH_ARRAY => {
+                Ok(PgValue::PathArray(point_lists_from_sql(ty, raw)?))
+            }
             &tokio_postgres::types::Type::POINT => {
                 let point = Point::<f64>::from_sql(ty, raw)?;
                 Ok(PgValue::Point(point_to_hashable_f64s(point)))
@@ -840,18 +925,12 @@ impl FromSql<'_> for PgValue {
                     .map(point_to_hashable_f64s)
                     .collect::<Vec<_>>(),
             )),
-            &tokio_postgres::types::Type::POLYGON => Ok(PgValue::Polygon(
-                Vec::<Point<f64>>::from_sql(ty, raw)?
-                    .into_iter()
-                    .map(point_to_hashable_f64s)
-                    .collect::<Vec<_>>(),
-            )),
-            &tokio_postgres::types::Type::POLYGON_ARRAY => Ok(PgValue::PolygonArray(
-                Vec::<Vec<Point<f64>>>::from_sql(ty, raw)?
-                    .into_iter()
-                    .map(|v| v.into_iter().map(point_to_hashable_f64s).collect())
-                    .collect::<Vec<Vec<_>>>(),
-            )),
+            &tokio_postgres::types::Type::POLYGON => {
+                Ok(PgValue::Polygon(points_from_sql(ty, raw)?))
+            }
+            &tokio_postgres::types::Type::POLYGON_ARRAY => {
+                Ok(PgValue::PolygonArray(point_lists_from_sql(ty, raw)?))
+            }
 
             &tokio_postgres::types::Type::CIDR => {
                 let cidr = IpCidr::from_sql(ty, raw)?;
