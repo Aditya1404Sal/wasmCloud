@@ -1,0 +1,109 @@
+# syntax=docker/dockerfile:1-labs
+
+# The wash host image WITH the betty-blocks retrieval plugin
+# (`--features betty-retrieval`). ./Dockerfile, the default `wash-host` image,
+# is untouched and does not carry the plugin. Build from the repository root:
+#
+#   docker build -f Dockerfile.retrieval -t wash-host:retrieval .
+#
+# This file is ./Dockerfile plus four things. Keep the two in step: `diff
+# Dockerfile Dockerfile.retrieval` should show these and nothing else.
+#
+#   1. Builder packages for what the plugin compiles and links (see below).
+#   2. `CARGO_FEATURES` defaults to `betty-retrieval`, and `cargo chef cook`
+#      is given it too, so ONNX Runtime and the tokenizer are built in the
+#      cached dependency layer rather than on every source change.
+#   3. `libstdc++` and `libgcc` in the release image.
+#   4. A second smoke test: the binary must offer `--retrieval-database-url`.
+#
+# The model's weights are NOT in the image. See
+# crates/wash-runtime/docs/BETTY_RETRIEVAL_PLUGIN.md for how they reach a host
+# and what a host with this plugin needs from its pod.
+
+FROM cgr.dev/chainguard/wolfi-base@sha256:9a8d954d8f03a21bcf2be73d4628f0ad26d35c3275469925de63a34eebd58f13 AS chef
+USER root
+WORKDIR /src
+
+# As ./Dockerfile, plus what `betty-retrieval` compiles and links:
+#
+#   libstdc++-dev  The C++ standard library's link-time library: `ort-sys`
+#                  links ONNX Runtime statically and asks the linker for
+#                  `-lstdc++`. Nothing in this build compiles C++; `tokenizers`
+#                  is built without its `esaxx_fast` feature.
+#   openssl-dev    `ort-sys`'s BUILD SCRIPT downloads the prebuilt ONNX Runtime
+#   pkgconf        with `ureq` over native-tls, which is OpenSSL on Linux and
+#                  is found through pkg-config. Build-time only: the `wash`
+#                  binary itself speaks TLS with rustls and links no OpenSSL.
+#
+# `onig_sys` (the tokenizer's regex engine) is plain C and needs nothing more
+# than the `gcc` already here.
+RUN apk add --no-cache \
+        gcc \
+        glibc-dev \
+        binutils \
+        rust-1.96 \
+        curl \
+        libstdc++-dev \
+        openssl-dev \
+        pkgconf
+ENV PATH=/root/.cargo/bin:$PATH
+RUN curl -L --proto '=https' --tlsv1.2 -sSf https://raw.githubusercontent.com/cargo-bins/cargo-binstall/main/install-from-binstall-release.sh | sh
+RUN cargo binstall -y --disable-telemetry cargo-chef
+
+FROM chef AS planner
+COPY --exclude=rust-toolchain.toml . .
+RUN cargo chef prepare --recipe-path recipe.json
+
+FROM chef AS builder
+
+# Docker/buildx sets TARGETARCH automatically ("amd64"/"arm64") to match the
+# build's target platform. This image is always built natively per-arch, never
+# cross-compiled, so TARGETARCH always matches the host's own already-installed
+# Rust target. Both are glibc targets on purpose: `ort` publishes a prebuilt
+# ONNX Runtime for x86_64 and aarch64 `-unknown-linux-gnu` and none for musl.
+ARG TARGETARCH
+RUN case "$TARGETARCH" in \
+      amd64) echo x86_64-unknown-linux-gnu ;; \
+      arm64) echo aarch64-unknown-linux-gnu ;; \
+      *) echo "unsupported TARGETARCH: $TARGETARCH" >&2; exit 1 ;; \
+    esac > /rust_target.txt
+
+RUN apk --no-cache add protoc protobuf protobuf-dev
+
+# Comma-separated cargo feature list. `betty-retrieval` is what this image is
+# for; add others beside it (e.g. "betty-retrieval,host-component-plugins").
+ARG CARGO_FEATURES="betty-retrieval"
+
+# Caps parallel codegen units. wasmtime and onnxruntime-sys are large enough
+# that cargo's default (one job per visible core) can push peak memory past a
+# constrained builder's limit; override with a higher value on a bigger box.
+ARG CARGO_BUILD_JOBS=4
+ENV CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS}
+
+COPY --from=planner /src/recipe.json recipe.json
+# With the features, unlike ./Dockerfile: this is where `ort-sys` runs. Its
+# build script fetches ONNX Runtime 1.22 from cdn.pyke.io (about 21 MB, checked
+# against a SHA-256 pinned in the crate) into /root/.cache/ort.pyke.io, which
+# the `cargo build` below then links from. The build needs that host reachable.
+RUN cargo chef cook --release --target "$(cat /rust_target.txt)" --features "${CARGO_FEATURES}" --recipe-path recipe.json
+COPY --exclude=rust-toolchain.toml --chown=nonroot:nonroot . .
+
+RUN cargo build --release --target "$(cat /rust_target.txt)" --bin wash --features "${CARGO_FEATURES}" \
+    && cp "target/$(cat /rust_target.txt)/release/wash" /src/wash
+
+# Release image
+FROM cgr.dev/chainguard/wolfi-base@sha256:9a8d954d8f03a21bcf2be73d4628f0ad26d35c3275469925de63a34eebd58f13
+# `libstdc++` and `libgcc`: ONNX Runtime is linked into `wash` statically, the
+# C++ runtime it was compiled against is not. Beyond these the binary needs
+# only what the default image's does (glibc's libc and libm).
+RUN apk add --no-cache git libstdc++ libgcc
+
+COPY --from=builder /src/wash /usr/local/bin/wash
+
+# Smoke test the binary against THIS stage's libc and C++ runtime: a missing
+# shared library fails here, at build time, rather than in a pod.
+RUN ["/usr/local/bin/wash", "--version"]
+# And that it is the binary this image is for.
+RUN /usr/local/bin/wash host --help | grep -q -- '--retrieval-database-url'
+
+ENTRYPOINT ["/usr/local/bin/wash"]

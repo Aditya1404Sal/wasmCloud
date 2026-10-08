@@ -5,6 +5,12 @@ name: BettyBlocks - Publish images
 #   <wash-version>-<short-sha>   e.g. 2.5.0-da5d3605f
 #     wash-version = Cargo [workspace.package].version
 #     short-sha    = git rev-parse --short HEAD
+#
+# `wash-host-retrieval` is an opt-in variant of `wash-host`: the same host built
+# from ./Dockerfile.retrieval with the betty-blocks retrieval plugin compiled
+# in. It is published under the `wash-host` name with `-retrieval` appended to
+# the tag (e.g. wash-host:2.5.0-da5d3605f-retrieval), is built only when chosen
+# by name, and is never part of `all`.
 on:
   # manual only, I dont think we want to create a new image for every new merge into main
   workflow_dispatch:
@@ -16,6 +22,7 @@ on:
         options:
           - all
           - wash-host
+          - wash-host-retrieval
           - wash-precompile
           - runtime-operator
           - runtime-gateway
@@ -64,8 +71,16 @@ jobs:
             {"image":"runtime-operator","context":"./runtime-operator","file":"./runtime-operator/Dockerfile","platforms":"linux/amd64"},
             {"image":"runtime-gateway","context":"./runtime-gateway","file":"./runtime-gateway/Dockerfile","platforms":"linux/amd64,linux/arm64"}
           ]'
+          # Opt-in variants: each is chosen by its own name, published under an
+          # existing image's name with `tag_suffix` appended to the tag, and
+          # left out of `all`, so `all` builds exactly the four images above.
+          variants='[
+            {"choice":"wash-host-retrieval","image":"wash-host","tag_suffix":"-retrieval","context":".","file":"./Dockerfile.retrieval","platforms":"linux/amd64"}
+          ]'
           if [ "${SELECTED}" = "all" ]; then
             include="$(echo "${all}" | jq -c .)"
+          elif echo "${variants}" | jq -e --arg img "${SELECTED}" 'any(.[]; .choice == $img)' > /dev/null; then
+            include="$(echo "${variants}" | jq -c --arg img "${SELECTED}" '[.[] | select(.choice == $img) | del(.choice)]')"
           else
             include="$(echo "${all}" | jq -c --arg img "${SELECTED}" '[.[] | select(.image == $img)]')"
           fi
@@ -94,7 +109,9 @@ jobs:
           registry: ghcr.io
           username: ${{ github.repository_owner }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Build and push ${{ matrix.image }}
+      # `matrix.tag_suffix` is set only on a variant; everywhere else it is
+      # empty, and the name, tag and cache scope below read as they always did.
+      - name: Build and push ${{ matrix.image }}${{ matrix.tag_suffix }}
         uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
         with:
           context: ${{ matrix.context }}
@@ -105,6 +122,6 @@ jobs:
           # containerd (e.g. for local k3s). Multi-arch images (runtime-gateway)
           # publish as a plain manifest list with no provenance attestation.
           provenance: false
-          tags: ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ matrix.image }}:${{ needs.compute-tag.outputs.tag }}
-          cache-from: type=gha,scope=${{ matrix.image }}
-          cache-to: type=gha,mode=max,scope=${{ matrix.image }}
+          tags: ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ matrix.image }}:${{ needs.compute-tag.outputs.tag }}${{ matrix.tag_suffix }}
+          cache-from: type=gha,scope=${{ matrix.image }}${{ matrix.tag_suffix }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.image }}${{ matrix.tag_suffix }}
