@@ -59,6 +59,9 @@ wasmcloud-postgres = [
     "dep:bit-vec", "dep:cidr", "dep:geo-types",
     "dep:ulid",
 ]
+# Betty retrieval host plugin: owns the Postgres pool and the granite
+# embedding model behind betty-blocks:retrieval.
+betty-retrieval = ["wasmcloud-postgres", "dep:genius-embed", "dep:pgvector", "dep:sha2"]
 # BettyBlocks: SMTP host-plugin feature (retained in upstream merge).
 wasmcloud-smtp = ["dep:html2text", "dep:lettre"]
 wasi-tls = ["dep:wasmtime-wasi-tls"]
@@ -162,6 +165,12 @@ tokio-postgres = { optional = true, workspace = true, features = [ "runtime", "w
 tokio-postgres-rustls = { optional = true, workspace = true }
 ulid = { optional = true, workspace = true, features = ["std"] }
 
+# Betty retrieval dependencies (optional, behind 'betty-retrieval' feature)
+# `genius-embed` is vendored at `crates/genius-embed` (see its README.md).
+# `adapter` is the ONNX Runtime backed model, `fetch` resolves a named model.
+genius-embed = { path = "../genius-embed", features = ["adapter", "fetch"], optional = true }
+pgvector = { version = "=0.4.1", default-features = false, features = ["postgres"], optional = true }
+
 # SMTP dependencies (optional, behind 'wasmcloud-smtp' feature)
 html2text = { version = "0.14", default-features = false, optional = true }
 lettre = { version = "0.11", default-features = false, features = ["tokio1", "tokio1-rustls-tls", "smtp-transport", "builder", "hostname", "pool"], optional = true }
@@ -200,6 +209,9 @@ testcontainers = { workspace = true }
 redis = { workspace = true }
 # postgres client for admin setup (create roles/tables) in tests
 tokio-postgres = { workspace = true, features = ["runtime"] }
+# `FakeEmbedder` for the betty-retrieval integration test. Only `fake`, so a
+# test build without `betty-retrieval` does not link `ort`.
+genius-embed = { path = "../genius-embed", default-features = false, features = ["fake"] }
 criterion = { version = "0.5", features = ["async_tokio", "html_reports"] }
 # gungraun requires a gungraun-runner of exactly the version resolved in
 # Cargo.lock. The bench host's provision.yml installs it, and
