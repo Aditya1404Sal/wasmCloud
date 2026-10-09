@@ -1,0 +1,57 @@
+[package]
+name = "genius-embed"
+version = "0.1.0"
+edition = "2021"
+# Vendored (see README.md), and not a crate this repository releases.
+publish = false
+
+# The embedder, shared by the native sidecar and the wasmCloud host plugin.
+# Both must produce bit-identical vectors, so they depend on one crate rather
+# than keeping two copies in step by hand.
+#
+# `ort` and `tokenizers` are exact pins, inherited from the research study's
+# FREEZE (contextbench): upstream carries a caret on a prerelease
+# (`^2.0.0-rc.9` floats to rc.11+ where `Session` was reshaped), and the
+# embedding path here must reproduce the vectors the model research measured.
+# `context-provider` no longer pins them directly — it gets these exact
+# versions transitively through its path dependency on this crate.
+#
+# Both are optional, behind the `adapter` feature: a wasm32 component links
+# neither, and only wants the `Embedder` trait, `embed_distinct` and (in
+# tests) `FakeEmbedder` — none of which touch onnxruntime or a tokenizer.
+[features]
+# Empty in this vendored copy, where the source has `default = ["adapter"]`:
+# as a workspace member, a default-on `adapter` would make every
+# `cargo test --workspace` and `cargo clippy --workspace` download ONNX Runtime
+# and build `tokenizers`. `wash-runtime`'s `betty-retrieval` feature asks for
+# `adapter` and `fetch` by name instead.
+default = []
+# The real model: `Adapter` and the `l2_normalize`/`pool_mean`/
+# `matryoshka_truncate` helpers it uses.
+adapter = ["dep:ort", "dep:tokenizers"]
+# `FakeEmbedder`, a deterministic stand-in with no model weights and no
+# `ort`/`tokenizers` link, for tests that need bit-identical vectors without
+# the 437 MB model.
+fake = []
+# `resolve`: turn a model NAME plus a catalog into artifacts on disk, fetching
+# and digest-checking them when the cache does not already hold them. Optional
+# because only a host that may have to download needs an HTTP client; the wasm
+# component never resolves anything.
+fetch = ["dep:ureq"]
+
+[dependencies]
+anyhow     = "1"
+serde      = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2       = "0.10"
+
+ort        = { version = "=2.0.0-rc.10", features = ["ndarray"], optional = true }
+# Without tokenizers' default features. `esaxx_fast` compiles C++ against the
+# static C runtime, which the Windows linker refuses beside `ort-sys` (LNK2038);
+# it and `progressbar` serve only training a tokenizer. `onig` is the regex
+# engine a loaded tokenizer runs on.
+tokenizers = { version = "=0.20.4", default-features = false, features = ["onig"], optional = true }
+# Blocking, no async runtime: resolving happens once at startup, on the thread
+# that is already about to load a 400 MB model, and a runtime-free client keeps
+# this crate usable from both a plain binary and a host plugin's init.
+ureq       = { version = "3", optional = true }

@@ -1,0 +1,5 @@
+# This crate is vendored (see README.md) and is formatted the way its source
+# repository formats it: rustfmt's defaults. Without this file the workspace's
+# `rustfmt.toml` would regroup its imports and rewrap its comments, and every
+# later sync would have to tell that noise apart from a real change.
+edition = "2021"
