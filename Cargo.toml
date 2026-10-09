@@ -3,6 +3,8 @@ resolver = "3"
 default-members = ["crates/wash"]
 members = [
     "crates/bench-tools",
+    # Vendored from the context-provider repository; see its README.md.
+    "crates/genius-embed",
     "crates/wash-runtime",
     "crates/wash",
     "crates/wash-precompile",
