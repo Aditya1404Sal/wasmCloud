@@ -6,7 +6,7 @@ use core::task::{Context, Poll};
 use std::sync::Arc;
 
 use futures::TryStreamExt as _;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{OwnedSemaphorePermit, mpsc, oneshot};
 use wasmtime::StoreContextMut;
 use wasmtime::component::{
     Access, Accessor, Destination, FutureReader, Linker, Resource, StreamProducer, StreamReader,
@@ -34,14 +34,15 @@ pub(crate) type QueryResult = (
 );
 
 /// The plugin serving the active call, `Arc`-cloned so it outlives the store
-/// borrow.
-pub(crate) fn plugin<U>(
+/// borrow, and the workload making it, whose share of the pool a new
+/// connection counts against.
+pub(crate) fn caller<U>(
     accessor: &Accessor<U, SharedCtx>,
-) -> wasmtime::Result<Arc<BettyRetrieval>> {
+) -> wasmtime::Result<(Arc<BettyRetrieval>, Arc<str>)> {
     accessor.with(|mut access| {
-        access
-            .get()
-            .try_get_plugin::<BettyRetrieval>(PLUGIN_BETTY_RETRIEVAL_ID)
+        let ctx = access.get();
+        let plugin = ctx.try_get_plugin::<BettyRetrieval>(PLUGIN_BETTY_RETRIEVAL_ID)?;
+        wasmtime::Result::Ok((plugin, Arc::clone(&ctx.workload_id)))
     })
 }
 
@@ -52,6 +53,52 @@ pub(crate) async fn checkout(
         .pool()
         .map_err(|e| errors::connection_failed(format!("{e:#}")))?;
     pool.get().await.map_err(|e| errors::pool(&e))
+}
+
+/// A pooled connection lent to one auto-committed statement.
+///
+/// It goes back to the pool only through [`Lent::give_back`], once the server
+/// has answered. Dropped before that (the call cancelled, a stream not read to
+/// its end, rows that could not be decoded) it is closed instead: the server
+/// may still be running the statement or sending its rows, and whoever
+/// borrowed the connection next, from any workload, would wait behind them.
+///
+/// It also holds one of its workload's permits, given back with it.
+struct Lent {
+    /// `None` once given back.
+    client: Option<deadpool_postgres::Client>,
+    _share: OwnedSemaphorePermit,
+}
+
+impl Lent {
+    /// One of `workload`'s permits first, so a workload over its share waits
+    /// without taking a connection the others could use.
+    async fn checkout(plugin: &BettyRetrieval, workload: &Arc<str>) -> Result<Self, types::Error> {
+        let share = plugin.shares().acquire(workload).await?;
+        Ok(Self {
+            client: Some(checkout(plugin).await?),
+            _share: share,
+        })
+    }
+
+    fn client(&self) -> Result<&deadpool_postgres::Client, types::Error> {
+        self.client.as_ref().ok_or_else(|| {
+            errors::connection_failed("this connection was already given back".to_string())
+        })
+    }
+
+    /// Back to the pool, which resets the session before lending it again.
+    fn give_back(mut self) {
+        drop(self.client.take());
+    }
+}
+
+impl Drop for Lent {
+    fn drop(&mut self) {
+        if let Some(client) = self.client.take() {
+            drop(deadpool_postgres::Object::take(client));
+        }
+    }
 }
 
 /// A statement's columns, and the channels its fetch task feeds.
@@ -65,12 +112,19 @@ struct Streaming {
 /// that fetches the rows.
 async fn start_query(
     plugin: &BettyRetrieval,
+    workload: &Arc<str>,
     sql: &str,
     params: Vec<types::Param>,
 ) -> Result<Streaming, types::Error> {
-    let bound = params::resolve(plugin.embedder(), params).await?;
-    let client = checkout(plugin).await?;
-    let stmt = prepare_checked(&client, sql, &bound).await?;
+    let bound = params::resolve(plugin.embedder(), plugin.embed_gate(), workload, params).await?;
+    let lent = Lent::checkout(plugin, workload).await?;
+    let stmt = match prepare_checked(lent.client()?, sql, &bound).await {
+        Ok(stmt) => stmt,
+        Err(e) => {
+            lent.give_back();
+            return Err(e);
+        }
+    };
     let columns = stmt
         .columns()
         .iter()
@@ -78,8 +132,9 @@ async fn start_query(
         .collect();
     let (row_tx, rows) = mpsc::channel(ROW_CHANNEL_CAPACITY);
     let (done_tx, done) = oneshot::channel();
+    let read_pause = plugin.read_pause();
     tokio::spawn(async move {
-        let _ = done_tx.send(drain_query(client, stmt, bound, row_tx).await);
+        let _ = done_tx.send(drain_query(lent, stmt, bound, row_tx, read_pause).await);
     });
     Ok(Streaming {
         columns,
@@ -103,25 +158,64 @@ async fn prepare_checked(
     Ok(stmt)
 }
 
+/// Fetch every row into `row_tx`. The connection goes back to the pool once
+/// the server has ended the statement; a stream that stops early, because the
+/// guest dropped it or a row could not be decoded, drops `lent` and closes it.
+///
+/// A guest that reads no row for `read_pause` (one that awaits the result
+/// before reading the rows, say) would otherwise hold its connection, and a
+/// permit of its share, for as long as it lived. The query is ended instead,
+/// and the result says why.
 async fn drain_query(
-    client: deadpool_postgres::Client,
+    lent: Lent,
     stmt: tokio_postgres::Statement,
     bound: Vec<Bound>,
     row_tx: mpsc::Sender<Row>,
+    read_pause: Option<std::time::Duration>,
 ) -> Result<(), types::Error> {
-    let rows = client
+    let rows = match lent
+        .client()?
         .query_raw(&stmt, params::as_sql(&bound))
         .await
-        .map_err(|e| errors::postgres(&e))?;
+    {
+        Ok(rows) => rows,
+        Err(e) => {
+            lent.give_back();
+            return Err(errors::postgres(&e));
+        }
+    };
     let mut rows = std::pin::pin!(rows);
-    while let Some(row) = rows.try_next().await.map_err(|e| errors::postgres(&e))? {
-        let values = row_to_values(&row).map_err(errors::value_conversion)?;
-        if row_tx.send(values).await.is_err() {
-            // The guest dropped the stream.
-            return Ok(());
+    loop {
+        match rows.try_next().await {
+            Ok(Some(row)) => {
+                let values = row_to_values(&row).map_err(errors::value_conversion)?;
+                let sent = match read_pause {
+                    Some(pause) => tokio::time::timeout(pause, row_tx.send(values))
+                        .await
+                        .map_err(|_| {
+                            errors::other(format!(
+                                "no row of the query was read for {pause:?}, so the host ended \
+                                 it; read the rows before awaiting the result"
+                            ))
+                        })?,
+                    None => row_tx.send(values).await,
+                };
+                if sent.is_err() {
+                    // The guest dropped the stream.
+                    return Ok(());
+                }
+            }
+            Ok(None) => {
+                lent.give_back();
+                return Ok(());
+            }
+            // The server ended the statement with this error.
+            Err(e) => {
+                lent.give_back();
+                return Err(errors::postgres(&e));
+            }
         }
     }
-    Ok(())
 }
 
 /// Forwards rows from the fetch task's channel to the guest, one per poll.
@@ -163,24 +257,37 @@ impl<D: 'static> StreamProducer<D> for RowStreamProducer {
 
 async fn run_execute(
     plugin: &BettyRetrieval,
+    workload: &Arc<str>,
     sql: &str,
     params: Vec<types::Param>,
 ) -> Result<u64, types::Error> {
-    let bound = params::resolve(plugin.embedder(), params).await?;
-    let client = checkout(plugin).await?;
-    let stmt = prepare_checked(&client, sql, &bound).await?;
-    client
-        .execute(&stmt, &params::as_sql(&bound))
-        .await
-        .map_err(|e| errors::postgres(&e))
+    let bound = params::resolve(plugin.embedder(), plugin.embed_gate(), workload, params).await?;
+    let lent = Lent::checkout(plugin, workload).await?;
+    let outcome = match prepare_checked(lent.client()?, sql, &bound).await {
+        Ok(stmt) => lent
+            .client()?
+            .execute(&stmt, &params::as_sql(&bound))
+            .await
+            .map_err(|e| errors::postgres(&e)),
+        Err(e) => Err(e),
+    };
+    lent.give_back();
+    outcome
 }
 
-async fn run_batch(plugin: &BettyRetrieval, sql: &str) -> Result<(), types::Error> {
-    let client = checkout(plugin).await?;
-    client
+async fn run_batch(
+    plugin: &BettyRetrieval,
+    workload: &Arc<str>,
+    sql: &str,
+) -> Result<(), types::Error> {
+    let lent = Lent::checkout(plugin, workload).await?;
+    let outcome = lent
+        .client()?
         .batch_execute(sql)
         .await
-        .map_err(|e| errors::postgres(&e))
+        .map_err(|e| errors::postgres(&e));
+    lent.give_back();
+    outcome
 }
 
 fn wit_space(space: &SpaceInfo) -> types::Space {
@@ -200,12 +307,12 @@ impl<U> store::HostWithStore<U> for SharedCtx {
         sql: String,
         params: Vec<types::Param>,
     ) -> wasmtime::Result<Result<QueryResult, types::Error>> {
-        let plugin = plugin(accessor)?;
+        let (plugin, workload) = caller(accessor)?;
         let Streaming {
             columns,
             rows,
             done,
-        } = match start_query(&plugin, &sql, params).await {
+        } = match start_query(&plugin, &workload, &sql, params).await {
             Ok(streaming) => streaming,
             Err(e) => return Ok(Err(e)),
         };
@@ -221,23 +328,23 @@ impl<U> store::HostWithStore<U> for SharedCtx {
         sql: String,
         params: Vec<types::Param>,
     ) -> wasmtime::Result<Result<u64, types::Error>> {
-        let plugin = plugin(accessor)?;
-        Ok(run_execute(&plugin, &sql, params).await)
+        let (plugin, workload) = caller(accessor)?;
+        Ok(run_execute(&plugin, &workload, &sql, params).await)
     }
 
     async fn batch(
         accessor: &Accessor<U, Self>,
         sql: String,
     ) -> wasmtime::Result<Result<(), types::Error>> {
-        let plugin = plugin(accessor)?;
-        Ok(run_batch(&plugin, &sql).await)
+        let (plugin, workload) = caller(accessor)?;
+        Ok(run_batch(&plugin, &workload, &sql).await)
     }
 
     async fn begin(
         accessor: &Accessor<U, Self>,
     ) -> wasmtime::Result<Result<Resource<TxHandle>, types::Error>> {
-        let plugin = plugin(accessor)?;
-        match tx::begin(&plugin).await {
+        let (plugin, workload) = caller(accessor)?;
+        match tx::begin(&plugin, &workload).await {
             Ok(handle) => Ok(Ok(
                 accessor.with(|mut access| access.get().table.push(handle))?
             )),
@@ -248,10 +355,20 @@ impl<U> store::HostWithStore<U> for SharedCtx {
     fn space(
         mut host: Access<'_, U, Self>,
     ) -> impl Future<Output = wasmtime::Result<types::Space>> + Send {
+        // `space` returns a record, not a result: with no model there is no
+        // space to report, and reporting a made-up one would let a component
+        // tag its data with it. The call traps instead, saying why.
         let space = host
             .get()
             .try_get_plugin::<BettyRetrieval>(PLUGIN_BETTY_RETRIEVAL_ID)
-            .map(|plugin| wit_space(plugin.space()));
+            .and_then(|plugin| match plugin.space() {
+                Some(space) => Ok(wit_space(space)),
+                None => Err(wasmtime::Error::msg(format!(
+                    "betty-retrieval has no embedding space: the model did not load when the \
+                     host started: {}",
+                    plugin.model_failure().unwrap_or("no cause was recorded")
+                ))),
+            });
         std::future::ready(space)
     }
 }

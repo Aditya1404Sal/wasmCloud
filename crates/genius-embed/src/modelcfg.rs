@@ -246,8 +246,18 @@ impl ModelConfig {
     pub fn parse(path: &Path) -> Result<Self> {
         let bytes = std::fs::read(path)
             .map_err(|e| anyhow::anyhow!("read model config {}: {e}", path.display()))?;
-        serde_json::from_slice(&bytes)
-            .map_err(|e| anyhow::anyhow!("parse model config {}: {e}", path.display()))
+        let mut cfg: Self = serde_json::from_slice(&bytes)
+            .map_err(|e| anyhow::anyhow!("parse model config {}: {e}", path.display()))?;
+        // A digest is hex, and hex has two cases: `sha256_file` writes lower
+        // case, PowerShell's Get-FileHash upper case. Compared as text, an
+        // upper-case pin would refuse the very bytes it names.
+        for pin in [&mut cfg.artifact_sha256, &mut cfg.tokenizer_sha256]
+            .into_iter()
+            .flatten()
+        {
+            pin.make_ascii_lowercase();
+        }
+        Ok(cfg)
     }
 
     /// The digests this descriptor pins, paired with the file each governs.

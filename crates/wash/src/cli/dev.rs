@@ -418,6 +418,15 @@ impl CliCommand for DevCommand {
                         ef_search: dev_config.retrieval_ef_search,
                         max_scan_tuples: dev_config.retrieval_max_scan_tuples,
                         embed_threads: dev_config.retrieval_embed_threads,
+                        statement_timeout_secs: dev_config.retrieval_statement_timeout_secs,
+                        idle_in_transaction_timeout_secs: dev_config
+                            .retrieval_idle_in_transaction_timeout_secs,
+                        connections_per_workload: dev_config.retrieval_connections_per_workload,
+                        transaction_query_max_bytes: dev_config
+                            .retrieval_transaction_query_max_bytes,
+                        embed_max_texts: dev_config.retrieval_embed_max_texts,
+                        embed_max_text_bytes: dev_config.retrieval_embed_max_text_bytes,
+                        ca_file: dev_config.retrieval_ca_file_path(project_dir),
                     },
                 )
                 .context("failed to configure the betty-blocks retrieval plugin")?;
@@ -437,16 +446,14 @@ impl CliCommand for DevCommand {
             (None, None) => {}
         }
         #[cfg(not(feature = "betty-retrieval"))]
-        ensure!(
-            dev_config.retrieval_database_url.is_none()
-                && dev_config.retrieval_model_config.is_none()
-                && dev_config.retrieval_pool_size.is_none()
-                && dev_config.retrieval_connect_timeout_secs.is_none()
-                && dev_config.retrieval_ef_search.is_none()
-                && dev_config.retrieval_max_scan_tuples.is_none()
-                && dev_config.retrieval_embed_threads.is_none(),
-            "dev.retrieval_* keys require a wash build with the `betty-retrieval` feature"
-        );
+        {
+            let set = dev_config.retrieval_keys_set();
+            ensure!(
+                set.is_empty(),
+                "dev.{} require a wash build with the `betty-retrieval` feature",
+                set.join(", dev.")
+            );
+        }
 
         // Add otel plugin
         if dev_config.wasi_otel {

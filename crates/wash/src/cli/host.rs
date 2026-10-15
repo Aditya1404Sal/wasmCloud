@@ -504,6 +504,73 @@ pub struct HostCommand {
     #[arg(long = "retrieval-embed-threads", env = "WASH_RETRIEVAL_EMBED_THREADS")]
     pub retrieval_embed_threads: Option<usize>,
 
+    /// The betty-blocks:retrieval plugin's `statement_timeout`: the server
+    /// cancels a statement that runs longer. 0 turns it off. Unset keeps the
+    /// plugin's own default (30s).
+    #[cfg(feature = "betty-retrieval")]
+    #[arg(
+        long = "retrieval-statement-timeout-secs",
+        env = "WASH_RETRIEVAL_STATEMENT_TIMEOUT_SECS"
+    )]
+    pub retrieval_statement_timeout_secs: Option<u64>,
+
+    /// The betty-blocks:retrieval plugin's `idle_in_transaction_session_timeout`:
+    /// the server ends a session that waits inside a transaction longer. 0
+    /// turns it off. Unset keeps the plugin's own default (60s).
+    #[cfg(feature = "betty-retrieval")]
+    #[arg(
+        long = "retrieval-idle-in-transaction-timeout-secs",
+        env = "WASH_RETRIEVAL_IDLE_IN_TRANSACTION_TIMEOUT_SECS"
+    )]
+    pub retrieval_idle_in_transaction_timeout_secs: Option<u64>,
+
+    /// How many of the betty-blocks:retrieval plugin's connections one
+    /// workload may hold at a time, so that one application cannot take the
+    /// pool from the others. Unset is half the pool, and at least one.
+    #[cfg(feature = "betty-retrieval")]
+    #[arg(
+        long = "retrieval-connections-per-workload",
+        env = "WASH_RETRIEVAL_CONNECTIONS_PER_WORKLOAD"
+    )]
+    pub retrieval_connections_per_workload: Option<usize>,
+
+    /// The most row data, in bytes, one transaction query of the
+    /// betty-blocks:retrieval plugin may read; a larger result fails that
+    /// query. Unset keeps the plugin's own default (64 MiB).
+    #[cfg(feature = "betty-retrieval")]
+    #[arg(
+        long = "retrieval-transaction-query-max-bytes",
+        env = "WASH_RETRIEVAL_TRANSACTION_QUERY_MAX_BYTES"
+    )]
+    pub retrieval_transaction_query_max_bytes: Option<usize>,
+
+    /// The most texts one statement may ask the betty-blocks:retrieval
+    /// plugin to embed. Unset keeps the plugin's own default (1000).
+    #[cfg(feature = "betty-retrieval")]
+    #[arg(
+        long = "retrieval-embed-max-texts",
+        env = "WASH_RETRIEVAL_EMBED_MAX_TEXTS"
+    )]
+    pub retrieval_embed_max_texts: Option<usize>,
+
+    /// The longest text, in bytes, a statement may ask the
+    /// betty-blocks:retrieval plugin to embed. Unset keeps the plugin's own
+    /// default (64 KiB).
+    #[cfg(feature = "betty-retrieval")]
+    #[arg(
+        long = "retrieval-embed-max-text-bytes",
+        env = "WASH_RETRIEVAL_EMBED_MAX_TEXT_BYTES"
+    )]
+    pub retrieval_embed_max_text_bytes: Option<usize>,
+
+    /// A PEM file of CA certificates the betty-blocks:retrieval plugin trusts
+    /// for its database's TLS, beside the public web roots: for a database
+    /// whose certificate comes from a private CA. A url's `sslrootcert` names
+    /// one too; this wins.
+    #[cfg(feature = "betty-retrieval")]
+    #[arg(long = "retrieval-ca-file", env = "WASH_RETRIEVAL_CA_FILE")]
+    pub retrieval_ca_file: Option<PathBuf>,
+
     /// Allow insecure OCI registries: when a component pull fails over HTTPS,
     /// retry it over plain HTTP (e.g. an in-cluster registry that serves no
     /// TLS). Registries that do serve TLS are unaffected — HTTPS is always
@@ -1193,6 +1260,14 @@ impl CliCommand for HostCommand {
                         ef_search: self.retrieval_ef_search,
                         max_scan_tuples: self.retrieval_max_scan_tuples,
                         embed_threads: self.retrieval_embed_threads,
+                        statement_timeout_secs: self.retrieval_statement_timeout_secs,
+                        idle_in_transaction_timeout_secs: self
+                            .retrieval_idle_in_transaction_timeout_secs,
+                        connections_per_workload: self.retrieval_connections_per_workload,
+                        transaction_query_max_bytes: self.retrieval_transaction_query_max_bytes,
+                        embed_max_texts: self.retrieval_embed_max_texts,
+                        embed_max_text_bytes: self.retrieval_embed_max_text_bytes,
+                        ca_file: self.retrieval_ca_file.clone(),
                     },
                 )
                 .context("failed to configure the betty-blocks retrieval plugin")?;
@@ -1757,7 +1832,31 @@ mod retrieval_tests {
             "500",
             "--retrieval-embed-threads",
             "2",
+            "--retrieval-statement-timeout-secs",
+            "5",
+            "--retrieval-idle-in-transaction-timeout-secs",
+            "0",
+            "--retrieval-connections-per-workload",
+            "3",
+            "--retrieval-transaction-query-max-bytes",
+            "4096",
+            "--retrieval-embed-max-texts",
+            "10",
+            "--retrieval-embed-max-text-bytes",
+            "512",
+            "--retrieval-ca-file",
+            "/etc/retrieval/ca.pem",
         ]);
+        assert_eq!(
+            host.retrieval_ca_file,
+            Some(std::path::PathBuf::from("/etc/retrieval/ca.pem"))
+        );
+        assert_eq!(host.retrieval_embed_max_texts, Some(10));
+        assert_eq!(host.retrieval_embed_max_text_bytes, Some(512));
+        assert_eq!(host.retrieval_transaction_query_max_bytes, Some(4096));
+        assert_eq!(host.retrieval_connections_per_workload, Some(3));
+        assert_eq!(host.retrieval_statement_timeout_secs, Some(5));
+        assert_eq!(host.retrieval_idle_in_transaction_timeout_secs, Some(0));
         assert_eq!(
             host.retrieval_database_url
                 .as_ref()
@@ -1787,6 +1886,13 @@ mod retrieval_tests {
         assert_eq!(host.retrieval_ef_search, None);
         assert_eq!(host.retrieval_max_scan_tuples, None);
         assert_eq!(host.retrieval_embed_threads, None);
+        assert_eq!(host.retrieval_statement_timeout_secs, None);
+        assert_eq!(host.retrieval_idle_in_transaction_timeout_secs, None);
+        assert_eq!(host.retrieval_connections_per_workload, None);
+        assert_eq!(host.retrieval_transaction_query_max_bytes, None);
+        assert_eq!(host.retrieval_embed_max_texts, None);
+        assert_eq!(host.retrieval_embed_max_text_bytes, None);
+        assert_eq!(host.retrieval_ca_file, None);
     }
 
     #[test]
@@ -1857,6 +1963,31 @@ mod retrieval_tests {
                 "WASH_RETRIEVAL_MAX_SCAN_TUPLES",
             ),
             ("retrieval-embed-threads", "WASH_RETRIEVAL_EMBED_THREADS"),
+            (
+                "retrieval-statement-timeout-secs",
+                "WASH_RETRIEVAL_STATEMENT_TIMEOUT_SECS",
+            ),
+            (
+                "retrieval-idle-in-transaction-timeout-secs",
+                "WASH_RETRIEVAL_IDLE_IN_TRANSACTION_TIMEOUT_SECS",
+            ),
+            (
+                "retrieval-connections-per-workload",
+                "WASH_RETRIEVAL_CONNECTIONS_PER_WORKLOAD",
+            ),
+            (
+                "retrieval-transaction-query-max-bytes",
+                "WASH_RETRIEVAL_TRANSACTION_QUERY_MAX_BYTES",
+            ),
+            (
+                "retrieval-embed-max-texts",
+                "WASH_RETRIEVAL_EMBED_MAX_TEXTS",
+            ),
+            (
+                "retrieval-embed-max-text-bytes",
+                "WASH_RETRIEVAL_EMBED_MAX_TEXT_BYTES",
+            ),
+            ("retrieval-ca-file", "WASH_RETRIEVAL_CA_FILE"),
         ];
         for (long, env) in expected {
             let arg = command

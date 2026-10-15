@@ -31,11 +31,14 @@ worst.
 
 So:
 
-- Change this crate in the source repository first, then copy it here. Do not
-  edit `src/` in this repository.
-- When copying, update the commit ids in the table above in the same commit.
-- `src/` is the source byte for byte, except the one comment listed below. To
-  check, with the source repository checked out at the commit above:
+- Change what decides a vector (the tokenizer settings, the pooling, the
+  normalisation, the `ort`/`tokenizers` pins, the space identity) in the
+  source repository first, then copy it here.
+- When copying, update the commit ids in the table above in the same commit,
+  and keep the differences listed below.
+- `src/` is the source byte for byte, except the changes listed below, none of
+  which changes a vector or the space identity. To check, with the source
+  repository checked out at the commit above:
 
   ```sh
   diff -r crates/genius-embed/src <context-provider>/genius-embed/src
@@ -43,8 +46,8 @@ So:
 
 ## What differs from the source, on purpose
 
-Only files the source does not have, three lines of `Cargo.toml`, and one
-comment:
+Only files the source does not have, three lines of `Cargo.toml`, one
+comment, and how a model reaches the disk:
 
 - `Cargo.toml`: `default = []` where the source has `default = ["adapter"]`.
   As a workspace member, a default-on `adapter` would make every
@@ -60,6 +63,25 @@ comment:
   same change can be made in the source.
 - `src/space.rs`: the doc comment on `artifact_digests` says "another
   repository" where the source names one that is not public. No code differs.
+- `src/modelcfg.rs`: `ModelConfig::parse` lowers the case of the two pinned
+  digests. An upper-case pin, as PowerShell's `Get-FileHash` prints it, refused
+  the very bytes it named, and a cached model was deleted and fetched again at
+  every start.
+- `src/resolve.rs`, which decides only where the bytes come from and whether
+  they are accepted, never what they embed to:
+  - A catalog, mirror or source on another machine must use `https`; plain
+    `http` is refused before any request, and an `https` address is not
+    followed to `http`. The catalog's digests are what every download is
+    checked against, so over plain http anything on the path could supply
+    both. Loopback `http` is still allowed.
+  - When the catalog cannot be reached, the descriptor a previous fetch left in
+    the cache is used, if both artifacts in the cache still match its pins
+    (`Origin::OfflineCache`). Before, a catalog outage stopped every restart.
+  - A download is written to a file of its own (process id and time in the
+    name), checked against its pin, and only then renamed into place; the
+    descriptor is replaced the same way. Two hosts sharing one cache no longer
+    write into each other's files, and a mismatch no longer deletes a file
+    another host just put in place.
 - `README.md` (this file) and `rustfmt.toml`, which keeps the crate on
   rustfmt's defaults so that `cargo fmt` here does not reformat it away from
   the source.

@@ -33,6 +33,25 @@
 //!     lists the host must still refuse.
 //!   - `/lseg-and-line-columns` — an `lseg` and an `lseg[]` column, then a
 //!     `line` column, which no `pg-value` can hold, then the next statement.
+//!   - `/aborted-batch` — a `batch` that fails after its own `BEGIN`, then the
+//!     next statement on the pool.
+//!   - `/batch-left-open?table=` — a `batch` that opens a transaction and
+//!     inserts, then an auto-committed insert; the test reads which persisted.
+//!   - `/changed-session-settings` — a `batch` of `SET`s, then the settings the
+//!     next statement on the pool runs under.
+//!   - `/cancelled-auto-commit` — which session serves the statement after an
+//!     auto-committed statement dropped mid-flight.
+//!   - `/slow-statement` — a three-second statement, then the next statement
+//!     on the pool. The test sets a shorter statement timeout.
+//!   - `/idle-transaction` — a statement on a transaction left idle for two
+//!     seconds, then the next statement on the pool. The test sets a shorter
+//!     idle timeout.
+//!   - `/wrong-scalar-type` — an `int8` bound to a `float8` placeholder, then
+//!     the next statement on the pool.
+//!   - `/oversized-transaction-query` — a transaction's query of about 10 KB,
+//!     then its `commit`. The test sets a 1 KiB cap.
+//!   - `/unread-rows` — a query's completion awaited before its rows are read,
+//!     then the next statement on the pool. The test sets a 1 s time limit.
 //!
 //! The test runs the plugin with a pool of one connection, so the statements a
 //! route runs share one Postgres session unless the plugin replaced it; two for
@@ -90,6 +109,15 @@ async fn run(path: &str) -> Result<String, String> {
         "/geometric-columns" => geometric_columns().await,
         "/empty-lists" => empty_lists().await,
         "/lseg-and-line-columns" => lseg_and_line_columns().await,
+        "/aborted-batch" => aborted_batch().await,
+        "/batch-left-open" => batch_left_open(&table(query)?).await,
+        "/changed-session-settings" => changed_session_settings().await,
+        "/cancelled-auto-commit" => cancelled_auto_commit().await,
+        "/slow-statement" => slow_statement().await,
+        "/idle-transaction" => idle_transaction().await,
+        "/wrong-scalar-type" => wrong_scalar_type().await,
+        "/oversized-transaction-query" => oversized_transaction_query().await,
+        "/unread-rows" => unread_rows().await,
         other => Err(format!("no route {other}")),
     }
 }
@@ -507,6 +535,146 @@ fn segment(((start_x, start_y), (end_x, end_y)): &((Float, Float), (Float, Float
         float(*end_x),
         float(*end_y)
     )
+}
+
+/// The batch's error stops Postgres before its `COMMIT`, which leaves the
+/// session inside a failed transaction block.
+async fn aborted_batch() -> Result<String, String> {
+    let failed = match store::batch("BEGIN; SELECT 1/0; COMMIT;".to_string()).await {
+        Err(Error::Postgres(PgError::QueryFailed(db))) => db.message,
+        other => return Err(format!("the batch returned {other:?}")),
+    };
+    let after = integer(only(&rows("SELECT 1", Vec::new()).await?)?)?;
+    Ok(format!("batch={failed} then={after}"))
+}
+
+/// The batch's transaction is never committed. An insert after it that joined
+/// it would be lost with it.
+async fn batch_left_open(table: &str) -> Result<String, String> {
+    store::batch(format!(
+        "BEGIN; INSERT INTO {table} (v) VALUES ('left-open');"
+    ))
+    .await
+    .map_err(debug)?;
+    store::execute(
+        format!("INSERT INTO {table} (v) VALUES ($1)"),
+        vec![text("auto-commit")],
+    )
+    .await
+    .map_err(debug)?;
+    Ok("inserted".to_string())
+}
+
+async fn changed_session_settings() -> Result<String, String> {
+    store::batch("SET application_name = 'leaked'; SET search_path = pg_catalog;".to_string())
+        .await
+        .map_err(debug)?;
+    let rows = rows(
+        "SELECT current_setting('application_name'), current_setting('search_path')",
+        Vec::new(),
+    )
+    .await?;
+    match rows.as_slice() {
+        [row] => match row.as_slice() {
+            [PgValue::Text(application), PgValue::Text(search_path)] => Ok(format!(
+                "application_name={application:?} search_path={search_path:?}"
+            )),
+            _ => Err(format!("expected two texts, got {row:?}")),
+        },
+        _ => Err(format!("expected one row, got {rows:?}")),
+    }
+}
+
+async fn cancelled_auto_commit() -> Result<String, String> {
+    let before = backend_pid().await?;
+    let statement = Box::pin(store::execute("SELECT pg_sleep(2)".to_string(), Vec::new()));
+    let timer = Box::pin(monotonic_clock::wait_for(CANCEL_AFTER_NS));
+    // As in `cancelled_statement`: the losing call is dropped still in flight.
+    if let Either::Left((finished, _)) = select(statement, timer).await {
+        return Err(format!(
+            "pg_sleep finished before the timer fired: {finished:?}"
+        ));
+    }
+    sessions(before, backend_pid().await?)
+}
+
+async fn slow_statement() -> Result<String, String> {
+    let code = match store::execute("SELECT pg_sleep(3)".to_string(), Vec::new()).await {
+        Err(Error::Postgres(PgError::QueryFailed(db))) => db.code,
+        other => return Err(format!("the statement returned {other:?}")),
+    };
+    let after = integer(only(&rows("SELECT 1", Vec::new()).await?)?)?;
+    Ok(format!("code={code} then={after}"))
+}
+
+/// The server ends a session that sits in a transaction past the idle
+/// timeout, which releases whatever the transaction held.
+async fn idle_transaction() -> Result<String, String> {
+    let tx = begin().await?;
+    tx.execute("SELECT 1".to_string(), Vec::new())
+        .await
+        .map_err(debug)?;
+    monotonic_clock::wait_for(2_000_000_000).await;
+    let late = tx.execute("SELECT 1".to_string(), Vec::new()).await;
+    drop(tx);
+    if late.is_ok() {
+        return Err("the idle transaction still ran a statement".to_string());
+    }
+    let after = integer(only(&rows("SELECT 1", Vec::new()).await?)?)?;
+    Ok(format!("idle-statement=failed then={after}"))
+}
+
+/// Written as it is, the eight bytes of `int8(1)` would be stored as the
+/// float8 4.9e-324.
+async fn wrong_scalar_type() -> Result<String, String> {
+    let refused = match store::execute(
+        "SELECT $1::float8".to_string(),
+        vec![Param::Value(PgValue::Int8(1))],
+    )
+    .await
+    {
+        Err(Error::Postgres(PgError::InvalidParams(message))) => message,
+        other => return Err(format!("the statement returned {other:?}")),
+    };
+    let after = integer(only(&rows("SELECT 1", Vec::new()).await?)?)?;
+    Ok(format!("invalid-params={refused} then={after}"))
+}
+
+async fn oversized_transaction_query() -> Result<String, String> {
+    let tx = begin().await?;
+    let refused = match tx
+        .query(
+            "SELECT repeat('x', 100) FROM generate_series(1, 100)".to_string(),
+            Vec::new(),
+        )
+        .await
+    {
+        Err(Error::Postgres(PgError::Other(message))) => message,
+        Err(other) => return Err(format!("the query failed with {other:?}")),
+        Ok(_) => return Err("the query answered its rows".to_string()),
+    };
+    Ok(format!(
+        "query={refused} commit={}",
+        failed_commit(tx).await?
+    ))
+}
+
+/// Awaits the completion first: the rows past the stream's buffer then wait
+/// for a reader that never comes.
+async fn unread_rows() -> Result<String, String> {
+    let (_columns, stream, completion) = store::query(
+        "SELECT g FROM generate_series(1, 5000) AS g".to_string(),
+        Vec::new(),
+    )
+    .await
+    .map_err(debug)?;
+    let outcome = match completion.await {
+        Err(Error::Postgres(PgError::Other(message))) => message,
+        other => return Err(format!("the completion answered {other:?}")),
+    };
+    drop(stream);
+    let after = integer(only(&rows("SELECT 1", Vec::new()).await?)?)?;
+    Ok(format!("done={outcome} then={after}"))
 }
 
 /// Commit `tx`, expecting the database error an aborted transaction reports.
