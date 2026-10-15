@@ -7,7 +7,8 @@
 //! and a five-second wait (see `common::retrieval`): the statements one request
 //! runs share a Postgres session, and a connection the plugin fails to return
 //! shows up as `pool-exhausted` inside the request. The one test that watches a
-//! transaction from a second session gets two connections.
+//! transaction from a second session gets two connections, and a workload
+//! share of both.
 //!
 //! Every test but one is `#[ignore]`d, as each needs a database with pgvector:
 //! `BETTY_RETRIEVAL_TEST_DATABASE_URL`, or Docker for a
@@ -26,27 +27,19 @@ use common::postgres::admin_client;
 use common::req;
 use common::retrieval::{
     DIMENSION, FreshDatabase, Gate, HOST_HEADER, ScratchTable, fake_embedder, fake_space,
-    start_retrieval_workload, test_database,
+    start_retrieval_workload, start_retrieval_workload_on, start_retrieval_workload_with,
+    test_database,
 };
+use wash_runtime::plugin::betty_retrieval::BettyRetrievalConfig;
 
-/// Start a host whose plugin embeds with `embedder` from a pool of `pool_size`
-/// connections, and return the fixture's answer to `path`, which must come
-/// back 200.
-async fn answer_from_pool(
-    database_url: &str,
-    embedder: Arc<FakeEmbedder>,
-    pool_size: usize,
-    path: &str,
-) -> Result<String> {
-    let (addr, _host) = start_retrieval_workload(database_url, embedder, pool_size).await?;
+/// Start a host whose plugin embeds with `embedder` from a pool of one
+/// connection, and return the fixture's answer to `path`, which must come back
+/// 200.
+async fn answer(database_url: &str, embedder: Arc<FakeEmbedder>, path: &str) -> Result<String> {
+    let (addr, _host) = start_retrieval_workload(database_url, embedder, 1).await?;
     let (status, body) = req(&reqwest::Client::new(), &addr, HOST_HEADER, path).await?;
     ensure!(status.is_success(), "{path} answered {status}: {body}");
     Ok(body)
-}
-
-/// [`answer_from_pool`] with one connection.
-async fn answer(database_url: &str, embedder: Arc<FakeEmbedder>, path: &str) -> Result<String> {
-    answer_from_pool(database_url, embedder, 1, path).await
 }
 
 /// [`answer`] on the test database, with an embedder nothing else counts.
@@ -153,8 +146,228 @@ async fn a_dropped_transaction_returns_its_connection_to_the_pool() -> Result<()
 
 #[tokio::test]
 #[ignore = "needs a pgvector database; run with `-- --ignored`"]
-async fn an_abandoned_query_stream_returns_its_connection_to_the_pool() -> Result<()> {
-    assert_eq!(ask("/abandoned-stream").await?, "same-session");
+async fn an_abandoned_query_stream_closes_its_connection() -> Result<()> {
+    // The server is still sending the rows nobody reads. Pooled, the connection
+    // would hold its next borrower, any workload's, behind them.
+    let answer = ask("/abandoned-stream").await?;
+    assert!(answer.starts_with("new-session"), "{answer}");
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "needs a pgvector database; run with `-- --ignored`"]
+async fn a_cancelled_auto_commit_statement_closes_its_connection() -> Result<()> {
+    // The server is still running the statement. Pooled, the connection would
+    // hold its next borrower behind it.
+    let answer = ask("/cancelled-auto-commit").await?;
+    assert!(answer.starts_with("new-session"), "{answer}");
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "needs a pgvector database; run with `-- --ignored`"]
+async fn a_batch_that_fails_inside_its_own_transaction_does_not_break_the_next_statement()
+-> Result<()> {
+    assert_eq!(
+        ask("/aborted-batch").await?,
+        "batch=division by zero then=1",
+        "the next borrower of the connection must not inherit the failed transaction block"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "needs a pgvector database; run with `-- --ignored`"]
+async fn a_transaction_a_batch_leaves_open_is_rolled_back_not_joined() -> Result<()> {
+    let db = test_database().await?;
+    let table = ScratchTable::create(&db.url, "left_open").await?;
+    let path = format!("/batch-left-open?table={}", table.name);
+    assert_eq!(answer(&db.url, fake_embedder(), &path).await?, "inserted");
+    // Read on the table's own session: the auto-committed insert persisted, and
+    // the one the batch left uncommitted did not.
+    assert_eq!(table.values().await?, ["auto-commit"]);
+    table.drop_table().await
+}
+
+/// [`answer`] on the test database, from a plugin whose config `configure`
+/// changed last.
+async fn ask_configured(configure: fn(&mut BettyRetrievalConfig), path: &str) -> Result<String> {
+    let db = test_database().await?;
+    let (addr, _host) =
+        start_retrieval_workload_with(&db.url, fake_embedder(), 1, configure).await?;
+    let (status, body) = req(&reqwest::Client::new(), &addr, HOST_HEADER, path).await?;
+    ensure!(status.is_success(), "{path} answered {status}: {body}");
+    Ok(body)
+}
+
+#[tokio::test]
+#[ignore = "needs a pgvector database; run with `-- --ignored`"]
+async fn a_transaction_query_larger_than_the_cap_fails_and_keeps_the_transaction_from_committing()
+-> Result<()> {
+    let answer = ask_configured(
+        |config| config.transaction_query_max_bytes = 1024,
+        "/oversized-transaction-query",
+    )
+    .await?;
+    let refused = "the query's rows are larger than 1024 bytes, the limit for one transaction \
+                   query; select fewer rows, or read them in pieces";
+    assert_eq!(
+        answer,
+        format!("query={refused} commit={}", aborted_commit(refused))
+    );
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "needs a pgvector database; run with `-- --ignored`"]
+async fn a_query_whose_rows_go_unread_is_ended_after_the_statement_time_limit() -> Result<()> {
+    let answer = ask_configured(
+        |config| config.statement_timeout = std::time::Duration::from_secs(1),
+        "/unread-rows",
+    )
+    .await?;
+    assert_eq!(
+        answer,
+        "done=no row of the query was read for 1s, so the host ended it; read the rows \
+         before awaiting the result then=1"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "needs a pgvector database; run with `-- --ignored`"]
+async fn a_scalar_of_the_wrong_type_is_invalid_params_not_stored_wrong() -> Result<()> {
+    let body = ask("/wrong-scalar-type").await?;
+    assert!(
+        body.starts_with("invalid-params=error serializing parameter 0: "),
+        "{body}"
+    );
+    assert!(body.contains("the Postgres type `float8`"), "{body}");
+    assert!(body.ends_with(" then=1"), "{body}");
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "needs a pgvector database; run with `-- --ignored`"]
+async fn a_host_whose_model_did_not_load_serves_sql_and_says_why_it_cannot_embed() -> Result<()> {
+    let db = test_database().await?;
+    let mut config = BettyRetrievalConfig::new(
+        db.url.clone(),
+        std::path::PathBuf::from("/nonexistent/models/missing.json"),
+    );
+    config.pool_size = 1;
+    let plugin = wash_runtime::plugin::betty_retrieval::BettyRetrieval::new(config)?;
+    let (addr, _host) = start_retrieval_workload_on(plugin).await?;
+    let client = reqwest::Client::new();
+
+    let (status, body) = req(&client, &addr, HOST_HEADER, "/null").await?;
+    assert!(status.is_success(), "{status}: {body}");
+    assert_eq!(
+        body, "is-null=true",
+        "a statement that embeds nothing still runs"
+    );
+
+    let (status, body) = req(&client, &addr, HOST_HEADER, "/embed-text").await?;
+    assert!(status.is_success(), "{status}: {body}");
+    assert!(body.starts_with("error: Error::Embed("), "{body}");
+    assert!(body.contains("did not load"), "{body}");
+
+    // `space` returns a record, not a result, so it cannot answer an error;
+    // the guest's call traps instead of reporting a space that does not exist.
+    let (status, body) = req(&client, &addr, HOST_HEADER, "/space").await?;
+    assert!(!status.is_success(), "space must fail: {status}: {body}");
+    Ok(())
+}
+
+/// The doc promises that statements work again once the database is back.
+/// Terminating every session the plugin holds is what a database restart or
+/// failover does to an established pool.
+#[tokio::test]
+#[ignore = "needs a pgvector database; run with `-- --ignored`"]
+async fn statements_work_again_after_the_database_ends_every_pooled_session() -> Result<()> {
+    let db = test_database().await?;
+    let fresh = FreshDatabase::create(&db.url, "terminated").await?;
+    let (addr, _host) = start_retrieval_workload(&fresh.url()?, fake_embedder(), 2).await?;
+    let client = reqwest::Client::new();
+    let (status, before) = req(&client, &addr, HOST_HEADER, "/embed-text").await?;
+    ensure!(
+        status.is_success(),
+        "/embed-text answered {status}: {before}"
+    );
+    assert_eq!(before, format!("dims={DIMENSION}"));
+
+    let ended = admin_client(&db.url)
+        .await?
+        .query(
+            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
+             WHERE datname = $1 AND pid <> pg_backend_pid()",
+            &[&fresh.name()],
+        )
+        .await?;
+    ensure!(!ended.is_empty(), "the plugin held no session to end");
+
+    let (status, after) = req(&client, &addr, HOST_HEADER, "/embed-text").await?;
+    ensure!(
+        status.is_success(),
+        "/embed-text answered {status}: {after}"
+    );
+    assert_eq!(
+        after,
+        format!("dims={DIMENSION}"),
+        "the pool must replace the sessions the database ended"
+    );
+    fresh.drop_database().await
+}
+
+#[tokio::test]
+#[ignore = "needs a pgvector database; run with `-- --ignored`"]
+async fn a_workload_cannot_hold_more_than_its_share_of_the_pool() -> Result<()> {
+    // The pool has a second connection free, but this workload's share is one:
+    // the rest is kept for the other applications on the host.
+    let answer = ask_configured(
+        |config| {
+            config.pool_size = 2;
+            config.connections_per_workload = Some(1);
+        },
+        "/second-begin",
+    )
+    .await?;
+    assert_eq!(answer, "second-begin=pool-exhausted");
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "needs a pgvector database; run with `-- --ignored`"]
+async fn a_statement_past_the_statement_timeout_is_cancelled_by_the_server() -> Result<()> {
+    let answer = ask_configured(
+        |config| config.statement_timeout = std::time::Duration::from_secs(1),
+        "/slow-statement",
+    )
+    .await?;
+    // 57014 is query_canceled; the connection serves the next statement.
+    assert_eq!(answer, "code=57014 then=1");
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "needs a pgvector database; run with `-- --ignored`"]
+async fn a_transaction_idle_past_the_idle_timeout_is_ended_by_the_server() -> Result<()> {
+    let answer = ask_configured(
+        |config| config.idle_in_transaction_timeout = std::time::Duration::from_secs(1),
+        "/idle-transaction",
+    )
+    .await?;
+    assert_eq!(answer, "idle-statement=failed then=1");
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "needs a pgvector database; run with `-- --ignored`"]
+async fn session_settings_a_batch_changes_do_not_reach_the_next_statement() -> Result<()> {
+    assert_eq!(
+        ask("/changed-session-settings").await?,
+        r#"application_name="" search_path="public""#
+    );
     Ok(())
 }
 
@@ -203,11 +416,18 @@ async fn an_array_bound_to_a_scalar_placeholder_is_invalid_params_not_a_panic() 
 #[tokio::test]
 #[ignore = "needs a pgvector database; run with `-- --ignored`"]
 async fn a_batch_closes_the_portal_a_transactions_query_left_open() -> Result<()> {
-    let db = test_database().await?;
     // A snapshot still held here is one `REINDEX INDEX CONCURRENTLY` on another
-    // session waits out, for as long as the transaction stays open.
+    // session waits out, for as long as the transaction stays open. The one
+    // workload needs both connections: the transaction's and the watcher's.
     assert_eq!(
-        answer_from_pool(&db.url, fake_embedder(), 2, "/batch-closes-portal").await?,
+        ask_configured(
+            |config| {
+                config.pool_size = 2;
+                config.connections_per_workload = Some(2);
+            },
+            "/batch-closes-portal",
+        )
+        .await?,
         "state=idle in transaction snapshot=released"
     );
     Ok(())

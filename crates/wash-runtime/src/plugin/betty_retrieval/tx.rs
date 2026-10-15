@@ -3,7 +3,9 @@
 
 use std::sync::Arc;
 
-use tokio::sync::Mutex;
+use futures::TryStreamExt as _;
+use tokio::sync::{Mutex, OwnedSemaphorePermit};
+use tokio_postgres::types::{FromSql, Type};
 use wasmtime::component::{Accessor, FutureReader, Resource, StreamReader};
 
 use crate::engine::ctx::{ActiveCtx, SharedCtx};
@@ -13,7 +15,7 @@ use super::bindings::betty_blocks::retrieval::types;
 use super::bindings::conversions::row_to_values;
 use super::bindings::wasmcloud::postgres::types::Row;
 use super::params::{self, Bound};
-use super::store::{QueryResult, checkout, plugin};
+use super::store::{QueryResult, caller, checkout};
 use super::{BettyRetrieval, errors};
 
 const CANCELLED: &str = "a statement was cancelled before it finished";
@@ -26,6 +28,8 @@ pub struct TxHandle {
 struct TxConn {
     /// `None` once `commit` or the resource's drop has ended the transaction.
     client: Option<deadpool_postgres::Object>,
+    /// One of the workload's permits, held for as long as the transaction.
+    _share: OwnedSemaphorePermit,
     /// Why the transaction can no longer commit: the first database error, or
     /// a statement cancelled before it finished.
     aborted: Option<String>,
@@ -95,6 +99,12 @@ impl<'a> StatementGuard<'a> {
         }
     }
 
+    /// Disarm, keeping `reason` as why the transaction can no longer commit.
+    fn refuse(mut self, reason: &str) {
+        self.armed = false;
+        record_abort(self.aborted, reason);
+    }
+
     /// Disarm, keeping a database error as the reason the transaction can no
     /// longer commit.
     fn finish<T>(mut self, outcome: Result<T, tokio_postgres::Error>) -> Result<T, types::Error> {
@@ -119,13 +129,19 @@ impl Drop for StatementGuard<'_> {
     }
 }
 
-/// Check out a connection and open a transaction on it.
-pub(crate) async fn begin(plugin: &BettyRetrieval) -> Result<TxHandle, types::Error> {
+/// Take one of `workload`'s permits, check out a connection and open a
+/// transaction on it.
+pub(crate) async fn begin(
+    plugin: &BettyRetrieval,
+    workload: &Arc<str>,
+) -> Result<TxHandle, types::Error> {
+    let share = plugin.shares().acquire(workload).await?;
     let client = checkout(plugin).await?;
     // Built before `BEGIN` is sent, so a call cancelled awaiting the reply
     // leaves `TxConn`'s drop to close the possibly open transaction.
     let conn = TxConn {
         client: Some(client),
+        _share: share,
         aborted: None,
     };
     conn.client()?
@@ -158,20 +174,92 @@ async fn prepare_checked(
     Ok(stmt)
 }
 
+/// A column's length on the wire, read without decoding it.
+struct WireLen(usize);
+
+impl<'a> FromSql<'a> for WireLen {
+    fn from_sql(_: &Type, raw: &'a [u8]) -> Result<Self, Box<dyn std::error::Error + Sync + Send>> {
+        Ok(Self(raw.len()))
+    }
+
+    fn from_sql_null(_: &Type) -> Result<Self, Box<dyn std::error::Error + Sync + Send>> {
+        Ok(Self(0))
+    }
+
+    fn accepts(_: &Type) -> bool {
+        true
+    }
+}
+
+/// How many bytes of row data `row` came with.
+fn wire_len(row: &tokio_postgres::Row) -> usize {
+    (0..row.len())
+        .map(|i| row.try_get::<_, WireLen>(i).map_or(0, |len| len.0))
+        .sum()
+}
+
+/// Why [`read_capped`] stopped.
+enum ReadError {
+    Database(tokio_postgres::Error),
+    /// The rows came to more than the cap.
+    TooLarge,
+}
+
+/// Every row of `stmt`, until they come to more than `max_bytes`.
+async fn read_capped(
+    client: &deadpool_postgres::Object,
+    stmt: &tokio_postgres::Statement,
+    bound: &[Bound],
+    max_bytes: usize,
+) -> Result<Vec<tokio_postgres::Row>, ReadError> {
+    let stream = client
+        .query_raw(stmt, params::as_sql(bound))
+        .await
+        .map_err(ReadError::Database)?;
+    let mut stream = std::pin::pin!(stream);
+    let mut rows = Vec::new();
+    let mut bytes = 0_usize;
+    while let Some(row) = stream.try_next().await.map_err(ReadError::Database)? {
+        bytes = bytes.saturating_add(wire_len(&row));
+        if bytes > max_bytes {
+            return Err(ReadError::TooLarge);
+        }
+        rows.push(row);
+    }
+    Ok(rows)
+}
+
 /// Every row, read before returning: rows streamed lazily would keep the
-/// pinned connection busy, and a `commit` would wait behind them.
+/// pinned connection busy, and a `commit` would wait behind them. So the rows
+/// are capped: a result larger than the plugin's limit fails the query, and
+/// the transaction can no longer commit, since a statement such as
+/// `UPDATE ... RETURNING` may have changed rows the guest never saw.
 async fn collect_query(
     plugin: &BettyRetrieval,
+    workload: &Arc<str>,
     conn: &Mutex<TxConn>,
     sql: &str,
     params: Vec<types::Param>,
 ) -> Result<(Vec<String>, Vec<Row>), types::Error> {
-    let bound = params::resolve(plugin.embedder(), params).await?;
+    let bound = params::resolve(plugin.embedder(), plugin.embed_gate(), workload, params).await?;
     let mut conn = conn.lock().await;
     let (client, aborted) = conn.statement_parts()?;
     let stmt = prepare_checked(client, aborted, sql, &bound).await?;
     let guard = StatementGuard::arm(aborted);
-    let rows = guard.finish(client.query(&stmt, &params::as_sql(&bound)).await)?;
+    let max_bytes = plugin.transaction_query_max_bytes();
+    let rows = match read_capped(client, &stmt, &bound, max_bytes).await {
+        Ok(rows) => rows,
+        Err(ReadError::Database(e)) => return guard.finish(Err(e)),
+        Err(ReadError::TooLarge) => {
+            let reason = format!(
+                "the query's rows are larger than {max_bytes} bytes, the limit for one \
+                 transaction query; select fewer rows, or read them in pieces"
+            );
+            guard.refuse(&reason);
+            return Err(errors::other(reason));
+        }
+    };
+    let rows = guard.finish(Ok::<_, tokio_postgres::Error>(rows))?;
     let columns = stmt
         .columns()
         .iter()
@@ -186,11 +274,12 @@ async fn collect_query(
 
 async fn run_execute(
     plugin: &BettyRetrieval,
+    workload: &Arc<str>,
     conn: &Mutex<TxConn>,
     sql: &str,
     params: Vec<types::Param>,
 ) -> Result<u64, types::Error> {
-    let bound = params::resolve(plugin.embedder(), params).await?;
+    let bound = params::resolve(plugin.embedder(), plugin.embed_gate(), workload, params).await?;
     let mut conn = conn.lock().await;
     let (client, aborted) = conn.statement_parts()?;
     let stmt = prepare_checked(client, aborted, sql, &bound).await?;
@@ -251,9 +340,9 @@ impl<U> HostTransactionWithStore<U> for SharedCtx {
         sql: String,
         params: Vec<types::Param>,
     ) -> wasmtime::Result<Result<QueryResult, types::Error>> {
-        let plugin = plugin(accessor)?;
+        let (plugin, workload) = caller(accessor)?;
         let conn = conn(accessor, &tx)?;
-        let (columns, rows) = match collect_query(&plugin, &conn, &sql, params).await {
+        let (columns, rows) = match collect_query(&plugin, &workload, &conn, &sql, params).await {
             Ok(collected) => collected,
             Err(e) => return Ok(Err(e)),
         };
@@ -273,9 +362,9 @@ impl<U> HostTransactionWithStore<U> for SharedCtx {
         sql: String,
         params: Vec<types::Param>,
     ) -> wasmtime::Result<Result<u64, types::Error>> {
-        let plugin = plugin(accessor)?;
+        let (plugin, workload) = caller(accessor)?;
         let conn = conn(accessor, &tx)?;
-        Ok(run_execute(&plugin, &conn, &sql, params).await)
+        Ok(run_execute(&plugin, &workload, &conn, &sql, params).await)
     }
 
     async fn batch(

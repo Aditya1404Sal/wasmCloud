@@ -28,7 +28,11 @@ only one of the two, the host refuses to start and says which is missing.
 `wash host` takes flags or environment variables. `wash dev` takes the same
 names as keys under `dev:` in `.wash/config.yaml` (for example
 `dev.retrieval_database_url`); the four model settings can also come from the
-`WASH_RETRIEVAL_MODEL*` variables, which win over the file.
+`WASH_RETRIEVAL_MODEL*` variables, which win over the file. `wash dev` reads
+those variables only for a project whose file sets the database or names a
+model, so variables exported for `wash host` leave other projects alone. A
+wash built without the feature refuses a config that sets any
+`dev.retrieval_*` key, naming each.
 
 | Flag | Environment variable | Default | |
 |---|---|---|---|
@@ -38,11 +42,18 @@ names as keys under `dev:` in `.wash/config.yaml` (for example
 | `--retrieval-model-catalog` | `WASH_RETRIEVAL_MODEL_CATALOG` | none | Where names are looked up: a directory, or an `http(s)` base url, holding `<name>.json`. |
 | `--retrieval-model-cache` | `WASH_RETRIEVAL_MODEL_CACHE` | `$XDG_CACHE_HOME/genius-embed/models`, else `$HOME/.cache/genius-embed/models` | Where a named model's files are kept. |
 | `--retrieval-model-mirror` | `WASH_RETRIEVAL_MODEL_MIRROR` | none | Fetch a named model's files from this base url instead of the one its descriptor gives. |
+| `--retrieval-ca-file` | `WASH_RETRIEVAL_CA_FILE` | none | A PEM file of CA certificates to trust for the database's TLS, beside the public roots. In `wash dev`, a relative path is read from the project directory. |
 | `--retrieval-pool-size` | `WASH_RETRIEVAL_POOL_SIZE` | 8 | Connections in the pool. A transaction a component holds pins one. |
+| `--retrieval-connections-per-workload` | `WASH_RETRIEVAL_CONNECTIONS_PER_WORKLOAD` | half the pool, at least 1 | How many connections one workload may hold at a time: one statement, a query's rows or a whole transaction each hold one. A workload over its share waits up to the connect timeout and then gets `pool-exhausted`, while the other workloads go on. At most the pool size. |
 | `--retrieval-connect-timeout-secs` | `WASH_RETRIEVAL_CONNECT_TIMEOUT_SECS` | 10 | How long a checkout waits for a free connection, after which the component gets `pool-exhausted`, and how long a new connection may take to open. |
 | `--retrieval-ef-search` | `WASH_RETRIEVAL_EF_SEARCH` | 200 | `hnsw.ef_search`, set on every pooled connection. |
 | `--retrieval-max-scan-tuples` | `WASH_RETRIEVAL_MAX_SCAN_TUPLES` | 20000 | `hnsw.max_scan_tuples`, likewise. |
 | `--retrieval-embed-threads` | `WASH_RETRIEVAL_EMBED_THREADS` | 4 | Threads one embedding uses. |
+| `--retrieval-embed-max-texts` | `WASH_RETRIEVAL_EMBED_MAX_TEXTS` | 1000 | The most texts one statement may embed, over all of its `embed-text` and `embed-texts` parameters. More is `invalid-params`, before anything is embedded. |
+| `--retrieval-embed-max-text-bytes` | `WASH_RETRIEVAL_EMBED_MAX_TEXT_BYTES` | 65536 (64 KiB) | The longest text a statement may embed. A longer one is `invalid-params`, named by its SHA-256. The model reads only the first `max_sequence` tokens of a text anyway. |
+| `--retrieval-statement-timeout-secs` | `WASH_RETRIEVAL_STATEMENT_TIMEOUT_SECS` | 30 | `statement_timeout` on every pooled connection: the server cancels a statement that runs longer, and the component gets SQLSTATE 57014. 0 turns it off. |
+| `--retrieval-transaction-query-max-bytes` | `WASH_RETRIEVAL_TRANSACTION_QUERY_MAX_BYTES` | 67108864 (64 MiB) | The most row data one `transaction.query` may read. A transaction's rows are read before the call returns, so a larger result fails that query with `other`, and the transaction can no longer commit. |
+| `--retrieval-idle-in-transaction-timeout-secs` | `WASH_RETRIEVAL_IDLE_IN_TRANSACTION_TIMEOUT_SECS` | 60 | `idle_in_transaction_session_timeout` on every pooled connection: the server ends a session that waits inside a transaction longer, which releases the transaction's locks. 0 turns it off. |
 
 The plugin is configured only by the host. A workload that puts config on its
 `betty-blocks:retrieval` interface entry is refused.
@@ -69,6 +80,15 @@ does not print the variable's value, and the structs that hold the url print
   Install the extension beforehand if the plugin's role may not: until it
   exists, no connection can be checked out.
 - Every pooled connection is set to `search_path = public`.
+- One pool serves every workload on the host, so nothing one statement leaves
+  on its session reaches the next borrower. Before a connection is lent
+  again, the plugin rolls back a transaction that a statement left open or
+  failed, cleans the session (settings, cursors, temporary tables, advisory
+  locks, listeners) and applies its own settings again. That costs one round
+  trip for each checkout. A connection whose statement was cancelled, or whose
+  rows were not read to the end, is closed instead of pooled. And no workload
+  may hold more than its share of the pool (half of it by default), so one
+  application that holds or leaks connections cannot stop the others.
 
 ## How the model's weights reach the host
 
@@ -215,9 +235,13 @@ by default), and the chart requests a quarter of a core.
 **The host starts without the database.** The plugin opens no connection
 when the host starts; its pool connects at the first statement. While the
 database is down, or refuses the plugin's role, every statement answers
-`connection-failed`, after the connect timeout at the latest
-(`--retrieval-connect-timeout-secs`, 10 seconds unless set). `space` still
-answers, because it comes from the model. A later statement works once the
+`connection-failed`. Each step of a checkout is held to the connect timeout
+(`--retrieval-connect-timeout-secs`, 10 seconds unless set): the wait for the
+workload's share and a free connection, opening a new connection, and setting
+up its session, which a server that stops answering after the handshake
+would otherwise hold for ever. So a statement can take a few times the connect
+timeout to fail, never longer. `space` still answers, because it comes from
+the model. A later statement works once the
 database is back, with no host restart.
 
 So a wrong database url or password no longer stops the host: it shows as
@@ -225,23 +249,40 @@ So a wrong database url or password no longer stops the host: it shows as
 `retrieval_database_reached` once, at its first connection; a host that never
 logs it has never reached its database.
 
-**The host does not start without the model.** If the model cannot be
-resolved or loaded, `wash host` exits. It does not come up without the
-plugin. In Kubernetes that is a crash loop that takes every workload on the
-host with it.
+**The host starts without the model too.** If the model cannot be resolved
+or loaded, the plugin logs `retrieval_model_failed` with the cause and comes
+up without it. Statements that embed nothing still run. A statement with an
+`embed-text` or `embed-texts` parameter fails with `embed`, saying that the
+model did not load and why, and a call to `space` traps with the same cause,
+since `space` returns a record and cannot answer an error. The plugin does
+not try again: restart the host once the model's files are in place. Only a
+setting that does not validate (one of the two missing, a bad url or CA file)
+still stops the host.
 
-**There is no statement timeout.** The plugin sets none, on the session or
-on the client. A slow statement holds its pooled connection until Postgres
-finishes it, and a component that stops waiting does not cancel it on the
-server. Set `statement_timeout` on the plugin's database role.
+**Statements and idle transactions have time limits.** By default the server
+cancels a statement after 30 seconds, and ends a session that waits inside a
+transaction for 60 seconds, so one application's slow query or forgotten
+transaction cannot hold a connection, or the rows it locked, for ever. The
+same statement limit applies to a query's rows outside a transaction: if a
+component reads none of them for that long (it awaits the result before it
+reads the rows, say), the plugin ends the query, closes its connection and
+answers the result with `other`, naming the cause. Raise
+or turn off either limit with the two settings above. A component that stops
+waiting closes its connection, but Postgres may run the statement on until it
+finishes, reaches the time limit, or next writes to the closed connection.
 
-**TLS trusts public roots only.** With `sslmode=require`, `verify-ca` or
-`verify-full` in the database url, the plugin connects with TLS and verifies
-the server's certificate and name against the public web roots compiled into
-the binary. All three mean the same. A database whose certificate comes from
-a private CA is refused, and there is no setting to add a root. With any
-other `sslmode`, or none, the connection is not encrypted at all. A named
-model's catalog and downloads over `https` trust the same public roots.
+**TLS.** With `sslmode=require`, `verify-ca` or `verify-full` in the database
+url, the plugin connects with TLS and verifies the server's certificate chain
+and its host name. All three mean the same, so `require` and `verify-ca` are
+stricter here than in libpq. The trust roots are the public web roots
+compiled into the binary and, for a database whose certificate comes from a
+private CA, the certificates in `--retrieval-ca-file` (or the file a url's
+`sslrootcert` names; the setting wins). With `disable`, `prefer` or no
+`sslmode`, the connection is not encrypted at all. Any other `sslmode`, a CA
+file that cannot be read, or a url option the postgres client does not know
+stops the host at start, naming the option or the file but never the url. A
+named model's catalog and downloads over `https` trust the public roots
+only.
 
 **No egress ceiling.** The plugin connects to Postgres and, by name, to the
 catalog and the model's source, but does not enforce `allowedHosts`,
@@ -254,11 +295,23 @@ not check. Leave those fields off the entry.
 component still holds keeps its connection until the component commits or
 drops it.
 
+**Embedding is shared.** Every workload embeds with the one model, one text
+at a time. So each workload embeds one statement at a time: a workload's
+next statement waits for its last embedding to end, while other workloads go
+on. A statement whose call is cancelled stops embedding before its next
+text, and the two caps above keep one statement from holding the model for
+long.
+
 **What a component can and cannot read.** Rows come back as
 `wasmcloud:postgres` `pg-value`s. A column with no `pg-value`, such as
 `vector`, `line`, `circle`, `interval` or a range, fails that query with
 `value-conversion-failed` naming the column; cast it in SQL (`::text`,
-`::float4[]`). Lists bind only to array parameters.
+`::float4[]`). Lists bind only to array parameters. A number, bool, date or
+time binds only to a parameter of its own type (`timestamp` and
+`timestamptz` to either), and text does not bind to a fixed-width type such
+as `int4`, `float8` or `uuid`: each would be stored as a different value.
+Such a parameter is `invalid-params`. Text still binds to the types Postgres
+stores as text, such as `json`, `xml` and enums.
 
 ## A component has to be built for this host's wasmtime
 

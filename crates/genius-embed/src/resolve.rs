@@ -46,6 +46,9 @@ pub enum Origin {
     Cache,
     /// At least one artifact was downloaded.
     Download,
+    /// The catalog could not be reached, and the descriptor and artifacts a
+    /// previous fetch left in the cache still matched their pins.
+    OfflineCache,
 }
 
 impl Origin {
@@ -54,6 +57,7 @@ impl Origin {
             Origin::Path => "path",
             Origin::Cache => "cache",
             Origin::Download => "download",
+            Origin::OfflineCache => "offline-cache",
         }
     }
 }
@@ -128,10 +132,21 @@ fn resolve_named(name: &str, request: &Request) -> Result<Resolved> {
         .with_context(|| format!("create the model cache {}", descriptor_dir.display()))?;
     let descriptor = descriptor_dir.join(format!("{name}.json"));
 
-    let raw = read_catalog_entry(catalog, name)?;
-    // Written to the cache before parsing, so that what was resolved is
-    // inspectable next to the artifacts it describes even when it is wrong.
-    std::fs::write(&descriptor, &raw).with_context(|| format!("write {}", descriptor.display()))?;
+    // A catalog that cannot be reached is not the end when an earlier fetch
+    // left the descriptor in the cache: its artifacts are checked against its
+    // pins below, and only then accepted. Without this, a catalog outage would
+    // stop every restart of a host whose model is already on disk.
+    let offline = match read_catalog_entry(catalog, name) {
+        Ok(raw) => {
+            // Written to the cache before parsing, so that what was resolved
+            // is inspectable next to the artifacts it describes even when it
+            // is wrong.
+            write_replacing(&descriptor, &raw)?;
+            None
+        }
+        Err(unreachable) if descriptor.is_file() => Some(unreachable),
+        Err(unreachable) => return Err(unreachable),
+    };
 
     let mut config = ModelConfig::parse(&descriptor)
         .with_context(|| format!("parse the catalog entry for {name}"))?;
@@ -164,6 +179,29 @@ fn resolve_named(name: &str, request: &Request) -> Result<Resolved> {
              descriptor by path."
         ),
     };
+
+    if let Some(unreachable) = offline {
+        for (what, path, pin) in [
+            ("model", &config.model_path, &model_pin),
+            ("tokenizer", &config.tokenizer_path, &tokenizer_pin),
+        ] {
+            let cached = path.is_file() && sha256_file(path)? == *pin;
+            if !cached {
+                return Err(unreachable.context(format!(
+                    "the catalog could not be reached, and the cache holds no {what} artifact \
+                     for {name} that matches its pin to fall back on"
+                )));
+            }
+        }
+        config
+            .verify_artifacts()
+            .with_context(|| format!("verify the cached artifacts for {name}"))?;
+        return Ok(Resolved {
+            config,
+            descriptor,
+            origin: Origin::OfflineCache,
+        });
+    }
 
     let mut origin = Origin::Cache;
     for (what, path, relative, pin) in [
@@ -216,26 +254,51 @@ fn fetch_one(
         std::fs::remove_file(path)
             .with_context(|| format!("remove the stale {what} artifact {}", path.display()))?;
     }
+    refuse_plain_http(base, "source")?;
     let url = format!(
         "{base}/{}",
         relative.to_string_lossy().trim_start_matches('/')
     );
     let bytes = download(&url)?;
-    // Written under a temporary name and renamed, so an interrupted fetch
-    // cannot leave a short file that the next start would digest and delete.
-    let temp = path.with_extension("partial");
+    // Written under a name of its own and checked BEFORE it is renamed into
+    // place: an interrupted fetch leaves no short file, two hosts sharing the
+    // cache never write into each other's file, and the final name only ever
+    // holds bytes that matched the pin.
+    let temp = temporary_beside(path);
     std::fs::write(&temp, &bytes).with_context(|| format!("write {}", temp.display()))?;
-    std::fs::rename(&temp, path).with_context(|| format!("move {} into place", temp.display()))?;
-    let actual = sha256_file(path)?;
+    let actual = sha256_file(&temp)?;
     if actual != pin {
-        std::fs::remove_file(path).ok();
+        std::fs::remove_file(&temp).ok();
         bail!(
             "the {what} artifact fetched for {name} from {url} does not match the digest \
              its catalog entry pins\n  expected {pin}\n  actual   {actual}\n\
              The bytes at that address are not the ones this model was validated with."
         );
     }
+    std::fs::rename(&temp, path).with_context(|| format!("move {} into place", temp.display()))?;
     Ok(true)
+}
+
+/// A name beside `path` that no other process or call picks: the process id
+/// and the time, so two hosts sharing one cache never write the same file.
+fn temporary_beside(path: &Path) -> PathBuf {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos())
+        .unwrap_or_default();
+    let file = path
+        .file_name()
+        .map(|f| f.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    path.with_file_name(format!(".{file}.{}.{nanos}.partial", std::process::id()))
+}
+
+/// Replace `path` with `bytes` in one rename, so a reader never sees it half
+/// written.
+fn write_replacing(path: &Path, bytes: &[u8]) -> Result<()> {
+    let temp = temporary_beside(path);
+    std::fs::write(&temp, bytes).with_context(|| format!("write {}", temp.display()))?;
+    std::fs::rename(&temp, path).with_context(|| format!("move {} into place", temp.display()))
 }
 
 fn file_name(path: &Path, field: &str) -> Result<String> {
@@ -248,6 +311,7 @@ fn file_name(path: &Path, field: &str) -> Result<String> {
 /// Read `<catalog>/<name>.json`, from a directory or over http(s).
 fn read_catalog_entry(catalog: &str, name: &str) -> Result<Vec<u8>> {
     if is_url(catalog) {
+        refuse_plain_http(catalog, "catalog")?;
         let url = format!("{}/{name}.json", catalog.trim_end_matches('/'));
         return download(&url).with_context(|| {
             format!(
@@ -270,13 +334,49 @@ fn is_url(s: &str) -> bool {
     s.starts_with("http://") || s.starts_with("https://")
 }
 
+/// Refuse a plain `http` address on another machine. The catalog decides the
+/// digests every artifact is checked against, so over plain http anything on
+/// the network path could supply both the files and the digests that would
+/// pass them. This machine's loopback is allowed, for a catalog served
+/// locally.
+fn refuse_plain_http(address: &str, what: &str) -> Result<()> {
+    let Some(rest) = address.strip_prefix("http://") else {
+        return Ok(());
+    };
+    let authority = rest.split('/').next().unwrap_or_default();
+    let host_port = authority.rsplit('@').next().unwrap_or_default();
+    let host = match host_port.strip_prefix('[') {
+        Some(bracketed) => bracketed.split(']').next().unwrap_or_default(),
+        None => host_port.split(':').next().unwrap_or_default(),
+    };
+    let loopback = host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback());
+    if loopback {
+        return Ok(());
+    }
+    bail!(
+        "the model {what} at {host} uses plain http; use https. The catalog's digests are \
+         what every download is checked against, so over plain http anything on the network \
+         path could supply both the files and the digests that pass them."
+    )
+}
+
 /// One blocking GET. A model artifact is hundreds of megabytes, so the body is
 /// read with a limit far above that rather than the client's small default,
 /// which would otherwise truncate the graph and fail the digest check with a
 /// misleading message.
 fn download(url: &str) -> Result<Vec<u8>> {
     const MAX_ARTIFACT_BYTES: u64 = 8 * 1024 * 1024 * 1024;
-    let mut response = ureq::get(url)
+    // An https address must not be redirected to plain http, for the same
+    // reason a plain http one is refused.
+    let agent = ureq::Agent::config_builder()
+        .https_only(url.starts_with("https://"))
+        .build()
+        .new_agent();
+    let mut response = agent
+        .get(url)
         .call()
         .with_context(|| format!("GET {url}"))?;
     response
@@ -472,6 +572,140 @@ mod tests {
             }
         });
         (base, handle)
+    }
+
+    #[test]
+    fn a_plain_http_catalog_or_source_off_this_machine_is_refused_before_any_request() {
+        let scratch = Scratch::new("http");
+        let err = resolve(&Request {
+            spec: "demo".to_string(),
+            catalog: Some("http://models.example/catalog".to_string()),
+            cache: Some(scratch.path().join("cache")),
+            mirror: None,
+        })
+        .expect_err("a plain http catalog on another machine must be refused");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("https"), "{msg}");
+        assert!(!msg.contains("GET "), "refused before any request: {msg}");
+
+        // A directory catalog whose entry fetches from plain http elsewhere.
+        let catalog = scratch.path().join("catalog");
+        std::fs::create_dir_all(&catalog).expect("catalog");
+        write_model(&catalog, "demo", Some("http://files.example/models"));
+        for mirror in [None, Some("http://mirror.example".to_string())] {
+            let err = resolve(&Request {
+                spec: "demo".to_string(),
+                catalog: Some(catalog.display().to_string()),
+                cache: Some(scratch.path().join("cache")),
+                mirror,
+            })
+            .expect_err("plain http artifacts from another machine must be refused");
+            let msg = format!("{err:#}");
+            assert!(msg.contains("https"), "{msg}");
+            assert!(!msg.contains("GET "), "refused before any request: {msg}");
+        }
+    }
+
+    #[test]
+    fn a_url_catalog_that_cannot_be_reached_falls_back_to_the_cached_descriptor() {
+        let scratch = Scratch::new("offline");
+        let published = scratch.path().join("published");
+        std::fs::create_dir_all(&published).expect("published");
+        let cache = scratch.path().join("cache");
+        let (base, server) = serve(published.clone());
+        write_model(&published, "demo", Some(&base));
+        resolve(&Request {
+            spec: "demo".to_string(),
+            catalog: Some(base),
+            cache: Some(cache.clone()),
+            mirror: None,
+        })
+        .expect("the first resolve fetches");
+        server.join().expect("server");
+
+        // The catalog is down now; the cache holds the descriptor and both
+        // artifacts, and they still match the descriptor's pins.
+        let resolved = resolve(&Request {
+            spec: "demo".to_string(),
+            catalog: Some("http://127.0.0.1:1/catalog".to_string()),
+            cache: Some(cache.clone()),
+            mirror: None,
+        })
+        .expect("a cached model resolves while its catalog is down");
+        assert_eq!(resolved.origin, Origin::OfflineCache);
+        assert_eq!(resolved.config.model_path, cache.join("demo/model.onnx"));
+
+        // Without the artifacts, the catalog's failure is what the error says.
+        std::fs::remove_file(cache.join("demo/model.onnx")).expect("drop the model");
+        let err = resolve(&Request {
+            spec: "demo".to_string(),
+            catalog: Some("http://127.0.0.1:1/catalog".to_string()),
+            cache: Some(cache),
+            mirror: None,
+        })
+        .expect_err("no catalog and no cached model cannot resolve");
+        assert!(format!("{err:#}").contains("catalog"), "{err:#}");
+    }
+
+    #[test]
+    fn a_digest_pinned_in_upper_case_matches_the_artifact() {
+        // PowerShell's Get-FileHash prints digests in upper case. Compared as
+        // text, a good cached artifact would be deleted and fetched again on
+        // every start, and then refused as tampered.
+        let scratch = Scratch::new("uppercase");
+        let catalog = scratch.path().join("catalog");
+        let cache = scratch.path().join("cache");
+        std::fs::create_dir_all(&catalog).expect("catalog");
+        let cached = cache.join("demo");
+        std::fs::create_dir_all(&cached).expect("cache dir");
+        write_model(&cached, "demo", None);
+        let entry = write_model(&catalog, "demo", Some("http://127.0.0.1:1/never"));
+        let mut json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&entry).expect("read")).expect("json");
+        for key in ["artifact_sha256", "tokenizer_sha256"] {
+            let upper = json[key].as_str().expect("pinned").to_ascii_uppercase();
+            json[key] = serde_json::Value::String(upper);
+        }
+        std::fs::write(&entry, serde_json::to_vec(&json).expect("json")).expect("write");
+
+        let resolved = resolve(&Request {
+            spec: "demo".to_string(),
+            catalog: Some(catalog.display().to_string()),
+            cache: Some(cache),
+            mirror: None,
+        })
+        .expect("an upper-case pin of the right digest matches");
+        assert_eq!(resolved.origin, Origin::Cache);
+    }
+
+    #[test]
+    fn a_download_with_the_wrong_bytes_leaves_no_file_behind() {
+        let scratch = Scratch::new("wrong-bytes");
+        let published = scratch.path().join("published");
+        std::fs::create_dir_all(&published).expect("published");
+        let cache = scratch.path().join("cache");
+        let (base, server) = serve(published.clone());
+        write_model(&published, "demo", Some(&base));
+        // Pinned to the bytes above, then served different ones.
+        std::fs::write(published.join("model.onnx"), b"other bytes").expect("swap");
+        let err = resolve(&Request {
+            spec: "demo".to_string(),
+            catalog: Some(base),
+            cache: Some(cache.clone()),
+            mirror: None,
+        })
+        .expect_err("bytes that do not match the pin are refused");
+        assert!(format!("{err:#}").contains("does not match"), "{err:#}");
+        drop(server);
+        let left: Vec<_> = std::fs::read_dir(cache.join("demo"))
+            .expect("the cache dir")
+            .filter_map(|entry| entry.ok().map(|entry| entry.file_name()))
+            .filter(|name| name != "demo.json")
+            .collect();
+        assert!(
+            left.is_empty(),
+            "nothing but the descriptor is left: {left:?}"
+        );
     }
 
     #[test]

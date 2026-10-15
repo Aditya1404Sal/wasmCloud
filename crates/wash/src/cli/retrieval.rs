@@ -52,6 +52,16 @@ pub(crate) struct BettyRetrievalOverrides {
     pub ef_search: Option<u32>,
     pub max_scan_tuples: Option<u32>,
     pub embed_threads: Option<usize>,
+    /// Zero turns the limit off.
+    pub statement_timeout_secs: Option<u64>,
+    /// Zero turns the limit off.
+    pub idle_in_transaction_timeout_secs: Option<u64>,
+    /// `None` is half the pool.
+    pub connections_per_workload: Option<usize>,
+    pub transaction_query_max_bytes: Option<usize>,
+    pub embed_max_texts: Option<usize>,
+    pub embed_max_text_bytes: Option<usize>,
+    pub ca_file: Option<PathBuf>,
 }
 
 /// Build and validate a [`BettyRetrievalConfig`] from a required database URL
@@ -81,6 +91,27 @@ pub(crate) fn build_betty_retrieval_config(
     }
     if let Some(embed_threads) = overrides.embed_threads {
         config.embed_threads = embed_threads;
+    }
+    if let Some(secs) = overrides.statement_timeout_secs {
+        config.statement_timeout = Duration::from_secs(secs);
+    }
+    if let Some(secs) = overrides.idle_in_transaction_timeout_secs {
+        config.idle_in_transaction_timeout = Duration::from_secs(secs);
+    }
+    if let Some(share) = overrides.connections_per_workload {
+        config.connections_per_workload = Some(share);
+    }
+    if let Some(max_bytes) = overrides.transaction_query_max_bytes {
+        config.transaction_query_max_bytes = max_bytes;
+    }
+    if let Some(max_texts) = overrides.embed_max_texts {
+        config.embed_max_texts = max_texts;
+    }
+    if let Some(max_bytes) = overrides.embed_max_text_bytes {
+        config.embed_max_text_bytes = max_bytes;
+    }
+    if let Some(ca_file) = overrides.ca_file {
+        config.ca_file = Some(ca_file);
     }
     config.validate()?;
     Ok(config)
@@ -113,6 +144,13 @@ mod tests {
         assert_eq!(config.ef_search, 200);
         assert_eq!(config.max_scan_tuples, 20_000);
         assert_eq!(config.embed_threads, 4);
+        assert_eq!(config.statement_timeout, Duration::from_secs(30));
+        assert_eq!(config.idle_in_transaction_timeout, Duration::from_secs(60));
+        assert_eq!(config.connections_per_workload, None);
+        assert_eq!(config.transaction_query_max_bytes, 64 * 1024 * 1024);
+        assert_eq!(config.embed_max_texts, 1_000);
+        assert_eq!(config.embed_max_text_bytes, 64 * 1024);
+        assert_eq!(config.ca_file, None);
     }
 
     #[test]
@@ -126,6 +164,14 @@ mod tests {
                 ef_search: Some(100),
                 max_scan_tuples: Some(500),
                 embed_threads: Some(2),
+                statement_timeout_secs: Some(5),
+                // Zero is how an operator turns a limit off; it must stay valid.
+                idle_in_transaction_timeout_secs: Some(0),
+                connections_per_workload: Some(3),
+                transaction_query_max_bytes: Some(4096),
+                embed_max_texts: Some(10),
+                embed_max_text_bytes: Some(512),
+                ca_file: None,
             },
         )
         .expect("valid overrides build a config");
@@ -134,6 +180,33 @@ mod tests {
         assert_eq!(config.ef_search, 100);
         assert_eq!(config.max_scan_tuples, 500);
         assert_eq!(config.embed_threads, 2);
+        assert_eq!(config.statement_timeout, Duration::from_secs(5));
+        assert_eq!(config.idle_in_transaction_timeout, Duration::ZERO);
+        assert_eq!(config.connections_per_workload, Some(3));
+        assert_eq!(config.transaction_query_max_bytes, 4096);
+        assert_eq!(config.embed_max_texts, 10);
+        assert_eq!(config.embed_max_text_bytes, 512);
+    }
+
+    #[test]
+    fn a_ca_file_override_reaches_the_plugin_and_is_read_when_validated() {
+        let dir = std::env::temp_dir().join(format!("wash-retrieval-ca-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("a scratch dir");
+        let ca = rcgen::generate_simple_self_signed(vec!["private-ca.test".to_string()])
+            .expect("a test CA");
+        let path = dir.join("ca.pem");
+        std::fs::write(&path, ca.cert.pem()).expect("write the CA");
+        let config = build_betty_retrieval_config(
+            format!("{}?sslmode=verify-full", database_url()),
+            model_config(),
+            BettyRetrievalOverrides {
+                ca_file: Some(path.clone()),
+                ..Default::default()
+            },
+        )
+        .expect("a readable CA file is accepted");
+        assert_eq!(config.ca_file, Some(path));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -197,7 +197,8 @@ fn cmd_show(ctx: &CliContext) -> anyhow::Result<CommandOutput> {
         &ctx.user_config_path(),
         Some(ctx.project_dir()),
         None::<Config>,
-    )?;
+    )?
+    .for_display();
     Ok(CommandOutput::ok(
         serde_yaml_ng::to_string(&config).context("failed to serialize config")?,
         Some(serde_json::to_value(&config).context("failed to serialize config")?),

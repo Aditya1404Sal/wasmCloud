@@ -77,6 +77,11 @@ pub(crate) fn invalid_params(message: String) -> Error {
     Error::Postgres(PgError::InvalidParams(message))
 }
 
+/// A failure the plugin itself decided on, with its reason.
+pub(crate) fn other(message: String) -> Error {
+    Error::Postgres(PgError::Other(message))
+}
+
 /// A returned value with no `pg-value` to become.
 pub(crate) fn value_conversion(message: String) -> Error {
     Error::Postgres(PgError::ValueConversionFailed(message))

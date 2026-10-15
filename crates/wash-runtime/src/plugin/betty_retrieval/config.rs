@@ -49,6 +49,31 @@ pub struct BettyRetrievalConfig {
     pub ef_search: u32,
     pub max_scan_tuples: u32,
     pub embed_threads: usize,
+    /// `statement_timeout` on every pooled session: the server cancels a
+    /// statement that runs longer. Zero means no limit.
+    pub statement_timeout: Duration,
+    /// `idle_in_transaction_session_timeout` on every pooled session: the
+    /// server ends a session that waits inside a transaction longer, which
+    /// releases the locks the transaction held. Zero means no limit.
+    pub idle_in_transaction_timeout: Duration,
+    /// How many of the pool's connections one workload may hold at a time.
+    /// `None` is half the pool, and at least one: several applications share
+    /// a host, and one that holds every connection stops all the others.
+    pub connections_per_workload: Option<usize>,
+    /// The most row data one `transaction.query` may read, in bytes as they
+    /// came over the wire. A transaction's rows are read before the call
+    /// returns, so without a cap one query could use up the host's memory.
+    pub transaction_query_max_bytes: usize,
+    /// The most texts one statement may ask the model to embed, counted over
+    /// all of its `embed-text` and `embed-texts` parameters.
+    pub embed_max_texts: usize,
+    /// The longest text, in bytes, a statement may ask the model to embed.
+    /// The model reads only its first few hundred tokens, but the tokenizer
+    /// reads all of it first.
+    pub embed_max_text_bytes: usize,
+    /// A PEM file of CA certificates to trust for the database's TLS, beside
+    /// the public web roots. A url's `sslrootcert` names one too; this wins.
+    pub ca_file: Option<PathBuf>,
 }
 
 impl std::fmt::Debug for BettyRetrievalConfig {
@@ -63,6 +88,13 @@ impl std::fmt::Debug for BettyRetrievalConfig {
             ef_search,
             max_scan_tuples,
             embed_threads,
+            statement_timeout,
+            idle_in_transaction_timeout,
+            connections_per_workload,
+            transaction_query_max_bytes,
+            embed_max_texts,
+            embed_max_text_bytes,
+            ca_file,
         } = self;
         f.debug_struct("BettyRetrievalConfig")
             .field("database_url", &format_args!("<redacted>"))
@@ -72,6 +104,13 @@ impl std::fmt::Debug for BettyRetrievalConfig {
             .field("ef_search", ef_search)
             .field("max_scan_tuples", max_scan_tuples)
             .field("embed_threads", embed_threads)
+            .field("statement_timeout", statement_timeout)
+            .field("idle_in_transaction_timeout", idle_in_transaction_timeout)
+            .field("connections_per_workload", connections_per_workload)
+            .field("transaction_query_max_bytes", transaction_query_max_bytes)
+            .field("embed_max_texts", embed_max_texts)
+            .field("embed_max_text_bytes", embed_max_text_bytes)
+            .field("ca_file", ca_file)
             .finish()
     }
 }
@@ -79,7 +118,11 @@ impl std::fmt::Debug for BettyRetrievalConfig {
 impl BettyRetrievalConfig {
     /// `database_url` and a model descriptor path, with the native provider's
     /// defaults for everything else: pool 8, 10s connect timeout, `ef_search`
-    /// 200, `max_scan_tuples` 20000, 4 embed threads. Use
+    /// 200, `max_scan_tuples` 20000, 4 embed threads. The two time limits,
+    /// which the native provider does not set, default to 30s for a statement
+    /// and 60s for an idle transaction, a workload may hold half the pool,
+    /// one transaction query may read 64 MiB, and one statement may embed
+    /// 1,000 texts of up to 64 KiB each. Use
     /// [`BettyRetrievalConfig::with_model`] to name a model instead.
     pub fn new(database_url: String, model_config: PathBuf) -> Self {
         Self::with_model(database_url, ModelSelection::from_path(model_config))
@@ -96,11 +139,27 @@ impl BettyRetrievalConfig {
             ef_search: 200,
             max_scan_tuples: 20_000,
             embed_threads: 4,
+            statement_timeout: Duration::from_secs(30),
+            idle_in_transaction_timeout: Duration::from_secs(60),
+            connections_per_workload: None,
+            transaction_query_max_bytes: 64 * 1024 * 1024,
+            embed_max_texts: 1_000,
+            embed_max_text_bytes: 64 * 1024,
+            ca_file: None,
         }
     }
 
+    /// How many connections one workload may hold: the set value, or else
+    /// half the pool and at least one.
+    pub fn workload_share(&self) -> usize {
+        self.connections_per_workload
+            .unwrap_or((self.pool_size / 2).max(1))
+    }
+
     /// Refuses an unnamed model, a zero pool size, connect timeout, embed
-    /// thread count, `ef_search` or `max_scan_tuples`, and a `database_url`
+    /// thread count, `ef_search`, `max_scan_tuples`, transaction query cap or
+    /// embedding cap,
+    /// a workload share of none or more than the pool, and a `database_url`
     /// that is not `postgres`/`postgresql`.
     pub fn validate(&self) -> anyhow::Result<()> {
         if self.model.spec.trim().is_empty() {
@@ -121,6 +180,23 @@ impl BettyRetrievalConfig {
         if self.max_scan_tuples == 0 {
             bail!("max_scan_tuples must be greater than zero");
         }
+        if self.transaction_query_max_bytes == 0 {
+            bail!("transaction_query_max_bytes must be greater than zero");
+        }
+        if self.embed_max_texts == 0 {
+            bail!("embed_max_texts must be greater than zero");
+        }
+        if self.embed_max_text_bytes == 0 {
+            bail!("embed_max_text_bytes must be greater than zero");
+        }
+        if let Some(share) = self.connections_per_workload
+            && !(1..=self.pool_size).contains(&share)
+        {
+            bail!(
+                "connections_per_workload must be between 1 and pool_size ({}), got {share}",
+                self.pool_size
+            );
+        }
         // The value is left out: a url can carry a password.
         let url = Url::parse(&self.database_url).context("database_url is not a valid url")?;
         if !matches!(url.scheme(), "postgres" | "postgresql") {
@@ -129,6 +205,10 @@ impl BettyRetrievalConfig {
                 url.scheme()
             );
         }
+        // Here rather than at `start`: an option the client refuses, an
+        // sslmode it cannot honour or a CA file it cannot read stops the host
+        // at once, saying which, instead of failing every statement later.
+        super::tls::DatabaseConnection::from_url(&self.database_url, self.ca_file.as_deref())?;
         Ok(())
     }
 
@@ -168,6 +248,83 @@ mod tests {
         assert_eq!(cfg.ef_search, 200);
         assert_eq!(cfg.max_scan_tuples, 20_000);
         assert_eq!(cfg.embed_threads, 4);
+    }
+
+    #[test]
+    fn a_workload_may_hold_half_the_pool_by_default_and_never_none() {
+        let mut cfg = config();
+        assert_eq!(cfg.connections_per_workload, None);
+        for (pool_size, share) in [(8, 4), (9, 4), (3, 1), (2, 1), (1, 1)] {
+            cfg.pool_size = pool_size;
+            assert_eq!(cfg.workload_share(), share, "pool of {pool_size}");
+        }
+        cfg.connections_per_workload = Some(6);
+        cfg.pool_size = 8;
+        assert_eq!(cfg.workload_share(), 6, "a set share wins over the default");
+    }
+
+    #[test]
+    fn validate_refuses_a_workload_share_of_none_or_more_than_the_pool() {
+        for share in [0, 9] {
+            let mut cfg = config();
+            cfg.connections_per_workload = Some(share);
+            let err = cfg
+                .validate()
+                .expect_err("a share must be at least one and at most the pool")
+                .to_string();
+            assert!(err.contains("connections_per_workload"), "{err}");
+        }
+    }
+
+    #[test]
+    fn validate_refuses_a_ca_file_that_cannot_be_read_without_printing_the_url() {
+        let mut cfg = config();
+        cfg.database_url =
+            "postgres://genius:hunter2@db.internal:5432/retrieval?sslmode=verify-full".to_string();
+        cfg.ca_file = Some(PathBuf::from("/nonexistent/retrieval-ca.pem"));
+        let err = format!(
+            "{:#}",
+            cfg.validate()
+                .expect_err("an unreadable CA file must be refused")
+        );
+        assert!(err.contains("/nonexistent/retrieval-ca.pem"), "{err}");
+        assert!(!err.contains("hunter2"), "{err}");
+    }
+
+    #[test]
+    fn a_statement_may_embed_1000_texts_of_64_kib_by_default_and_never_none() {
+        let cfg = config();
+        assert_eq!(cfg.embed_max_texts, 1_000);
+        assert_eq!(cfg.embed_max_text_bytes, 64 * 1024);
+        for (texts, bytes, field) in [(0, 1, "embed_max_texts"), (1, 0, "embed_max_text_bytes")] {
+            let mut cfg = config();
+            cfg.embed_max_texts = texts;
+            cfg.embed_max_text_bytes = bytes;
+            let err = cfg
+                .validate()
+                .expect_err("a cap of zero refuses everything")
+                .to_string();
+            assert!(err.contains(field), "{err}");
+        }
+    }
+
+    #[test]
+    fn a_transaction_query_may_read_64_mib_by_default_and_never_nothing() {
+        let mut cfg = config();
+        assert_eq!(cfg.transaction_query_max_bytes, 64 * 1024 * 1024);
+        cfg.transaction_query_max_bytes = 0;
+        let err = cfg
+            .validate()
+            .expect_err("a cap of zero would refuse every row")
+            .to_string();
+        assert!(err.contains("transaction_query_max_bytes"), "{err}");
+    }
+
+    #[test]
+    fn statements_and_idle_transactions_have_time_limits_by_default() {
+        let cfg = config();
+        assert_eq!(cfg.statement_timeout, Duration::from_secs(30));
+        assert_eq!(cfg.idle_in_transaction_timeout, Duration::from_secs(60));
     }
 
     #[test]

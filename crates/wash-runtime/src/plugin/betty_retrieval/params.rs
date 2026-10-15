@@ -1,7 +1,9 @@
 //! Bind parameters: a value passes through, and an embed parameter becomes a
 //! pgvector vector before its statement reaches the database.
 
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use bytes::BytesMut;
 use genius_embed::Embedder;
@@ -12,6 +14,8 @@ use tokio_postgres::types::{Format, IsNull, Kind, ToSql, Type, WrongType};
 use super::bindings::betty_blocks::retrieval::types::{Error, Param, Role};
 use super::bindings::wasmcloud::postgres::types::PgValue;
 use super::errors::{self, ParamEncodeError};
+use super::share::WorkloadShares;
+use tokio::sync::OwnedSemaphorePermit;
 
 /// A resolved parameter, owning whatever its statement borrows.
 #[derive(Debug)]
@@ -54,9 +58,10 @@ impl ToSql for Bound {
     ) -> Result<IsNull, Box<dyn std::error::Error + Sync + Send>> {
         // `PgValue` accepts every type, so without this a list would reach a
         // postgres-types slice encoder, which panics on a type that is not an
-        // array.
+        // array, and a scalar would be written in its own format whatever the
+        // parameter's type.
         if let Bound::Value(value) = self
-            && !has_array_levels(ty, array_levels_encoded(value))
+            && (!has_array_levels(ty, array_levels_encoded(value)) || !scalar_fits(value, ty))
         {
             let wrong = WrongType::new::<PgValue>(ty.clone());
             return Err(ParamEncodeError::new(Box::new(wrong)).into());
@@ -140,6 +145,70 @@ fn array_levels(value: &PgValue) -> usize {
     }
 }
 
+/// Types Postgres reads as fixed-width binary. A value written in another
+/// format of the same width is read as a different value, with no error.
+const FIXED_WIDTH: &[Type] = &[
+    Type::BOOL,
+    Type::INT2,
+    Type::INT4,
+    Type::INT8,
+    Type::OID,
+    Type::FLOAT4,
+    Type::FLOAT8,
+    Type::MONEY,
+    Type::DATE,
+    Type::TIME,
+    Type::TIMESTAMP,
+    Type::TIMESTAMPTZ,
+    Type::INTERVAL,
+    Type::NUMERIC,
+    Type::UUID,
+];
+
+/// Whether a scalar `value` may be written for a parameter of type `ty`.
+///
+/// The stock conversion writes each scalar in its own format and never looks
+/// at `ty`. That is right only where the formats agree: a number, bool, date
+/// or time must meet its own type (`timestamp` and `timestamptz` share one
+/// encoding, so they meet either), and text must not meet a fixed-width type.
+/// Text still binds to every type Postgres stores as text, such as `json`,
+/// `xml` and enums. A domain is checked as its base type. Lists and the
+/// other variants are left to [`has_array_levels`] and their own encoders.
+fn scalar_fits(value: &PgValue, ty: &Type) -> bool {
+    let ty = base_type(ty);
+    match value {
+        PgValue::BigInt(_) | PgValue::Int8(_) | PgValue::BigSerial(_) | PgValue::Serial8(_) => {
+            <i64 as ToSql>::accepts(ty)
+        }
+        PgValue::Integer(_)
+        | PgValue::Int(_)
+        | PgValue::Int4(_)
+        | PgValue::Serial(_)
+        | PgValue::Serial4(_) => <i32 as ToSql>::accepts(ty),
+        PgValue::SmallInt(_) | PgValue::Int2(_) | PgValue::SmallSerial(_) | PgValue::Serial2(_) => {
+            <i16 as ToSql>::accepts(ty)
+        }
+        PgValue::Double(_) | PgValue::Float8(_) => <f64 as ToSql>::accepts(ty),
+        PgValue::Real(_) | PgValue::Float4(_) => <f32 as ToSql>::accepts(ty),
+        PgValue::Bool(_) | PgValue::Boolean(_) => <bool as ToSql>::accepts(ty),
+        PgValue::Date(_) => *ty == Type::DATE,
+        PgValue::Time(_) => *ty == Type::TIME,
+        PgValue::Timestamp(_) | PgValue::TimestampTz(_) => {
+            matches!(*ty, Type::TIMESTAMP | Type::TIMESTAMPTZ)
+        }
+        PgValue::Text(_) => !FIXED_WIDTH.contains(ty),
+        _ => true,
+    }
+}
+
+/// `ty`, or the type a domain over it is built on, all the way down.
+fn base_type(ty: &Type) -> &Type {
+    match ty.kind() {
+        Kind::Domain(base) => base_type(base),
+        _ => ty,
+    }
+}
+
 /// Whether `ty` is an array `levels` deep: an array whose members are arrays,
 /// and so on.
 fn has_array_levels(ty: &Type, levels: usize) -> bool {
@@ -174,60 +243,174 @@ pub(crate) fn embed_role(role: Role) -> genius_embed::Role {
     }
 }
 
+/// What one statement may ask the model to embed, and one statement's
+/// embedding at a time for each workload.
+///
+/// Every workload on the host embeds with the one model, one text at a time.
+/// Without these, one statement with a huge list, a huge text, or a stream of
+/// statements from one workload would keep every other workload's embedding
+/// waiting.
+pub(crate) struct EmbedGate {
+    max_texts: usize,
+    max_text_bytes: usize,
+    /// One slot for each workload, with no time limit: a workload's next
+    /// statement waits for its last embedding to end.
+    running: WorkloadShares,
+}
+
+impl EmbedGate {
+    pub(crate) fn new(max_texts: usize, max_text_bytes: usize) -> Self {
+        Self {
+            max_texts,
+            max_text_bytes,
+            running: WorkloadShares::new(1, None),
+        }
+    }
+
+    /// Drop `workload`'s slot once it is unbound.
+    pub(crate) fn forget(&self, workload: &str) {
+        self.running.forget(workload);
+    }
+
+    /// Refuse a statement over either cap before anything is embedded. A text
+    /// is named by its SHA-256, never by its content.
+    fn check(&self, params: &[Param]) -> Result<(), Error> {
+        let texts = || {
+            params.iter().flat_map(|param| match param {
+                Param::Value(_) => [].iter(),
+                Param::EmbedText((text, _)) => std::slice::from_ref(text).iter(),
+                Param::EmbedTexts((texts, _)) => texts.iter(),
+            })
+        };
+        let count = texts().count();
+        if count > self.max_texts {
+            return Err(errors::invalid_params(format!(
+                "the statement has {count} texts to embed; at most {} are allowed",
+                self.max_texts
+            )));
+        }
+        if let Some(text) = texts().find(|text| text.len() > self.max_text_bytes) {
+            return Err(errors::invalid_params(format!(
+                "the text with sha {:x} is {} bytes; at most {} are allowed",
+                Sha256::digest(text.as_bytes()),
+                text.len(),
+                self.max_text_bytes
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// Sets its flag when dropped: the future that awaits an embedding is gone,
+/// so the blocking task embedding for it can stop.
+struct AbandonOnDrop(Arc<AtomicBool>);
+
+impl Drop for AbandonOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+}
+
 /// Every parameter as something tokio-postgres can bind, in order.
 ///
 /// Called before a connection is checked out or a transaction is locked, so
-/// an embedding never holds a connection idle.
+/// an embedding never holds a connection idle. A statement over a cap is
+/// refused first; then the statement waits for `workload`'s embedding slot,
+/// which its blocking tasks hold until they end.
 pub(crate) async fn resolve(
     embedder: &Arc<dyn Embedder>,
+    gate: &EmbedGate,
+    workload: &Arc<str>,
     params: Vec<Param>,
 ) -> Result<Vec<Bound>, Error> {
+    gate.check(&params)?;
+    let slot = if params.iter().any(|param| !matches!(param, Param::Value(_))) {
+        Some(Arc::new(gate.running.acquire(workload).await?))
+    } else {
+        None
+    };
     let mut bound = Vec::with_capacity(params.len());
     for param in params {
         bound.push(match param {
             Param::Value(value) => Bound::Value(value),
-            Param::EmbedText((text, role)) => {
-                Bound::Vector(embed_one(embedder, text, embed_role(role)).await?)
-            }
+            Param::EmbedText((text, role)) => Bound::Vector(
+                embed_texts(embedder, vec![text], embed_role(role), slot.clone())
+                    .await?
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| Error::Embed("the model answered no vector".to_string()))?,
+            ),
             Param::EmbedTexts((texts, role)) => {
-                Bound::Vectors(embed_many(embedder, texts, embed_role(role)).await?)
+                Bound::Vectors(embed_texts(embedder, texts, embed_role(role), slot.clone()).await?)
             }
         });
     }
     Ok(bound)
 }
 
-async fn embed_one(
-    embedder: &Arc<dyn Embedder>,
-    text: String,
-    role: genius_embed::Role,
-) -> Result<Vector, Error> {
-    let embedder = Arc::clone(embedder);
-    tokio::task::spawn_blocking(move || {
-        embedder.embed(&text, role).map(Vector::from).map_err(|e| {
-            // Named by the hash `entity.text_sha256` stores: the model's own
-            // error does not say which text it failed on.
-            let sha = Sha256::digest(text.as_bytes());
-            Error::Embed(format!("embed text with sha {sha:x}: {e:#}"))
-        })
-    })
-    .await
-    .map_err(|e| Error::Embed(format!("embedding task failed: {e}")))?
-}
-
-async fn embed_many(
+/// Each text's vector, in order, embedding each distinct text once on a
+/// blocking thread. The thread holds `slot` until it ends, and stops before
+/// its next text once the caller has gone.
+async fn embed_texts(
     embedder: &Arc<dyn Embedder>,
     texts: Vec<String>,
     role: genius_embed::Role,
+    slot: Option<Arc<OwnedSemaphorePermit>>,
 ) -> Result<Vec<Vector>, Error> {
     let embedder = Arc::clone(embedder);
+    let abandoned = Arc::new(AtomicBool::new(false));
+    let _abandon = AbandonOnDrop(Arc::clone(&abandoned));
     let vectors = tokio::task::spawn_blocking(move || {
-        genius_embed::embed_distinct(embedder.as_ref(), &texts, role)
-            .map_err(|e| Error::Embed(format!("{e:#}")))
+        let _slot = slot;
+        embed_distinct(embedder.as_ref(), &texts, role, &abandoned)
     })
     .await
     .map_err(|e| Error::Embed(format!("embedding task failed: {e}")))??;
     Ok(vectors.into_iter().map(Vector::from).collect())
+}
+
+/// As `genius_embed::embed_distinct`, stopping before the next text once
+/// `abandoned` is set.
+fn embed_distinct(
+    embedder: &dyn Embedder,
+    texts: &[String],
+    role: genius_embed::Role,
+    abandoned: &AtomicBool,
+) -> Result<Vec<Vec<f32>>, Error> {
+    let mut distinct: Vec<&str> = Vec::new();
+    let mut index: HashMap<&str, usize> = HashMap::new();
+    let positions: Vec<usize> = texts
+        .iter()
+        .map(|text| {
+            *index.entry(text.as_str()).or_insert_with(|| {
+                distinct.push(text.as_str());
+                distinct.len() - 1
+            })
+        })
+        .collect();
+    let mut vectors = Vec::with_capacity(distinct.len());
+    for text in distinct {
+        if abandoned.load(Ordering::Relaxed) {
+            return Err(Error::Embed(
+                "the statement was cancelled before its texts were embedded".to_string(),
+            ));
+        }
+        vectors.push(embedder.embed(text, role).map_err(|e| {
+            // Named by the hash `entity.text_sha256` stores: the model's own
+            // error does not say which text it failed on.
+            let sha = Sha256::digest(text.as_bytes());
+            Error::Embed(format!("embed text with sha {sha:x}: {e:#}"))
+        })?);
+    }
+    positions
+        .into_iter()
+        .map(|i| {
+            vectors
+                .get(i)
+                .cloned()
+                .ok_or_else(|| Error::Embed("an embedding went missing".to_string()))
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -316,6 +499,159 @@ mod tests {
         (counting, embedder)
     }
 
+    fn workload(id: &str) -> Arc<str> {
+        Arc::from(id)
+    }
+
+    /// One workload's statement, under limits too wide to matter.
+    async fn resolve_alone(
+        embedder: &Arc<dyn Embedder>,
+        params: Vec<Param>,
+    ) -> Result<Vec<Bound>, Error> {
+        resolve(
+            embedder,
+            &EmbedGate::new(1_000, 64 * 1024),
+            &workload("w"),
+            params,
+        )
+        .await
+    }
+
+    /// Counts its calls, how many run at once at most, and takes 40 ms each.
+    #[derive(Default)]
+    struct SlowEmbedder {
+        calls: AtomicUsize,
+        running: AtomicUsize,
+        most_at_once: AtomicUsize,
+    }
+
+    impl Embedder for SlowEmbedder {
+        fn embed(&self, text: &str, role: genius_embed::Role) -> anyhow::Result<Vec<f32>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let now = self.running.fetch_add(1, Ordering::SeqCst) + 1;
+            self.most_at_once.fetch_max(now, Ordering::SeqCst);
+            std::thread::sleep(std::time::Duration::from_millis(40));
+            self.running.fetch_sub(1, Ordering::SeqCst);
+            Ok(vector_for(text, role))
+        }
+
+        fn dim(&self) -> usize {
+            2
+        }
+    }
+
+    fn texts(count: usize) -> Vec<String> {
+        (0..count).map(|i| format!("text {i}")).collect()
+    }
+
+    #[tokio::test]
+    async fn a_statement_with_more_texts_than_the_cap_is_invalid_params_before_any_embedding() {
+        let (counting, embedder) = counting();
+        let params = vec![
+            Param::EmbedTexts((vec!["a".to_string(), "b".to_string()], Role::Passage)),
+            Param::EmbedText(("c".to_string(), Role::Query)),
+        ];
+        let err = resolve(&embedder, &EmbedGate::new(2, 1024), &workload("w"), params)
+            .await
+            .expect_err("three texts are over a cap of two");
+        assert!(
+            matches!(&err, Error::Postgres(PgError::InvalidParams(m))
+                if m == "the statement has 3 texts to embed; at most 2 are allowed"),
+            "{err:?}"
+        );
+        assert_eq!(counting.calls(), 0, "nothing is embedded before the check");
+    }
+
+    #[tokio::test]
+    async fn a_text_longer_than_the_cap_is_invalid_params_named_by_its_sha256() {
+        let (counting, embedder) = counting();
+        let long = "x".repeat(11);
+        let err = resolve(
+            &embedder,
+            &EmbedGate::new(10, 10),
+            &workload("w"),
+            vec![Param::EmbedText((long.clone(), Role::Query))],
+        )
+        .await
+        .expect_err("eleven bytes are over a cap of ten");
+        let sha = format!("{:x}", Sha256::digest(long.as_bytes()));
+        assert!(
+            matches!(&err, Error::Postgres(PgError::InvalidParams(m))
+                if m == &format!("the text with sha {sha} is 11 bytes; at most 10 are allowed")),
+            "{err:?}"
+        );
+        assert_eq!(counting.calls(), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_abandoned_embedding_stops_at_the_next_text() {
+        let slow = Arc::new(SlowEmbedder::default());
+        let embedder: Arc<dyn Embedder> = slow.clone();
+        let gate = Arc::new(EmbedGate::new(1_000, 1024));
+        let task = tokio::spawn(async move {
+            resolve(
+                &embedder,
+                &gate,
+                &workload("w"),
+                vec![Param::EmbedTexts((texts(20), Role::Passage))],
+            )
+            .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+        task.abort();
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        let calls = slow.calls.load(Ordering::SeqCst);
+        assert!(
+            calls < 6,
+            "an abandoned embedding went on to {calls} of 20 texts"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn one_workload_embeds_one_statement_at_a_time() {
+        let slow = Arc::new(SlowEmbedder::default());
+        let embedder: Arc<dyn Embedder> = slow.clone();
+        let gate = EmbedGate::new(1_000, 1024);
+        let same = workload("w");
+        let one = || {
+            resolve(
+                &embedder,
+                &gate,
+                &same,
+                vec![Param::EmbedTexts((texts(3), Role::Passage))],
+            )
+        };
+        let (first, second) = tokio::join!(one(), one());
+        first.expect("the first statement embeds");
+        second.expect("the second statement embeds after it");
+        assert_eq!(slow.most_at_once.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn another_workload_does_not_wait_for_ones_embedding() {
+        let slow = Arc::new(SlowEmbedder::default());
+        let embedder: Arc<dyn Embedder> = slow.clone();
+        let gate = EmbedGate::new(1_000, 1024);
+        let statement = |id: &str| {
+            let workload = workload(id);
+            let embedder = &embedder;
+            let gate = &gate;
+            async move {
+                resolve(
+                    embedder,
+                    gate,
+                    &workload,
+                    vec![Param::EmbedTexts((texts(3), Role::Passage))],
+                )
+                .await
+            }
+        };
+        let (a, b) = tokio::join!(statement("a"), statement("b"));
+        a.expect("a embeds");
+        b.expect("b embeds");
+        assert_eq!(slow.most_at_once.load(Ordering::SeqCst), 2);
+    }
+
     #[test]
     fn each_wit_role_maps_onto_the_same_model_role() {
         assert_eq!(embed_role(Role::Query), genius_embed::Role::Query);
@@ -325,7 +661,7 @@ mod tests {
     #[tokio::test]
     async fn a_value_passes_through_without_an_embedding() {
         let (counting, embedder) = counting();
-        let bound = resolve(
+        let bound = resolve_alone(
             &embedder,
             vec![Param::Value(PgValue::Text("orders".to_string()))],
         )
@@ -339,7 +675,7 @@ mod tests {
     async fn embed_text_becomes_one_vector_for_its_role() {
         let (counting, embedder) = counting();
         let text = "which models hold orders";
-        let bound = resolve(
+        let bound = resolve_alone(
             &embedder,
             vec![Param::EmbedText((text.to_string(), Role::Query))],
         )
@@ -360,7 +696,7 @@ mod tests {
         let (counting, embedder) = counting();
         // Not a palindrome, so a reversed output cannot pass.
         let texts = ["alpha", "beta", "alpha", "gamma"];
-        let bound = resolve(
+        let bound = resolve_alone(
             &embedder,
             vec![Param::EmbedTexts((
                 texts.iter().map(ToString::to_string).collect(),
@@ -380,7 +716,7 @@ mod tests {
     #[tokio::test]
     async fn parameters_resolve_in_their_own_order() {
         let (_, embedder) = counting();
-        let bound = resolve(
+        let bound = resolve_alone(
             &embedder,
             vec![
                 Param::EmbedTexts((vec!["beta".to_string()], Role::Passage)),
@@ -450,6 +786,99 @@ mod tests {
                 "{ty}: {err}"
             );
             assert!(out.is_empty(), "{ty}: a refused parameter writes nothing");
+        }
+    }
+
+    fn midnight(
+        on: (i32, u32, u32),
+    ) -> super::super::bindings::wasmcloud::postgres::types::Timestamp {
+        use super::super::bindings::wasmcloud::postgres::types::{Date, Time, Timestamp};
+        Timestamp {
+            date: Date::Ymd(on),
+            time: Time {
+                hour: 0,
+                min: 0,
+                sec: 0,
+                micro: 0,
+            },
+        }
+    }
+
+    /// A type made as Postgres reports a domain or an enum it does not know
+    /// statically.
+    fn custom_type(name: &str, kind: Kind) -> Type {
+        Type::new(name.to_string(), 4_000_000, kind, "public".to_string())
+    }
+
+    /// Each of these encodes to as many bytes as the type it is bound to
+    /// expects, so Postgres would store a different value with no error:
+    /// `int8(1)` as the float8 4.9e-324, `int8(1700000000)` as a timestamptz
+    /// at 2000-01-01 00:28:20, `"1234"` as the int4 825373492.
+    #[test]
+    fn a_scalar_bound_to_another_type_of_its_width_is_refused_not_misread() {
+        let int_domain = custom_type("positive_count", Kind::Domain(Type::INT4));
+        for (value, ty) in [
+            (PgValue::Int8(1), Type::FLOAT8),
+            (PgValue::BigInt(1_700_000_000), Type::TIMESTAMPTZ),
+            (PgValue::Int8(1), Type::TIMESTAMP),
+            (PgValue::Float8((1, 0, 1)), Type::INT8),
+            (PgValue::Int4(1), Type::FLOAT4),
+            (PgValue::Int4(1), Type::DATE),
+            (PgValue::Int(1), Type::INT8),
+            (PgValue::Int2(1), Type::INT4),
+            (PgValue::Bool(true), Type::INT2),
+            (PgValue::Timestamp(midnight((2026, 10, 15))), Type::INT8),
+            (PgValue::Text("1234".to_string()), Type::INT4),
+            (PgValue::Text("12345678".to_string()), Type::FLOAT8),
+            (PgValue::Text("0123456789abcdef".to_string()), Type::UUID),
+            (PgValue::Text("1234".to_string()), int_domain),
+        ] {
+            let mut out = BytesMut::new();
+            let err = Bound::Value(value.clone())
+                .to_sql_checked(&ty, &mut out)
+                .err()
+                .unwrap_or_else(|| panic!("{value:?} must not bind to {ty}"));
+            assert!(err.is::<ParamEncodeError>(), "{ty}: {err}");
+            assert!(
+                err.source().is_some_and(|source| source.is::<WrongType>()),
+                "{ty}: {err}"
+            );
+            assert!(out.is_empty(), "{ty}: a refused parameter writes nothing");
+        }
+    }
+
+    #[test]
+    fn a_scalar_binds_to_its_own_type_and_text_to_the_types_stored_as_text() {
+        let count_domain = custom_type("order_count", Kind::Domain(Type::INT8));
+        let mood = custom_type("mood", Kind::Enum(vec!["calm".to_string()]));
+        for (value, ty) in [
+            (PgValue::Int8(1), Type::INT8),
+            (PgValue::Serial8(1), Type::INT8),
+            (PgValue::Int8(1), count_domain),
+            (PgValue::Int4(1), Type::INT4),
+            (PgValue::Serial4(1), Type::INT4),
+            (PgValue::Int2(1), Type::INT2),
+            (PgValue::Float8((1, 0, 1)), Type::FLOAT8),
+            (PgValue::Float4((1, 0, 1)), Type::FLOAT4),
+            (PgValue::Bool(true), Type::BOOL),
+            // One encoding for both: a naive timestamp is read as UTC.
+            (
+                PgValue::Timestamp(midnight((2026, 10, 15))),
+                Type::TIMESTAMP,
+            ),
+            (
+                PgValue::Timestamp(midnight((2026, 10, 15))),
+                Type::TIMESTAMPTZ,
+            ),
+            (PgValue::Text("orders".to_string()), Type::TEXT),
+            (PgValue::Text("orders".to_string()), Type::VARCHAR),
+            (PgValue::Text("{}".to_string()), Type::JSON),
+            (PgValue::Text("<a/>".to_string()), Type::XML),
+            (PgValue::Text("calm".to_string()), mood),
+        ] {
+            Bound::Value(value.clone())
+                .to_sql_checked(&ty, &mut BytesMut::new())
+                .unwrap_or_else(|e| panic!("{value:?} must bind to {ty}: {e}"));
         }
     }
 
@@ -623,7 +1052,7 @@ mod tests {
             Param::EmbedText(("abc".to_string(), Role::Query)),
             Param::EmbedTexts((vec!["abc".to_string()], Role::Passage)),
         ] {
-            let message = embed_message(resolve(&embedder, vec![param]).await)
+            let message = embed_message(resolve_alone(&embedder, vec![param]).await)
                 .expect("an embedding failure is an embed error");
             assert!(
                 message.starts_with(&format!("embed text with sha {ABC_SHA256}: ")),

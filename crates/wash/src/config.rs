@@ -103,6 +103,19 @@ impl Default for Config {
 }
 
 impl Config {
+    /// This config as `wash config show` prints it: the same, with every
+    /// secret url replaced by `<redacted>`. `Serialize` keeps the url itself,
+    /// which a saved config file needs; only the printed copy leaves it out.
+    pub fn for_display(&self) -> Self {
+        let mut shown = self.clone();
+        if let Some(dev) = shown.dev.as_mut()
+            && dev.retrieval_database_url.is_some()
+        {
+            dev.retrieval_database_url = Some(SecretUrl::new("<redacted>"));
+        }
+        shown
+    }
+
     /// Get the WIT directory from the configuration, defaulting to "./wit" if not set
     pub fn wit_dir(&self) -> PathBuf {
         if let Some(wit_config) = &self.wit
@@ -1399,6 +1412,45 @@ pub struct DevConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub retrieval_embed_threads: Option<usize>,
 
+    /// The betty-blocks:retrieval plugin's `statement_timeout`, in seconds; 0
+    /// turns it off. Unset keeps the plugin's own default (30s).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retrieval_statement_timeout_secs: Option<u64>,
+
+    /// The betty-blocks:retrieval plugin's
+    /// `idle_in_transaction_session_timeout`, in seconds; 0 turns it off.
+    /// Unset keeps the plugin's own default (60s).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retrieval_idle_in_transaction_timeout_secs: Option<u64>,
+
+    /// How many of the betty-blocks:retrieval plugin's connections one
+    /// workload may hold at a time. Unset is half the pool, and at least one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retrieval_connections_per_workload: Option<usize>,
+
+    /// The most row data, in bytes, one transaction query of the
+    /// betty-blocks:retrieval plugin may read. Unset keeps the plugin's own
+    /// default (64 MiB).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retrieval_transaction_query_max_bytes: Option<usize>,
+
+    /// The most texts one statement may ask the betty-blocks:retrieval
+    /// plugin to embed. Unset keeps the plugin's own default (1000).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retrieval_embed_max_texts: Option<usize>,
+
+    /// The longest text, in bytes, a statement may ask the
+    /// betty-blocks:retrieval plugin to embed. Unset keeps the plugin's own
+    /// default (64 KiB).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retrieval_embed_max_text_bytes: Option<usize>,
+
+    /// A PEM file of CA certificates the betty-blocks:retrieval plugin trusts
+    /// for its database's TLS, beside the public web roots. A relative path
+    /// is read from the project directory.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retrieval_ca_file: Option<PathBuf>,
+
     /// Enable WASI OpenTelemetry support
     #[serde(default)]
     pub wasi_otel: bool,
@@ -1528,6 +1580,85 @@ impl DevConfig {
         .map(Some)
     }
 
+    /// The `dev.retrieval_*` keys this config sets, by name, in the order the
+    /// struct declares them. A wash build without the `betty-retrieval`
+    /// feature refuses a config that sets any of them, naming each.
+    pub fn retrieval_keys_set(&self) -> Vec<&'static str> {
+        [
+            (
+                "retrieval_database_url",
+                self.retrieval_database_url.is_some(),
+            ),
+            (
+                "retrieval_model_config",
+                self.retrieval_model_config.is_some(),
+            ),
+            ("retrieval_model", self.retrieval_model.is_some()),
+            (
+                "retrieval_model_catalog",
+                self.retrieval_model_catalog.is_some(),
+            ),
+            (
+                "retrieval_model_cache",
+                self.retrieval_model_cache.is_some(),
+            ),
+            (
+                "retrieval_model_mirror",
+                self.retrieval_model_mirror.is_some(),
+            ),
+            ("retrieval_pool_size", self.retrieval_pool_size.is_some()),
+            (
+                "retrieval_connect_timeout_secs",
+                self.retrieval_connect_timeout_secs.is_some(),
+            ),
+            ("retrieval_ef_search", self.retrieval_ef_search.is_some()),
+            (
+                "retrieval_max_scan_tuples",
+                self.retrieval_max_scan_tuples.is_some(),
+            ),
+            (
+                "retrieval_embed_threads",
+                self.retrieval_embed_threads.is_some(),
+            ),
+            (
+                "retrieval_statement_timeout_secs",
+                self.retrieval_statement_timeout_secs.is_some(),
+            ),
+            (
+                "retrieval_idle_in_transaction_timeout_secs",
+                self.retrieval_idle_in_transaction_timeout_secs.is_some(),
+            ),
+            (
+                "retrieval_connections_per_workload",
+                self.retrieval_connections_per_workload.is_some(),
+            ),
+            (
+                "retrieval_transaction_query_max_bytes",
+                self.retrieval_transaction_query_max_bytes.is_some(),
+            ),
+            (
+                "retrieval_embed_max_texts",
+                self.retrieval_embed_max_texts.is_some(),
+            ),
+            (
+                "retrieval_embed_max_text_bytes",
+                self.retrieval_embed_max_text_bytes.is_some(),
+            ),
+            ("retrieval_ca_file", self.retrieval_ca_file.is_some()),
+        ]
+        .into_iter()
+        .filter_map(|(key, set)| set.then_some(key))
+        .collect()
+    }
+
+    /// `retrieval_ca_file`, with a relative path joined onto `project_dir`, as
+    /// [`DevConfig::retrieval_model_config_path`] does.
+    pub fn retrieval_ca_file_path(&self, project_dir: &Path) -> Option<PathBuf> {
+        self.retrieval_ca_file
+            .as_ref()
+            .map(|path| project_dir.join(path))
+    }
+
     /// `retrieval_model_config`, with a relative path joined onto
     /// `project_dir` rather than left to resolve against the working directory.
     pub fn retrieval_model_config_path(&self, project_dir: &Path) -> Option<PathBuf> {
@@ -1559,8 +1690,17 @@ impl DevConfig {
         project_dir: &Path,
         read_env: impl Fn(&str) -> Option<String>,
     ) -> RetrievalModelSettings {
+        // The variables are for a project that uses the plugin: one whose file
+        // sets the database or names a model. Any other project ignores them,
+        // so exporting them for `wash host` does not turn the plugin on, or
+        // fail `wash dev`, for every project on the machine.
+        let uses_plugin = self.retrieval_database_url.is_some()
+            || self.retrieval_model.is_some()
+            || self.retrieval_model_config.is_some();
         let env = |key: &str| {
-            read_env(key)
+            uses_plugin
+                .then(|| read_env(key))
+                .flatten()
                 .map(|value| value.trim().to_string())
                 .filter(|value| !value.is_empty())
         };
@@ -2645,6 +2785,97 @@ workload:
         }
     }
 
+    /// `wash config show` prints the merged config, in YAML or JSON. A file
+    /// keeps the url as written (see the test above); a person reading the
+    /// config does not see it.
+    #[test]
+    fn a_config_shown_to_a_person_leaves_out_the_retrieval_database_url() {
+        for url in SECRET_URLS {
+            let config = Config {
+                dev: Some(DevConfig {
+                    retrieval_database_url: Some(SecretUrl::new(url)),
+                    retrieval_pool_size: Some(3),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            let shown = config.for_display();
+            for printed in [
+                serde_yaml_ng::to_string(&shown).unwrap(),
+                serde_json::to_value(&shown).unwrap().to_string(),
+            ] {
+                assert!(!printed.contains("hunter2"), "{printed}");
+                assert!(!printed.contains("db.internal"), "{printed}");
+                assert!(printed.contains("<redacted>"), "{printed}");
+                // Everything else still prints.
+                assert!(printed.contains("retrieval_pool_size"), "{printed}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_config_without_a_retrieval_database_url_shows_none() {
+        let shown = Config::default().for_display();
+        assert!(
+            !serde_yaml_ng::to_string(&shown)
+                .unwrap()
+                .contains("retrieval_database_url"),
+            "redaction must not invent a key the config does not have"
+        );
+    }
+
+    #[test]
+    fn a_config_file_sets_the_retrieval_time_limits() {
+        let dev: DevConfig = serde_yaml_ng::from_str(
+            "retrieval_statement_timeout_secs: 5\n\
+             retrieval_idle_in_transaction_timeout_secs: 0\n",
+        )
+        .unwrap();
+        assert_eq!(dev.retrieval_statement_timeout_secs, Some(5));
+        assert_eq!(dev.retrieval_idle_in_transaction_timeout_secs, Some(0));
+    }
+
+    #[test]
+    fn a_config_file_sets_each_workloads_share_of_the_pool() {
+        let dev: DevConfig =
+            serde_yaml_ng::from_str("retrieval_connections_per_workload: 3\n").unwrap();
+        assert_eq!(dev.retrieval_connections_per_workload, Some(3));
+    }
+
+    #[test]
+    fn a_config_file_sets_the_transaction_query_cap() {
+        let dev: DevConfig =
+            serde_yaml_ng::from_str("retrieval_transaction_query_max_bytes: 4096\n").unwrap();
+        assert_eq!(dev.retrieval_transaction_query_max_bytes, Some(4096));
+    }
+
+    #[test]
+    fn a_config_file_sets_the_embedding_caps() {
+        let dev: DevConfig = serde_yaml_ng::from_str(
+            "retrieval_embed_max_texts: 10\n\
+             retrieval_embed_max_text_bytes: 512\n",
+        )
+        .unwrap();
+        assert_eq!(dev.retrieval_embed_max_texts, Some(10));
+        assert_eq!(dev.retrieval_embed_max_text_bytes, Some(512));
+    }
+
+    #[test]
+    fn a_relative_ca_file_is_anchored_to_the_project_like_the_model_path() {
+        let dev: DevConfig = serde_yaml_ng::from_str("retrieval_ca_file: certs/ca.pem\n").unwrap();
+        let project = PathBuf::from("/work/app");
+        assert_eq!(
+            dev.retrieval_ca_file_path(&project),
+            Some(project.join("certs/ca.pem"))
+        );
+        let absolute: DevConfig =
+            serde_yaml_ng::from_str("retrieval_ca_file: /etc/ca.pem\n").unwrap();
+        assert_eq!(
+            absolute.retrieval_ca_file_path(&project),
+            Some(PathBuf::from("/etc/ca.pem"))
+        );
+    }
+
     /// A `DevConfig` with the retrieval database set and nothing else.
     fn dev_with_retrieval_database() -> DevConfig {
         DevConfig {
@@ -2764,8 +2995,59 @@ workload:
     }
 
     #[test]
+    fn every_retrieval_key_a_config_sets_is_named() {
+        assert!(DevConfig::default().retrieval_keys_set().is_empty());
+        let dev = DevConfig {
+            retrieval_model: Some("granite-107m".to_string()),
+            retrieval_model_catalog: Some("https://models.example/catalog".to_string()),
+            retrieval_model_cache: Some(PathBuf::from("cache")),
+            retrieval_model_mirror: Some("https://mirror.example".to_string()),
+            retrieval_ca_file: Some(PathBuf::from("ca.pem")),
+            ..Default::default()
+        };
+        assert_eq!(
+            dev.retrieval_keys_set(),
+            [
+                "retrieval_model",
+                "retrieval_model_catalog",
+                "retrieval_model_cache",
+                "retrieval_model_mirror",
+                "retrieval_ca_file",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_project_that_does_not_use_the_plugin_ignores_the_retrieval_environment() {
+        // Exported for `wash host`, these must not turn the plugin on, or fail
+        // `wash dev`, for every other project on the machine.
+        let env = |key: &str| match key {
+            "WASH_RETRIEVAL_MODEL" => Some("granite-107m".to_string()),
+            "WASH_RETRIEVAL_MODEL_CATALOG" => Some("https://models.example/catalog".to_string()),
+            "WASH_RETRIEVAL_MODEL_CACHE" => Some("/var/cache/models".to_string()),
+            "WASH_RETRIEVAL_MODEL_MIRROR" => Some("https://mirror.example".to_string()),
+            _ => None,
+        };
+        let project = Path::new("/project");
+        let unused = DevConfig::default().retrieval_model_settings_from(project, env);
+        assert_eq!(unused.model, None);
+        assert_eq!(unused.catalog, None);
+        assert_eq!(unused.cache, None);
+        assert_eq!(unused.mirror, None);
+
+        // A project that sets the database takes its model from the
+        // environment, which is what the variables are for.
+        let used = dev_with_retrieval_database().retrieval_model_settings_from(project, env);
+        assert_eq!(used.model.as_deref(), Some("granite-107m"));
+        assert_eq!(
+            used.catalog.as_deref(),
+            Some("https://models.example/catalog")
+        );
+    }
+
+    #[test]
     fn a_model_path_is_anchored_to_the_project_but_a_model_name_is_not() {
-        let dev = DevConfig::default();
+        let dev = dev_with_retrieval_database();
         let project = Path::new("/project");
         let named = |value: &'static str| {
             dev.retrieval_model_settings_from(project, move |key| {

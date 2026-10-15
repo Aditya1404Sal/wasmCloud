@@ -15,14 +15,17 @@
 //! `crates/wash-runtime/docs/BETTY_RETRIEVAL_PLUGIN.md`: the host settings, how
 //! the model's files reach the host, the image that carries the plugin, and
 //! what the Helm chart's defaults break. In short: the host starts without the
-//! database but not without the model, the plugin sets no statement timeout,
-//! and its TLS trusts public roots only.
+//! database and without the model, statements and idle transactions have
+//! time limits (30s and 60s by default), and its TLS trusts the public roots
+//! and an optional CA file.
 
 mod bindings;
 mod config;
 mod errors;
 mod params;
+mod share;
 mod store;
+mod tls;
 mod tx;
 
 use std::collections::HashSet;
@@ -32,7 +35,6 @@ use anyhow::{Context as _, anyhow, bail};
 use deadpool_postgres::{Hook, HookError, Manager, ManagerConfig, Pool, RecyclingMethod};
 use genius_embed::{Adapter, Embedder, space_identity};
 use tokio::sync::OnceCell;
-use url::Url;
 
 use crate::engine::ctx::{ActiveCtx, SharedCtx, extract_active_ctx};
 use crate::engine::workload::WorkloadItem;
@@ -58,11 +60,19 @@ pub struct SpaceInfo {
 /// pgvector vectors before a statement reaches the database.
 pub struct BettyRetrieval {
     config: BettyRetrievalConfig,
-    /// Turns `embed` bind parameters into vectors.
+    /// Turns `embed` bind parameters into vectors; when the model did not
+    /// load, answers every text with why.
     embedder: Arc<dyn Embedder>,
-    space: SpaceInfo,
+    /// `None` when the model did not load.
+    space: Option<SpaceInfo>,
+    /// Why the model did not load, when it did not.
+    model_failure: Option<String>,
     /// Filled by [`HostPlugin::start`]; a plugin that never started has none.
     pool: OnceCell<Pool>,
+    /// How much of `pool` each workload holds.
+    shares: share::WorkloadShares,
+    /// What a statement may embed, and one embedding at a time per workload.
+    embed_gate: params::EmbedGate,
 }
 
 impl BettyRetrieval {
@@ -74,8 +84,55 @@ impl BettyRetrieval {
     /// Resolving happens here, at startup, on the thread that is about to load
     /// hundreds of megabytes of model anyway: a fetch is a once-per-machine
     /// cost, and everything after it reads from the cache.
+    ///
+    /// Only a config that does not validate is an error. A model that cannot
+    /// be resolved or loaded is logged, and the plugin comes up without it:
+    /// statements that embed nothing still run, and an embedding or `space`
+    /// fails, saying why, until the host restarts with the model in place.
+    /// Stopping the host instead would stop every workload on it, which in a
+    /// cluster is a crash loop.
     pub fn new(config: BettyRetrievalConfig) -> anyhow::Result<Self> {
         config.validate()?;
+        match Self::load_model(&config) {
+            Ok((embedder, space)) => Ok(Self::assemble(config, embedder, Some(space), None)),
+            Err(e) => {
+                let failure = format!("{e:#}");
+                tracing::error!(
+                    event = "retrieval_model_failed",
+                    error = %failure,
+                    "the betty-retrieval embedding model did not load; statements that embed \
+                     fail until the host restarts with the model in place"
+                );
+                let unloaded = Arc::new(Unloaded {
+                    failure: failure.clone(),
+                });
+                Ok(Self::assemble(config, unloaded, None, Some(failure)))
+            }
+        }
+    }
+
+    fn assemble(
+        config: BettyRetrievalConfig,
+        embedder: Arc<dyn Embedder>,
+        space: Option<SpaceInfo>,
+        model_failure: Option<String>,
+    ) -> Self {
+        Self {
+            shares: share::WorkloadShares::new(
+                config.workload_share(),
+                Some(config.connect_timeout),
+            ),
+            embed_gate: params::EmbedGate::new(config.embed_max_texts, config.embed_max_text_bytes),
+            config,
+            embedder,
+            space,
+            model_failure,
+            pool: OnceCell::new(),
+        }
+    }
+
+    /// The model the config names, and its embedding space.
+    fn load_model(config: &BettyRetrievalConfig) -> anyhow::Result<(Arc<dyn Embedder>, SpaceInfo)> {
         let resolved = genius_embed::resolve(&genius_embed::ResolveRequest {
             spec: config.model.spec.clone(),
             catalog: config.model.catalog.clone(),
@@ -106,12 +163,7 @@ impl BettyRetrieval {
             dimension: u32::try_from(dimension)
                 .context("the betty-retrieval model's dimension does not fit a u32")?,
         };
-        Ok(Self {
-            config,
-            embedder: Arc::new(adapter),
-            space,
-            pool: OnceCell::new(),
-        })
+        Ok((Arc::new(adapter), space))
     }
 
     /// Build a plugin around a pre-built embedder and its [`SpaceInfo`] — for
@@ -122,12 +174,7 @@ impl BettyRetrieval {
         space: SpaceInfo,
     ) -> anyhow::Result<Self> {
         config.validate()?;
-        Ok(Self {
-            config,
-            embedder,
-            space,
-            pool: OnceCell::new(),
-        })
+        Ok(Self::assemble(config, embedder, Some(space), None))
     }
 
     /// The pool [`HostPlugin::start`] built, or an error if it has not run
@@ -138,35 +185,60 @@ impl BettyRetrieval {
             .ok_or_else(|| anyhow!("the betty-retrieval plugin has not started its pool yet"))
     }
 
+    /// Each workload's share of the pool.
+    pub(crate) fn shares(&self) -> &share::WorkloadShares {
+        &self.shares
+    }
+
+    /// How long a query's rows may go unread before the query is ended: the
+    /// statement time limit, or no limit when that is off.
+    pub(crate) fn read_pause(&self) -> Option<std::time::Duration> {
+        Some(self.config.statement_timeout).filter(|limit| !limit.is_zero())
+    }
+
+    /// The most row data one transaction query may read.
+    pub(crate) fn transaction_query_max_bytes(&self) -> usize {
+        self.config.transaction_query_max_bytes
+    }
+
+    /// The caps and slots every statement's embedding goes through.
+    pub(crate) fn embed_gate(&self) -> &params::EmbedGate {
+        &self.embed_gate
+    }
+
     /// The model `embed` bind parameters resolve with.
     pub(crate) fn embedder(&self) -> &Arc<dyn Embedder> {
         &self.embedder
     }
 
-    pub fn space(&self) -> &SpaceInfo {
-        &self.space
+    /// The embedding space, or `None` when the model did not load.
+    pub fn space(&self) -> Option<&SpaceInfo> {
+        self.space.as_ref()
+    }
+
+    /// Why the model did not load, or `None` when it did.
+    pub fn model_failure(&self) -> Option<&str> {
+        self.model_failure.as_deref()
     }
 }
 
-/// Whether `sslmode` in a postgres url calls for TLS. Mirrors
-/// `wasmcloud_postgres::extract_tls_requirement`, which is private to that
-/// module.
-fn extract_tls_requirement(url: &Url) -> bool {
-    url.query_pairs()
-        .find(|(k, _)| k == "sslmode")
-        .map(|(_, v)| matches!(v.as_ref(), "require" | "verify-ca" | "verify-full"))
-        .unwrap_or(false)
+/// The embedder of a plugin whose model did not load: every text is answered
+/// with why.
+struct Unloaded {
+    failure: String,
 }
 
-/// A `rustls` connector trusting the platform's web PKI roots, matching the
-/// stock postgres plugin's TLS setup.
-fn rustls_connector() -> tokio_postgres_rustls::MakeRustlsConnect {
-    let tls_config = rustls::ClientConfig::builder()
-        .with_root_certificates(rustls::RootCertStore {
-            roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
-        })
-        .with_no_client_auth();
-    tokio_postgres_rustls::MakeRustlsConnect::new(tls_config)
+impl Embedder for Unloaded {
+    fn embed(&self, _text: &str, _role: genius_embed::Role) -> anyhow::Result<Vec<f32>> {
+        bail!(
+            "the embedding model did not load when the host started: {}",
+            self.failure
+        )
+    }
+
+    fn dim(&self) -> usize {
+        0
+    }
 }
 
 /// The statements that create the vector extension, one session at a time
@@ -195,10 +267,51 @@ fn create_vector_extension_sql(lock_timeout: std::time::Duration) -> String {
     )
 }
 
-/// Build the pool: fast recycling, wait/create timeouts bound to
-/// `connect_timeout` and run on tokio (deadpool refuses timeouts without a
-/// runtime), and a `post_create` hook that runs on every physical connection.
-/// Building opens no connection.
+/// The session every pooled connection runs under: the native provider's
+/// settings, the two time limits in whole milliseconds (zero is no limit, as
+/// Postgres reads it), and no notices or warnings sent to the host.
+/// tokio-postgres logs each one it receives, and [`recycle_sql`]'s `ROLLBACK`
+/// on a connection that is not in a transaction is one.
+fn pooled_session_sql(config: &BettyRetrievalConfig) -> String {
+    let statement = config.statement_timeout.as_millis();
+    let idle = config.idle_in_transaction_timeout.as_millis();
+    format!(
+        "{}\n\
+         SET statement_timeout = {statement};\n\
+         SET idle_in_transaction_session_timeout = {idle};\n\
+         SET client_min_messages = error;",
+        config.session_setup_sql()
+    )
+}
+
+/// Run on a pooled connection before it is lent again. The pool is shared by
+/// every workload on the host, so nothing one borrower leaves on its session
+/// may reach the next: a transaction left open or failed is rolled back, the
+/// session is cleaned the way deadpool's `RecyclingMethod::Clean` cleans it,
+/// and the settings that `RESET ALL` undid are applied again.
+///
+/// `ROLLBACK` comes first because a failed transaction refuses every other
+/// statement. The rest then runs as one implicit transaction, which these
+/// statements allow (`DISCARD ALL` would not be allowed, hence its parts).
+fn recycle_sql(config: &BettyRetrievalConfig) -> String {
+    format!(
+        "ROLLBACK;\n\
+         CLOSE ALL;\n\
+         SET SESSION AUTHORIZATION DEFAULT;\n\
+         RESET ALL;\n\
+         UNLISTEN *;\n\
+         SELECT pg_advisory_unlock_all();\n\
+         DISCARD TEMP;\n\
+         DISCARD SEQUENCES;\n\
+         {}",
+        pooled_session_sql(config)
+    )
+}
+
+/// Build the pool: wait/create timeouts bound to `connect_timeout` and run on
+/// tokio (deadpool refuses timeouts without a runtime), and a `post_create`
+/// hook that runs on every physical connection. Building opens no connection.
+/// The manager given recycles with [`recycle_sql`].
 ///
 /// The hook first makes sure the vector extension exists, once per pool: the
 /// session setup probes `'[1]'::vector`, which fails until it does. Connections
@@ -207,9 +320,10 @@ fn create_vector_extension_sql(lock_timeout: std::time::Duration) -> String {
 /// most, and a failed attempt leaves the next connection to try again. Then it
 /// applies the native provider's session GUCs.
 fn build_pool(mgr: Manager, config: &BettyRetrievalConfig) -> anyhow::Result<Pool> {
-    let setup = Arc::new(config.session_setup_sql());
+    let setup = Arc::new(pooled_session_sql(config));
     let create_extension = Arc::new(create_vector_extension_sql(config.connect_timeout));
     let extension = Arc::new(OnceCell::new());
+    let limit = config.connect_timeout;
     Pool::builder(mgr)
         .max_size(config.pool_size)
         .runtime(deadpool_postgres::Runtime::Tokio1)
@@ -220,22 +334,30 @@ fn build_pool(mgr: Manager, config: &BettyRetrievalConfig) -> anyhow::Result<Poo
             let create_extension = Arc::clone(&create_extension);
             let extension = Arc::clone(&extension);
             Box::pin(async move {
-                extension
-                    .get_or_try_init(|| async {
-                        client.batch_execute(&create_extension).await?;
-                        tracing::info!(
-                            event = "retrieval_database_reached",
-                            "betty-retrieval reached its database"
-                        );
-                        Ok::<_, tokio_postgres::Error>(())
-                    })
-                    .await
-                    .map_err(HookError::Backend)?;
-                client
-                    .batch_execute(&setup)
-                    .await
-                    .map_err(HookError::Backend)?;
-                Ok(())
+                // deadpool's create timeout ends with the handshake. A server
+                // that stalls after it would hold this connection, and every
+                // connection waiting on `extension`, for as long as TCP takes
+                // to give up, so the setup gets the connect timeout too.
+                let set_up = async {
+                    extension
+                        .get_or_try_init(|| async {
+                            client.batch_execute(&create_extension).await?;
+                            tracing::info!(
+                                event = "retrieval_database_reached",
+                                "betty-retrieval reached its database"
+                            );
+                            Ok::<_, tokio_postgres::Error>(())
+                        })
+                        .await?;
+                    client.batch_execute(&setup).await
+                };
+                match tokio::time::timeout(limit, set_up).await {
+                    Ok(set_up) => set_up.map_err(HookError::Backend),
+                    Err(_elapsed) => Err(HookError::message(format!(
+                        "the database accepted the connection but did not finish setting up \
+                         its session within {limit:?}"
+                    ))),
+                }
             })
         }))
         .build()
@@ -260,32 +382,44 @@ impl HostPlugin for BettyRetrieval {
         }
     }
 
+    /// A retrieval guest imports only `types` from `wasmcloud:postgres`, so an
+    /// entry of that package is claimed only when it names `types` alone. A
+    /// package-wide entry, or one with `query` or `prepared`, is left to the
+    /// stock postgres plugin, which this one sorts before.
+    fn claims(&self, interface: &WitInterface) -> bool {
+        if interface.namespace == "wasmcloud" && interface.package == "postgres" {
+            return !interface.interfaces.is_empty()
+                && interface.interfaces.iter().all(|name| name == "types");
+        }
+        true
+    }
+
     /// Builds the pool and opens no connection, so a host comes up while its
     /// database is down. The pool connects at the first checkout; until one
     /// succeeds, every statement answers `connection-failed`.
     async fn start(&self) -> anyhow::Result<()> {
-        let url = Url::parse(&self.config.database_url)
-            .context("parse the betty-retrieval database url")?;
-        let tls = extract_tls_requirement(&url);
-        let pg_config: tokio_postgres::Config = self
-            .config
-            .database_url
-            .parse()
-            .context("parse the betty-retrieval postgres config")?;
+        let tls::DatabaseConnection { pg, tls, .. } = tls::DatabaseConnection::from_url(
+            &self.config.database_url,
+            self.config.ca_file.as_deref(),
+        )
+        .context("configure the betty-retrieval database connection")?;
 
         let mgr_config = ManagerConfig {
-            recycling_method: RecyclingMethod::Fast,
+            recycling_method: RecyclingMethod::Custom(recycle_sql(&self.config)),
         };
-        let pool = if tls {
-            build_pool(
-                Manager::from_config(pg_config, rustls_connector(), mgr_config),
+        let pool = match tls {
+            Some(tls) => build_pool(
+                Manager::from_config(
+                    pg,
+                    tokio_postgres_rustls::MakeRustlsConnect::new(tls),
+                    mgr_config,
+                ),
                 &self.config,
-            )?
-        } else {
-            build_pool(
-                Manager::from_config(pg_config, tokio_postgres::NoTls, mgr_config),
+            )?,
+            None => build_pool(
+                Manager::from_config(pg, tokio_postgres::NoTls, mgr_config),
                 &self.config,
-            )?
+            )?,
         };
 
         self.pool
@@ -328,6 +462,18 @@ impl HostPlugin for BettyRetrieval {
                 extract_active_ctx,
             )?;
         }
+        Ok(())
+    }
+
+    /// Forgets the workload's share of the pool. A statement or transaction
+    /// it still has open keeps its permit until it ends.
+    async fn on_workload_unbind(
+        &self,
+        workload_id: &str,
+        _interfaces: WitInterfaces<'_>,
+    ) -> anyhow::Result<()> {
+        self.shares.forget(workload_id);
+        self.embed_gate.forget(workload_id);
         Ok(())
     }
 
@@ -380,7 +526,7 @@ mod tests {
         let plugin =
             BettyRetrieval::with_embedder(stub_config(), Arc::new(StubEmbedder), stub_space())
                 .expect("with_embedder builds a plugin from a stub embedder");
-        assert_eq!(plugin.space(), &stub_space());
+        assert_eq!(plugin.space(), Some(&stub_space()));
     }
 
     #[test]
@@ -393,6 +539,30 @@ mod tests {
             "betty-blocks:retrieval/types,store@0.1.0"
         )));
         assert!(imports.contains(&WitInterface::from("wasmcloud:postgres/types@0.2.0")));
+    }
+
+    /// On a host with the stock postgres plugin too, this plugin sorts first.
+    /// A package-wide `wasmcloud:postgres` entry, or one with `query` or
+    /// `prepared`, is a stock-postgres workload's: taken here, it would be
+    /// bound to nothing, and the stock plugin would never see it.
+    #[test]
+    fn only_a_postgres_entry_naming_the_types_alone_is_claimed() {
+        let plugin =
+            BettyRetrieval::with_embedder(stub_config(), Arc::new(StubEmbedder), stub_space())
+                .expect("with_embedder builds a plugin from a stub embedder");
+        for (entry, claimed) in [
+            ("betty-blocks:retrieval/types,store@0.1.0", true),
+            ("wasmcloud:postgres/types@0.2.0", true),
+            ("wasmcloud:postgres@0.2.0", false),
+            ("wasmcloud:postgres/query,types@0.2.0", false),
+            ("wasmcloud:postgres/prepared@0.2.0", false),
+        ] {
+            assert_eq!(
+                plugin.claims(&WitInterface::from(entry)),
+                claimed,
+                "{entry}"
+            );
+        }
     }
 
     #[test]
@@ -440,6 +610,53 @@ mod tests {
         use bindings::betty_blocks::retrieval::types::Error;
         use bindings::wasmcloud::postgres::types::Error as PgError;
         matches!(checkout, Err(Error::Postgres(PgError::ConnectionFailed(_))))
+    }
+
+    /// A host that cannot load its model still starts, with the plugin: only
+    /// what needs the model fails, and says why. Before, `wash host` exited,
+    /// which in a cluster is a crash loop for every workload on the host.
+    #[test]
+    fn a_model_that_cannot_load_still_gives_a_plugin_whose_embedding_says_why() {
+        let plugin = BettyRetrieval::new(BettyRetrievalConfig::new(
+            "postgres://betty:betty@127.0.0.1:1/never_connected".to_string(),
+            std::path::PathBuf::from("/nonexistent/models/missing.json"),
+        ))
+        .expect("a model that cannot load must not stop the host");
+        assert_eq!(plugin.space(), None);
+        let failure = plugin
+            .model_failure()
+            .expect("the plugin keeps why it has no model")
+            .to_string();
+        assert!(failure.contains("missing.json"), "{failure}");
+        let err = plugin
+            .embedder()
+            .embed("orders", genius_embed::Role::Query)
+            .expect_err("no model, no embedding");
+        let err = format!("{err:#}");
+        assert!(err.contains("did not load"), "{err}");
+        assert!(err.contains("missing.json"), "{err}");
+    }
+
+    /// The operator doc says all three TLS modes work; tokio-postgres itself
+    /// accepts only `require`. `start` opens no connection, so this needs no
+    /// server.
+    #[tokio::test]
+    async fn start_accepts_every_tls_sslmode() {
+        for mode in ["require", "verify-ca", "verify-full"] {
+            let plugin = BettyRetrieval::with_embedder(
+                BettyRetrievalConfig::new(
+                    format!("postgres://betty:betty@127.0.0.1:1/never_connected?sslmode={mode}"),
+                    std::path::PathBuf::from("models/granite-embedding-107m-multilingual.json"),
+                ),
+                Arc::new(StubEmbedder),
+                stub_space(),
+            )
+            .expect("with_embedder builds a plugin from a stub embedder");
+            plugin
+                .start()
+                .await
+                .unwrap_or_else(|e| panic!("sslmode={mode} must start: {e:#}"));
+        }
     }
 
     /// The host must come up with the database down: `start` opens no
@@ -493,6 +710,68 @@ mod tests {
         );
     }
 
+    /// A server that completes the startup handshake and then answers
+    /// nothing: the network partitioned, or the server stalled, after the
+    /// connection opened. Each accepted connection gets `AuthenticationOk` and
+    /// `ReadyForQuery`, and every query after that waits for ever.
+    async fn server_that_stalls_after_the_handshake() -> std::net::SocketAddr {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind a loopback port");
+        let addr = listener.local_addr().expect("the bound address");
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut length = [0_u8; 4];
+                    if socket.read_exact(&mut length).await.is_err() {
+                        return;
+                    }
+                    let startup = (u32::from_be_bytes(length) as usize).saturating_sub(4);
+                    if socket.read_exact(&mut vec![0_u8; startup]).await.is_err() {
+                        return;
+                    }
+                    let ready = [b'R', 0, 0, 0, 8, 0, 0, 0, 0, b'Z', 0, 0, 0, 5, b'I'];
+                    if socket.write_all(&ready).await.is_err() {
+                        return;
+                    }
+                    let mut ignored = [0_u8; 1024];
+                    while matches!(socket.read(&mut ignored).await, Ok(read) if read > 0) {}
+                });
+            }
+        });
+        addr
+    }
+
+    /// deadpool's create timeout ends with the handshake, and the extension
+    /// lock wait is bounded only at the server: the session setup that runs
+    /// after it needs a bound of its own, or every checkout behind it hangs.
+    #[tokio::test]
+    async fn a_server_that_stalls_after_the_handshake_holds_up_a_checkout_no_longer_than_the_timeout()
+     {
+        let addr = server_that_stalls_after_the_handshake().await;
+        let mut config = BettyRetrievalConfig::new(
+            format!("postgres://betty:betty@{addr}/stalled?sslmode=disable"),
+            std::path::PathBuf::from("models/granite-embedding-107m-multilingual.json"),
+        );
+        config.connect_timeout = std::time::Duration::from_millis(300);
+        let plugin = BettyRetrieval::with_embedder(config, Arc::new(StubEmbedder), stub_space())
+            .expect("with_embedder builds a plugin from a stub embedder");
+        plugin
+            .start()
+            .await
+            .expect("start must not need the database");
+        let checkout =
+            tokio::time::timeout(std::time::Duration::from_secs(5), store::checkout(&plugin))
+                .await
+                .expect("a checkout must give up at the connect timeout");
+        assert!(
+            is_connection_failed(&checkout),
+            "a connection whose setup timed out must be connection-failed, got {:?}",
+            checkout.err()
+        );
+    }
+
     /// Postgres reads `lock_timeout = 0` as "wait for ever", which is the one
     /// thing the setting is there to prevent.
     #[test]
@@ -506,6 +785,38 @@ mod tests {
             create_vector_extension_sql(Duration::from_micros(10))
                 .contains("SET LOCAL lock_timeout = 1;"),
             "a timeout under one millisecond must round up, not down to no limit"
+        );
+    }
+
+    #[test]
+    fn every_pooled_session_carries_both_time_limits_in_milliseconds() {
+        let mut config = stub_config();
+        config.statement_timeout = std::time::Duration::from_secs(30);
+        config.idle_in_transaction_timeout = std::time::Duration::from_millis(1500);
+        let session = pooled_session_sql(&config);
+        assert!(
+            session.contains("SET statement_timeout = 30000;"),
+            "{session}"
+        );
+        assert!(
+            session.contains("SET idle_in_transaction_session_timeout = 1500;"),
+            "{session}"
+        );
+        // A reused connection gets them again after `RESET ALL`.
+        assert!(recycle_sql(&config).ends_with(&session));
+    }
+
+    /// Postgres reads zero as "no limit", which is how an operator turns one off.
+    #[test]
+    fn a_time_limit_of_zero_is_sent_as_zero() {
+        let mut config = stub_config();
+        config.statement_timeout = std::time::Duration::ZERO;
+        config.idle_in_transaction_timeout = std::time::Duration::ZERO;
+        let session = pooled_session_sql(&config);
+        assert!(session.contains("SET statement_timeout = 0;"), "{session}");
+        assert!(
+            session.contains("SET idle_in_transaction_session_timeout = 0;"),
+            "{session}"
         );
     }
 
@@ -551,13 +862,11 @@ mod tests {
             std::path::PathBuf::from(model_config),
         );
         let plugin = BettyRetrieval::new(config).expect("load the betty-retrieval plugin");
-        assert_eq!(plugin.space().dimension, 384);
+        let space = plugin.space().expect("the granite model loads");
+        assert_eq!(space.dimension, 384);
+        assert_eq!(space.model_id, "granite-embedding-107m-multilingual");
         assert_eq!(
-            plugin.space().model_id,
-            "granite-embedding-107m-multilingual"
-        );
-        assert_eq!(
-            plugin.space().space_id,
+            space.space_id,
             "471a7b4ab27a48ac568db817ea95029601a3e7f55079fe28d78439236ee955ba"
         );
     }

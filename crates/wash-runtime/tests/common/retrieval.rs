@@ -118,6 +118,7 @@ fn plugin(
     database_url: &str,
     embedder: Arc<FakeEmbedder>,
     pool_size: usize,
+    configure: impl FnOnce(&mut BettyRetrievalConfig),
 ) -> Result<BettyRetrieval> {
     let mut config = BettyRetrievalConfig::new(
         database_url.to_string(),
@@ -126,6 +127,7 @@ fn plugin(
     );
     config.pool_size = pool_size;
     config.connect_timeout = Duration::from_secs(5);
+    configure(&mut config);
     BettyRetrieval::with_embedder(config, embedder, fake_space())
 }
 
@@ -138,6 +140,24 @@ pub async fn start_retrieval_workload(
     embedder: Arc<FakeEmbedder>,
     pool_size: usize,
 ) -> Result<(std::net::SocketAddr, impl HostApi + use<>)> {
+    start_retrieval_workload_with(database_url, embedder, pool_size, |_| {}).await
+}
+
+/// [`start_retrieval_workload`], with `configure` applied to the plugin's
+/// config last.
+pub async fn start_retrieval_workload_with(
+    database_url: &str,
+    embedder: Arc<FakeEmbedder>,
+    pool_size: usize,
+    configure: fn(&mut BettyRetrievalConfig),
+) -> Result<(std::net::SocketAddr, impl HostApi + use<>)> {
+    start_retrieval_workload_on(plugin(database_url, embedder, pool_size, configure)?).await
+}
+
+/// [`start_retrieval_workload`], around a plugin the test built itself.
+pub async fn start_retrieval_workload_on(
+    plugin: BettyRetrieval,
+) -> Result<(std::net::SocketAddr, impl HostApi + use<>)> {
     let engine = Engine::builder().build()?;
     let ingress = Ingress::new(DevRouter::default(), "127.0.0.1:0".parse()?).await?;
     let addr = ingress.addr();
@@ -145,7 +165,7 @@ pub async fn start_retrieval_workload(
     let host = HostBuilder::new()
         .with_engine(engine)
         .with_http_handler(Arc::new(ingress))
-        .with_plugin(Arc::new(plugin(database_url, embedder, pool_size)?))?
+        .with_plugin(Arc::new(plugin))?
         .build()?;
     let host = host.start().await.context("failed to start host")?;
 
