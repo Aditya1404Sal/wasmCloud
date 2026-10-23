@@ -534,9 +534,10 @@ pub struct HostCommand {
     )]
     pub retrieval_connections_per_workload: Option<usize>,
 
-    /// The most row data, in bytes, one transaction query of the
-    /// betty-blocks:retrieval plugin may read; a larger result fails that
-    /// query. Unset keeps the plugin's own default (64 MiB).
+    /// How much, in bytes, one transaction query of the
+    /// betty-blocks:retrieval plugin may read, counting what the host holds
+    /// each row and value in; a larger result fails that query. Unset keeps
+    /// the plugin's own default (64 MiB).
     #[cfg(feature = "betty-retrieval")]
     #[arg(
         long = "retrieval-transaction-query-max-bytes",

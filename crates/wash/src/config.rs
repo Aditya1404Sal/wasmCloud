@@ -1428,9 +1428,9 @@ pub struct DevConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub retrieval_connections_per_workload: Option<usize>,
 
-    /// The most row data, in bytes, one transaction query of the
-    /// betty-blocks:retrieval plugin may read. Unset keeps the plugin's own
-    /// default (64 MiB).
+    /// How much, in bytes, one transaction query of the
+    /// betty-blocks:retrieval plugin may read, counting what the host holds
+    /// each row and value in. Unset keeps the plugin's own default (64 MiB).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub retrieval_transaction_query_max_bytes: Option<usize>,
 

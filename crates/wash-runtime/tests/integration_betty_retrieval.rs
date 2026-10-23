@@ -164,6 +164,38 @@ async fn a_cancelled_auto_commit_statement_closes_its_connection() -> Result<()>
     Ok(())
 }
 
+/// Statements dropped mid-flight, one after another. Closing the connection
+/// alone does not stop Postgres, which runs the statement on until it next
+/// writes to the connection; until then its session sat outside the pool and
+/// the workload's share, and a loop of cancels could fill `max_connections`.
+/// Now the server is asked to cancel the statement, and the connection holds
+/// its pool slot and its permit until the statement has ended.
+#[tokio::test]
+#[ignore = "needs a pgvector database; run with `-- --ignored`"]
+async fn a_dropped_statement_has_ended_on_the_server_before_its_connection_is_replaced()
+-> Result<()> {
+    let db = test_database().await?;
+    assert_eq!(
+        answer(&db.url, fake_embedder(), "/cancel-loop").await?,
+        "running=0,0,0,0,0,0",
+        "after each dropped statement, no session may still be running one"
+    );
+    let still: i64 = admin_client(&db.url)
+        .await?
+        .query_one(
+            "SELECT count(*) FROM pg_stat_activity WHERE state = 'active' \
+             AND strpos(query, 'betty-it-cancel-loop') > 0 AND pid <> pg_backend_pid()",
+            &[],
+        )
+        .await?
+        .get(0);
+    assert_eq!(
+        still, 0,
+        "a dropped statement is still running on the server"
+    );
+    Ok(())
+}
+
 #[tokio::test]
 #[ignore = "needs a pgvector database; run with `-- --ignored`"]
 async fn a_batch_that_fails_inside_its_own_transaction_does_not_break_the_next_statement()
@@ -214,6 +246,40 @@ async fn a_transaction_query_larger_than_the_cap_fails_and_keeps_the_transaction
     assert_eq!(
         answer,
         format!("query={refused} commit={}", aborted_commit(refused))
+    );
+    Ok(())
+}
+
+/// A row costs the host its values' bytes and the structures that hold them,
+/// so rows of nothing but a NULL count too: the cap counted only the bytes,
+/// and let any number of them through.
+#[tokio::test]
+#[ignore = "needs a pgvector database; run with `-- --ignored`"]
+async fn a_transaction_query_of_null_rows_still_counts_against_the_cap() -> Result<()> {
+    let answer = ask_configured(
+        |config| config.transaction_query_max_bytes = 1024,
+        "/null-rows-transaction-query",
+    )
+    .await?;
+    let refused = "the query's rows are larger than 1024 bytes, the limit for one transaction \
+                   query; select fewer rows, or read them in pieces";
+    assert_eq!(
+        answer,
+        format!("query={refused} commit={}", aborted_commit(refused))
+    );
+    Ok(())
+}
+
+/// The host holds each row the server sends until the guest reads it. A row
+/// over the most one row may be fails its query before the guest gets it,
+/// and the next statement runs as usual.
+#[tokio::test]
+#[ignore = "needs a pgvector database; run with `-- --ignored`"]
+async fn a_row_larger_than_one_row_may_be_fails_its_query() -> Result<()> {
+    assert_eq!(
+        ask("/oversized-row").await?,
+        "rows=0 done=a row of the query is larger than 67108864 bytes, the most one row may \
+         be; select less of it, or read it in pieces then=1"
     );
     Ok(())
 }

@@ -20,7 +20,9 @@
 //! and an optional CA file.
 
 mod bindings;
+mod cancel;
 mod config;
+mod cost;
 mod errors;
 mod params;
 mod share;
@@ -69,6 +71,9 @@ pub struct BettyRetrieval {
     model_failure: Option<String>,
     /// Filled by [`HostPlugin::start`]; a plugin that never started has none.
     pool: OnceCell<Pool>,
+    /// How a connection whose statement may still be running is closed;
+    /// filled with `pool`.
+    canceller: OnceCell<cancel::Canceller>,
     /// How much of `pool` each workload holds.
     shares: share::WorkloadShares,
     /// What a statement may embed, and one embedding at a time per workload.
@@ -128,6 +133,7 @@ impl BettyRetrieval {
             space,
             model_failure,
             pool: OnceCell::new(),
+            canceller: OnceCell::new(),
         }
     }
 
@@ -181,6 +187,14 @@ impl BettyRetrieval {
     /// yet.
     pub(crate) fn pool(&self) -> anyhow::Result<&Pool> {
         self.pool
+            .get()
+            .ok_or_else(|| anyhow!("the betty-retrieval plugin has not started its pool yet"))
+    }
+
+    /// How a connection whose statement may still be running is closed, or an
+    /// error if [`HostPlugin::start`] has not run yet.
+    pub(crate) fn canceller(&self) -> anyhow::Result<&cancel::Canceller> {
+        self.canceller
             .get()
             .ok_or_else(|| anyhow!("the betty-retrieval plugin has not started its pool yet"))
     }
@@ -308,10 +322,12 @@ fn recycle_sql(config: &BettyRetrievalConfig) -> String {
     )
 }
 
-/// Build the pool: wait/create timeouts bound to `connect_timeout` and run on
-/// tokio (deadpool refuses timeouts without a runtime), and a `post_create`
-/// hook that runs on every physical connection. Building opens no connection.
-/// The manager given recycles with [`recycle_sql`].
+/// Build the pool: wait, create and recycle timeouts bound to
+/// `connect_timeout` and run on tokio (deadpool refuses timeouts without a
+/// runtime), and a `post_create` hook that runs on every physical connection.
+/// Building opens no connection. The manager given recycles with
+/// [`recycle_sql`]; a pooled connection that does not answer that reset in
+/// time is dropped, and the checkout goes on to another.
 ///
 /// The hook first makes sure the vector extension exists, once per pool: the
 /// session setup probes `'[1]'::vector`, which fails until it does. Connections
@@ -329,6 +345,7 @@ fn build_pool(mgr: Manager, config: &BettyRetrievalConfig) -> anyhow::Result<Poo
         .runtime(deadpool_postgres::Runtime::Tokio1)
         .wait_timeout(Some(config.connect_timeout))
         .create_timeout(Some(config.connect_timeout))
+        .recycle_timeout(Some(config.connect_timeout))
         .post_create(Hook::async_fn(move |client, _| {
             let setup = Arc::clone(&setup);
             let create_extension = Arc::clone(&create_extension);
@@ -407,15 +424,9 @@ impl HostPlugin for BettyRetrieval {
         let mgr_config = ManagerConfig {
             recycling_method: RecyclingMethod::Custom(recycle_sql(&self.config)),
         };
-        let pool = match tls {
-            Some(tls) => build_pool(
-                Manager::from_config(
-                    pg,
-                    tokio_postgres_rustls::MakeRustlsConnect::new(tls),
-                    mgr_config,
-                ),
-                &self.config,
-            )?,
+        let tls = tls.map(tokio_postgres_rustls::MakeRustlsConnect::new);
+        let pool = match tls.clone() {
+            Some(tls) => build_pool(Manager::from_config(pg, tls, mgr_config), &self.config)?,
             None => build_pool(
                 Manager::from_config(pg, tokio_postgres::NoTls, mgr_config),
                 &self.config,
@@ -424,6 +435,9 @@ impl HostPlugin for BettyRetrieval {
 
         self.pool
             .set(pool)
+            .map_err(|_| anyhow!("the betty-retrieval plugin already started"))?;
+        self.canceller
+            .set(cancel::Canceller::new(tls, self.config.connect_timeout))
             .map_err(|_| anyhow!("the betty-retrieval plugin already started"))?;
         Ok(())
     }
@@ -769,6 +783,127 @@ mod tests {
             is_connection_failed(&checkout),
             "a connection whose setup timed out must be connection-failed, got {:?}",
             checkout.err()
+        );
+    }
+
+    /// A server that completes the handshake and answers each simple query
+    /// with `ReadyForQuery`, until a query that starts with `stall_on`: from
+    /// then on it answers nothing on that connection, as a connection the
+    /// network dropped without a word. Every new connection starts answering
+    /// again.
+    async fn server_that_stalls_on(stall_on: &'static str) -> std::net::SocketAddr {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        const READY: [u8; 6] = [b'Z', 0, 0, 0, 5, b'I'];
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind a loopback port");
+        let addr = listener.local_addr().expect("the bound address");
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut length = [0_u8; 4];
+                    if socket.read_exact(&mut length).await.is_err() {
+                        return;
+                    }
+                    let startup = (u32::from_be_bytes(length) as usize).saturating_sub(4);
+                    if socket.read_exact(&mut vec![0_u8; startup]).await.is_err() {
+                        return;
+                    }
+                    let authenticated = [b'R', 0, 0, 0, 8, 0, 0, 0, 0];
+                    if socket.write_all(&authenticated).await.is_err()
+                        || socket.write_all(&READY).await.is_err()
+                    {
+                        return;
+                    }
+                    loop {
+                        let mut tag = [0_u8; 1];
+                        if socket.read_exact(&mut tag).await.is_err()
+                            || socket.read_exact(&mut length).await.is_err()
+                        {
+                            return;
+                        }
+                        let mut body =
+                            vec![0_u8; (u32::from_be_bytes(length) as usize).saturating_sub(4)];
+                        if socket.read_exact(&mut body).await.is_err() {
+                            return;
+                        }
+                        if tag[0] != b'Q' {
+                            continue;
+                        }
+                        if body.starts_with(stall_on.as_bytes()) {
+                            let mut ignored = [0_u8; 1024];
+                            while matches!(socket.read(&mut ignored).await, Ok(read) if read > 0) {}
+                            return;
+                        }
+                        if socket.write_all(&READY).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        addr
+    }
+
+    /// A pooled connection is reset before it is lent again. Before the reset
+    /// had a time limit, a connection that stopped answering held that reset,
+    /// and the checkout, until TCP gave up on it, about 15 minutes; now the
+    /// pool drops it at the connect timeout and opens another.
+    #[tokio::test]
+    async fn a_pooled_connection_that_stops_answering_holds_up_a_checkout_no_longer_than_the_timeout()
+     {
+        let addr = server_that_stalls_on("ROLLBACK;").await;
+        let mut config = BettyRetrievalConfig::new(
+            format!("postgres://betty:betty@{addr}/stalled?sslmode=disable"),
+            std::path::PathBuf::from("models/granite-embedding-107m-multilingual.json"),
+        );
+        config.connect_timeout = std::time::Duration::from_millis(300);
+        let plugin = BettyRetrieval::with_embedder(config, Arc::new(StubEmbedder), stub_space())
+            .expect("with_embedder builds a plugin from a stub embedder");
+        plugin
+            .start()
+            .await
+            .expect("start must not need the database");
+        drop(
+            store::checkout(&plugin)
+                .await
+                .expect("the server answers a new connection's setup"),
+        );
+        let again =
+            tokio::time::timeout(std::time::Duration::from_secs(5), store::checkout(&plugin))
+                .await
+                .expect("a checkout must give up on a pooled connection that stopped answering");
+        assert!(
+            again.is_ok(),
+            "the pool must open a new connection in place of the silent one, got {:?}",
+            again.err()
+        );
+    }
+
+    #[test]
+    fn every_step_of_a_checkout_is_held_to_the_connect_timeout() {
+        let mut config = stub_config();
+        config.connect_timeout = std::time::Duration::from_secs(7);
+        let pg_config: tokio_postgres::Config = config
+            .database_url
+            .parse()
+            .expect("the dummy url parses as a postgres config");
+        let manager = Manager::from_config(
+            pg_config,
+            tokio_postgres::NoTls,
+            ManagerConfig {
+                recycling_method: RecyclingMethod::Fast,
+            },
+        );
+        let timeouts = build_pool(manager, &config)
+            .expect("the pool builds")
+            .timeouts();
+        let limit = Some(std::time::Duration::from_secs(7));
+        assert_eq!(timeouts.wait, limit, "waiting for a free connection");
+        assert_eq!(timeouts.create, limit, "opening a new connection");
+        assert_eq!(
+            timeouts.recycle, limit,
+            "resetting a pooled connection before it is lent again"
         );
     }
 

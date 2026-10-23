@@ -5,7 +5,6 @@ use std::sync::Arc;
 
 use futures::TryStreamExt as _;
 use tokio::sync::{Mutex, OwnedSemaphorePermit};
-use tokio_postgres::types::{FromSql, Type};
 use wasmtime::component::{Accessor, FutureReader, Resource, StreamReader};
 
 use crate::engine::ctx::{ActiveCtx, SharedCtx};
@@ -14,6 +13,8 @@ use super::bindings::betty_blocks::retrieval::store::{HostTransaction, HostTrans
 use super::bindings::betty_blocks::retrieval::types;
 use super::bindings::conversions::row_to_values;
 use super::bindings::wasmcloud::postgres::types::Row;
+use super::cancel::Canceller;
+use super::cost;
 use super::params::{self, Bound};
 use super::store::{QueryResult, caller, checkout};
 use super::{BettyRetrieval, errors};
@@ -28,8 +29,10 @@ pub struct TxHandle {
 struct TxConn {
     /// `None` once `commit` or the resource's drop has ended the transaction.
     client: Option<deadpool_postgres::Object>,
-    /// One of the workload's permits, held for as long as the transaction.
-    _share: OwnedSemaphorePermit,
+    /// One of the workload's permits, held for as long as the transaction;
+    /// `None` once handed to the canceller.
+    share: Option<OwnedSemaphorePermit>,
+    canceller: Canceller,
     /// Why the transaction can no longer commit: the first database error, or
     /// a statement cancelled before it finished.
     aborted: Option<String>,
@@ -64,10 +67,15 @@ impl TxConn {
 }
 
 impl Drop for TxConn {
-    // No ROLLBACK here: that needs a spawned task, which a shutting-down
-    // runtime can drop unpolled, pooling the connection mid-transaction.
+    // Dropped still holding its connection, the transaction may be in the
+    // middle of a statement: the canceller asks the server to cancel it, then
+    // closes the connection, which ends the transaction. No ROLLBACK here: the
+    // canceller's task, which a shutting-down runtime can drop unpolled, never
+    // pools the connection.
     fn drop(&mut self) {
-        self.detach();
+        if let Some(client) = self.client.take() {
+            self.canceller.close(client, self.share.take());
+        }
     }
 }
 
@@ -135,13 +143,18 @@ pub(crate) async fn begin(
     plugin: &BettyRetrieval,
     workload: &Arc<str>,
 ) -> Result<TxHandle, types::Error> {
+    let canceller = plugin
+        .canceller()
+        .map_err(|e| errors::connection_failed(format!("{e:#}")))?
+        .clone();
     let share = plugin.shares().acquire(workload).await?;
     let client = checkout(plugin).await?;
     // Built before `BEGIN` is sent, so a call cancelled awaiting the reply
     // leaves `TxConn`'s drop to close the possibly open transaction.
     let conn = TxConn {
         client: Some(client),
-        _share: share,
+        share: Some(share),
+        canceller,
         aborted: None,
     };
     conn.client()?
@@ -174,66 +187,99 @@ async fn prepare_checked(
     Ok(stmt)
 }
 
-/// A column's length on the wire, read without decoding it.
-struct WireLen(usize);
-
-impl<'a> FromSql<'a> for WireLen {
-    fn from_sql(_: &Type, raw: &'a [u8]) -> Result<Self, Box<dyn std::error::Error + Sync + Send>> {
-        Ok(Self(raw.len()))
-    }
-
-    fn from_sql_null(_: &Type) -> Result<Self, Box<dyn std::error::Error + Sync + Send>> {
-        Ok(Self(0))
-    }
-
-    fn accepts(_: &Type) -> bool {
-        true
-    }
-}
-
-/// How many bytes of row data `row` came with.
-fn wire_len(row: &tokio_postgres::Row) -> usize {
-    (0..row.len())
-        .map(|i| row.try_get::<_, WireLen>(i).map_or(0, |len| len.0))
-        .sum()
-}
+/// The most rows one transaction query may read, whatever their bytes.
+pub(crate) const TRANSACTION_QUERY_MAX_ROWS: usize = 1_000_000;
 
 /// Why [`read_capped`] stopped.
+#[derive(Debug)]
 enum ReadError {
     Database(tokio_postgres::Error),
     /// The rows came to more than the cap.
     TooLarge,
+    /// More than [`TRANSACTION_QUERY_MAX_ROWS`] rows.
+    TooManyRows,
 }
 
-/// Every row of `stmt`, until they come to more than `max_bytes`.
+/// What one transaction query's rows have cost so far, against its caps.
+struct Budget {
+    max_bytes: usize,
+    bytes: usize,
+    rows: usize,
+}
+
+impl Budget {
+    fn new(max_bytes: usize) -> Self {
+        Self {
+            max_bytes,
+            bytes: 0,
+            rows: 0,
+        }
+    }
+
+    /// Count one more row, which costs `cost` decoded (see [`cost::row_cost`]).
+    fn charge(&mut self, cost: usize) -> Result<(), ReadError> {
+        self.rows += 1;
+        self.bytes = self.bytes.saturating_add(cost);
+        if self.rows > TRANSACTION_QUERY_MAX_ROWS {
+            Err(ReadError::TooManyRows)
+        } else if self.bytes > self.max_bytes {
+            Err(ReadError::TooLarge)
+        } else {
+            Ok(())
+        }
+    }
+}
+
+/// The rows of a query, decoded for the guest, and the first column that would
+/// not decode.
+struct Collected {
+    rows: Vec<Row>,
+    /// Reading goes on past a value that will not decode, so the statement
+    /// finishes and the transaction stays usable; the rows are not kept.
+    conversion_error: Option<String>,
+}
+
+/// Every row of `stmt`, decoded as it arrives, until they cost more than
+/// `max_bytes` or number more than [`TRANSACTION_QUERY_MAX_ROWS`]. A row costs
+/// what it decodes to (see [`cost::row_cost`]), which is checked before it is
+/// decoded, so rows of NULLs count too, and so does a `text[]` of empty
+/// strings. The row as it came off the wire is dropped once decoded: only the
+/// decoded rows, which the budget counts, are held.
 async fn read_capped(
     client: &deadpool_postgres::Object,
     stmt: &tokio_postgres::Statement,
     bound: &[Bound],
     max_bytes: usize,
-) -> Result<Vec<tokio_postgres::Row>, ReadError> {
+) -> Result<Collected, ReadError> {
     let stream = client
         .query_raw(stmt, params::as_sql(bound))
         .await
         .map_err(ReadError::Database)?;
     let mut stream = std::pin::pin!(stream);
-    let mut rows = Vec::new();
-    let mut bytes = 0_usize;
+    let mut collected = Collected {
+        rows: Vec::new(),
+        conversion_error: None,
+    };
+    let mut budget = Budget::new(max_bytes);
     while let Some(row) = stream.try_next().await.map_err(ReadError::Database)? {
-        bytes = bytes.saturating_add(wire_len(&row));
-        if bytes > max_bytes {
-            return Err(ReadError::TooLarge);
+        budget.charge(cost::row_cost(&row))?;
+        if collected.conversion_error.is_some() {
+            continue;
         }
-        rows.push(row);
+        match row_to_values(&row) {
+            Ok(values) => collected.rows.push(values),
+            Err(e) => collected.conversion_error = Some(e),
+        }
     }
-    Ok(rows)
+    Ok(collected)
 }
 
 /// Every row, read before returning: rows streamed lazily would keep the
 /// pinned connection busy, and a `commit` would wait behind them. So the rows
-/// are capped: a result larger than the plugin's limit fails the query, and
-/// the transaction can no longer commit, since a statement such as
-/// `UPDATE ... RETURNING` may have changed rows the guest never saw.
+/// are capped, by what they cost the host and by their number: a result over
+/// either cap fails the query, and the transaction can no longer commit,
+/// since a statement such as `UPDATE ... RETURNING` may have changed rows the
+/// guest never saw.
 async fn collect_query(
     plugin: &BettyRetrieval,
     workload: &Arc<str>,
@@ -247,8 +293,8 @@ async fn collect_query(
     let stmt = prepare_checked(client, aborted, sql, &bound).await?;
     let guard = StatementGuard::arm(aborted);
     let max_bytes = plugin.transaction_query_max_bytes();
-    let rows = match read_capped(client, &stmt, &bound, max_bytes).await {
-        Ok(rows) => rows,
+    let collected = match read_capped(client, &stmt, &bound, max_bytes).await {
+        Ok(collected) => collected,
         Err(ReadError::Database(e)) => return guard.finish(Err(e)),
         Err(ReadError::TooLarge) => {
             let reason = format!(
@@ -258,18 +304,25 @@ async fn collect_query(
             guard.refuse(&reason);
             return Err(errors::other(reason));
         }
+        Err(ReadError::TooManyRows) => {
+            let reason = format!(
+                "the query has more than {TRANSACTION_QUERY_MAX_ROWS} rows, the limit for one \
+                 transaction query; select fewer rows, or read them in pieces"
+            );
+            guard.refuse(&reason);
+            return Err(errors::other(reason));
+        }
     };
-    let rows = guard.finish(Ok::<_, tokio_postgres::Error>(rows))?;
+    let collected = guard.finish(Ok::<_, tokio_postgres::Error>(collected))?;
+    if let Some(e) = collected.conversion_error {
+        return Err(errors::value_conversion(e));
+    }
     let columns = stmt
         .columns()
         .iter()
         .map(|c| c.name().to_string())
         .collect();
-    let rows = rows
-        .iter()
-        .map(|row| row_to_values(row).map_err(errors::value_conversion))
-        .collect::<Result<_, _>>()?;
-    Ok((columns, rows))
+    Ok((columns, collected.rows))
 }
 
 async fn run_execute(
@@ -413,6 +466,52 @@ mod tests {
             StatementGuard::arm(&mut aborted).finish(Ok::<_, tokio_postgres::Error>(7_u64));
         assert!(matches!(outcome, Ok(7)));
         assert_eq!(aborted, None);
+    }
+
+    /// Rows of one NULL each used to cost nothing, so no number of them ever
+    /// reached the cap.
+    #[test]
+    fn rows_of_nulls_reach_the_cap() {
+        let mut budget = Budget::new(1024);
+        let null_row = cost::cost(1, 0);
+        let fit = 1024 / null_row;
+        for _ in 0..fit {
+            budget.charge(null_row).expect("within the cap");
+        }
+        assert!(matches!(budget.charge(null_row), Err(ReadError::TooLarge)));
+    }
+
+    #[test]
+    fn more_rows_than_the_row_cap_are_refused_whatever_their_bytes() {
+        let mut budget = Budget::new(usize::MAX);
+        for _ in 0..TRANSACTION_QUERY_MAX_ROWS {
+            budget.charge(0).expect("within the row cap");
+        }
+        assert!(matches!(budget.charge(0), Err(ReadError::TooManyRows)));
+    }
+
+    /// `SELECT array_fill(''::text, ARRAY[15000000])` is 60 MB on the wire,
+    /// under the 64 MiB cap, and 360 MB decoded.
+    #[test]
+    fn a_row_that_is_small_on_the_wire_and_large_decoded_reaches_the_cap() {
+        let count = 15_000_000_usize;
+        let wire_only = cost::cost(1, 20 + 4 * count);
+        let mut budget = Budget::new(64 * 1024 * 1024);
+        budget
+            .charge(wire_only)
+            .expect("counted by its wire bytes it fits");
+        let mut raw = vec![0_u8; 20 + 4 * count];
+        raw[0..4].copy_from_slice(&1_i32.to_be_bytes());
+        raw[8..12].copy_from_slice(&25_u32.to_be_bytes());
+        raw[12..16].copy_from_slice(&i32::try_from(count).unwrap().to_be_bytes());
+        raw[16..20].copy_from_slice(&1_i32.to_be_bytes());
+        let decoded = cost::cost(
+            1,
+            cost::column_bytes(&tokio_postgres::types::Type::TEXT_ARRAY, &raw),
+        );
+        assert!(decoded >= count * size_of::<String>());
+        let mut budget = Budget::new(64 * 1024 * 1024);
+        assert!(matches!(budget.charge(decoded), Err(ReadError::TooLarge)));
     }
 
     #[test]

@@ -60,9 +60,11 @@ pub struct BettyRetrievalConfig {
     /// `None` is half the pool, and at least one: several applications share
     /// a host, and one that holds every connection stops all the others.
     pub connections_per_workload: Option<usize>,
-    /// The most row data one `transaction.query` may read, in bytes as they
-    /// came over the wire. A transaction's rows are read before the call
-    /// returns, so without a cap one query could use up the host's memory.
+    /// How much one `transaction.query` may read, in bytes as the host holds
+    /// the rows: their bytes as they came over the wire, plus a fixed amount
+    /// for each row and each value (see `cost.rs`). A transaction's rows are
+    /// read before the call returns, so without a cap one query could use up
+    /// the host's memory.
     pub transaction_query_max_bytes: usize,
     /// The most texts one statement may ask the model to embed, counted over
     /// all of its `embed-text` and `embed-texts` parameters.
