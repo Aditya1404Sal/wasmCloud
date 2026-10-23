@@ -18,13 +18,20 @@ use crate::engine::ctx::{ActiveCtx, SharedCtx, extract_active_ctx};
 use super::bindings::betty_blocks::retrieval::{store, types};
 use super::bindings::conversions::row_to_values;
 use super::bindings::wasmcloud::postgres::types::Row;
+use super::cancel::Canceller;
+use super::cost::{self, RowBuffer};
 use super::params::{self, Bound};
 use super::tx::{self, TxHandle};
 use super::{BettyRetrieval, PLUGIN_BETTY_RETRIEVAL_ID, SpaceInfo, errors};
 
 /// How many fetched rows may wait between the fetch task and the guest before
-/// the task stops reading, bounding host memory.
+/// the task stops reading. Together they may cost at most
+/// [`cost::ROW_BUFFER_MAX_BYTES`], and one at most [`cost::ROW_MAX_BYTES`].
 const ROW_CHANNEL_CAPACITY: usize = 16;
+
+/// A fetched row on its way to the guest, holding its room in the query's
+/// [`RowBuffer`] until the guest takes it.
+type Buffered = (Row, OwnedSemaphorePermit);
 
 /// A statement's column names, its rows, and the outcome of fetching them.
 pub(crate) type QueryResult = (
@@ -62,22 +69,31 @@ pub(crate) async fn checkout(
 /// its end, rows that could not be decoded) it is closed instead: the server
 /// may still be running the statement or sending its rows, and whoever
 /// borrowed the connection next, from any workload, would wait behind them.
+/// The server is asked to cancel the statement first, and the connection
+/// keeps its place in the pool until it has (see [`Canceller`]).
 ///
 /// It also holds one of its workload's permits, given back with it.
 struct Lent {
     /// `None` once given back.
     client: Option<deadpool_postgres::Client>,
-    _share: OwnedSemaphorePermit,
+    /// `None` once given back or handed to the canceller.
+    share: Option<OwnedSemaphorePermit>,
+    canceller: Canceller,
 }
 
 impl Lent {
     /// One of `workload`'s permits first, so a workload over its share waits
     /// without taking a connection the others could use.
     async fn checkout(plugin: &BettyRetrieval, workload: &Arc<str>) -> Result<Self, types::Error> {
+        let canceller = plugin
+            .canceller()
+            .map_err(|e| errors::connection_failed(format!("{e:#}")))?
+            .clone();
         let share = plugin.shares().acquire(workload).await?;
         Ok(Self {
             client: Some(checkout(plugin).await?),
-            _share: share,
+            share: Some(share),
+            canceller,
         })
     }
 
@@ -96,7 +112,7 @@ impl Lent {
 impl Drop for Lent {
     fn drop(&mut self) {
         if let Some(client) = self.client.take() {
-            drop(deadpool_postgres::Object::take(client));
+            self.canceller.close(client, self.share.take());
         }
     }
 }
@@ -104,7 +120,7 @@ impl Drop for Lent {
 /// A statement's columns, and the channels its fetch task feeds.
 struct Streaming {
     columns: Vec<String>,
-    rows: mpsc::Receiver<Row>,
+    rows: mpsc::Receiver<Buffered>,
     done: oneshot::Receiver<Result<(), types::Error>>,
 }
 
@@ -161,18 +177,25 @@ async fn prepare_checked(
 /// Fetch every row into `row_tx`. The connection goes back to the pool once
 /// the server has ended the statement; a stream that stops early, because the
 /// guest dropped it or a row could not be decoded, drops `lent` and closes it.
+/// A dropped stream is noticed at once, even while the server is still
+/// working on the next row.
 ///
 /// A guest that reads no row for `read_pause` (one that awaits the result
 /// before reading the rows, say) would otherwise hold its connection, and a
 /// permit of its share, for as long as it lived. The query is ended instead,
 /// and the result says why.
+///
+/// The rows waiting for the guest are held to [`cost::ROW_BUFFER_MAX_BYTES`]
+/// together, and a row over [`cost::ROW_MAX_BYTES`] ends the query before it
+/// is decoded.
 async fn drain_query(
     lent: Lent,
     stmt: tokio_postgres::Statement,
     bound: Vec<Bound>,
-    row_tx: mpsc::Sender<Row>,
+    row_tx: mpsc::Sender<Buffered>,
     read_pause: Option<std::time::Duration>,
 ) -> Result<(), types::Error> {
+    let buffer = RowBuffer::new();
     let rows = match lent
         .client()?
         .query_raw(&stmt, params::as_sql(&bound))
@@ -186,19 +209,35 @@ async fn drain_query(
     };
     let mut rows = std::pin::pin!(rows);
     loop {
-        match rows.try_next().await {
+        let next = tokio::select! {
+            next = rows.try_next() => next,
+            // The guest dropped the stream.
+            () = row_tx.closed() => return Ok(()),
+        };
+        match next {
             Ok(Some(row)) => {
+                let cost = cost::row_cost(&row);
+                if cost > cost::ROW_MAX_BYTES {
+                    return Err(errors::other(format!(
+                        "a row of the query is larger than {} bytes, the most one row may be; \
+                         select less of it, or read it in pieces",
+                        cost::ROW_MAX_BYTES
+                    )));
+                }
                 let values = row_to_values(&row).map_err(errors::value_conversion)?;
+                drop(row);
+                let deliver = async {
+                    let room = buffer.reserve(cost).await.map_err(|_| ())?;
+                    row_tx.send((values, room)).await.map_err(|_| ())
+                };
                 let sent = match read_pause {
-                    Some(pause) => tokio::time::timeout(pause, row_tx.send(values))
-                        .await
-                        .map_err(|_| {
-                            errors::other(format!(
-                                "no row of the query was read for {pause:?}, so the host ended \
-                                 it; read the rows before awaiting the result"
-                            ))
-                        })?,
-                    None => row_tx.send(values).await,
+                    Some(pause) => tokio::time::timeout(pause, deliver).await.map_err(|_| {
+                        errors::other(format!(
+                            "no row of the query was read for {pause:?}, so the host ended it; \
+                             read the rows before awaiting the result"
+                        ))
+                    })?,
+                    None => deliver.await,
                 };
                 if sent.is_err() {
                     // The guest dropped the stream.
@@ -218,11 +257,12 @@ async fn drain_query(
     }
 }
 
-/// Forwards rows from the fetch task's channel to the guest, one per poll.
+/// Forwards rows from the fetch task's channel to the guest, one per poll,
+/// giving back each row's room in the query's buffer as the guest takes it.
 /// The stream ends when the channel closes; the completion future carries
 /// the outcome.
 struct RowStreamProducer {
-    rows: mpsc::Receiver<Row>,
+    rows: mpsc::Receiver<Buffered>,
 }
 
 impl<D: 'static> StreamProducer<D> for RowStreamProducer {
@@ -245,7 +285,7 @@ impl<D: 'static> StreamProducer<D> for RowStreamProducer {
             return Poll::Ready(Ok(StreamResult::Completed));
         }
         match this.rows.poll_recv(cx) {
-            Poll::Ready(Some(row)) => {
+            Poll::Ready(Some((row, _room))) => {
                 dst.set_buffer(Some(row));
                 Poll::Ready(Ok(StreamResult::Completed))
             }

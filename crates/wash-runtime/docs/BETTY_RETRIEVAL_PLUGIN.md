@@ -45,14 +45,14 @@ wash built without the feature refuses a config that sets any
 | `--retrieval-ca-file` | `WASH_RETRIEVAL_CA_FILE` | none | A PEM file of CA certificates to trust for the database's TLS, beside the public roots. In `wash dev`, a relative path is read from the project directory. |
 | `--retrieval-pool-size` | `WASH_RETRIEVAL_POOL_SIZE` | 8 | Connections in the pool. A transaction a component holds pins one. |
 | `--retrieval-connections-per-workload` | `WASH_RETRIEVAL_CONNECTIONS_PER_WORKLOAD` | half the pool, at least 1 | How many connections one workload may hold at a time: one statement, a query's rows or a whole transaction each hold one. A workload over its share waits up to the connect timeout and then gets `pool-exhausted`, while the other workloads go on. At most the pool size. |
-| `--retrieval-connect-timeout-secs` | `WASH_RETRIEVAL_CONNECT_TIMEOUT_SECS` | 10 | How long a checkout waits for a free connection, after which the component gets `pool-exhausted`, and how long a new connection may take to open. |
+| `--retrieval-connect-timeout-secs` | `WASH_RETRIEVAL_CONNECT_TIMEOUT_SECS` | 10 | How long a checkout waits for a free connection, after which the component gets `pool-exhausted`, how long a new connection may take to open or a pooled one to be reset, and how long the server may take to end a statement the component dropped. |
 | `--retrieval-ef-search` | `WASH_RETRIEVAL_EF_SEARCH` | 200 | `hnsw.ef_search`, set on every pooled connection. |
 | `--retrieval-max-scan-tuples` | `WASH_RETRIEVAL_MAX_SCAN_TUPLES` | 20000 | `hnsw.max_scan_tuples`, likewise. |
 | `--retrieval-embed-threads` | `WASH_RETRIEVAL_EMBED_THREADS` | 4 | Threads one embedding uses. |
 | `--retrieval-embed-max-texts` | `WASH_RETRIEVAL_EMBED_MAX_TEXTS` | 1000 | The most texts one statement may embed, over all of its `embed-text` and `embed-texts` parameters. More is `invalid-params`, before anything is embedded. |
 | `--retrieval-embed-max-text-bytes` | `WASH_RETRIEVAL_EMBED_MAX_TEXT_BYTES` | 65536 (64 KiB) | The longest text a statement may embed. A longer one is `invalid-params`, named by its SHA-256. The model reads only the first `max_sequence` tokens of a text anyway. |
 | `--retrieval-statement-timeout-secs` | `WASH_RETRIEVAL_STATEMENT_TIMEOUT_SECS` | 30 | `statement_timeout` on every pooled connection: the server cancels a statement that runs longer, and the component gets SQLSTATE 57014. 0 turns it off. |
-| `--retrieval-transaction-query-max-bytes` | `WASH_RETRIEVAL_TRANSACTION_QUERY_MAX_BYTES` | 67108864 (64 MiB) | The most row data one `transaction.query` may read. A transaction's rows are read before the call returns, so a larger result fails that query with `other`, and the transaction can no longer commit. |
+| `--retrieval-transaction-query-max-bytes` | `WASH_RETRIEVAL_TRANSACTION_QUERY_MAX_BYTES` | 67108864 (64 MiB) | How much one `transaction.query` may read, counted as an upper bound of what the host holds once the rows are decoded, not their bytes on the wire: 96 bytes for each row and 96 for each value, so rows of NULLs count too, plus each value's decoded size. A `text[]` member costs 24 bytes (a `String`) and a `varchar[]` member 32, on top of their characters, where the wire has 4 bytes for an empty one (`SELECT array_fill(''::text, ARRAY[15000000])` is 60 MB on the wire and 360 MB decoded, and fails); the member count is read from the array's header. A `numeric` costs the characters it prints (`1e131071` is 10 wire bytes and 131,072 characters). A `json` or `jsonb` costs 10 times its wire bytes, a fixed factor for the tree the host builds to decode it, not a bound: a document of nothing but `[1],[1],...` builds more. Text, numbers, bytes and dates cost what they did. A transaction's rows are read before the call returns, so a larger result, or one of more than 1,000,000 rows, fails that query with `other`, and the transaction can no longer commit. |
 | `--retrieval-idle-in-transaction-timeout-secs` | `WASH_RETRIEVAL_IDLE_IN_TRANSACTION_TIMEOUT_SECS` | 60 | `idle_in_transaction_session_timeout` on every pooled connection: the server ends a session that waits inside a transaction longer, which releases the transaction's locks. 0 turns it off. |
 
 The plugin is configured only by the host. A workload that puts config on its
@@ -86,7 +86,8 @@ does not print the variable's value, and the structs that hold the url print
   failed, cleans the session (settings, cursors, temporary tables, advisory
   locks, listeners) and applies its own settings again. That costs one round
   trip for each checkout. A connection whose statement was cancelled, or whose
-  rows were not read to the end, is closed instead of pooled. And no workload
+  rows were not read to the end, is closed instead of pooled, once the server
+  has cancelled the statement (see below). And no workload
   may hold more than its share of the pool (half of it by default), so one
   application that holds or leaks connections cannot stop the others.
 
@@ -118,6 +119,9 @@ plugin copies that descriptor into `<cache>/<name>/`, then makes sure both
 files are there with the pinned digests, downloading each from the
 descriptor's `source.base_url` (or from `--retrieval-model-mirror`) when it
 is missing or does not match. A named descriptor must pin both digests.
+Each file has 10 minutes in all to arrive, whatever its speed, so a download
+slower than about 0.7 MB/s (430 MB in 600 seconds) fails and the next start
+tries again. That total deadline is known and not changed.
 
 By name needs a writable cache directory even when every file is already
 there, because the descriptor is written into it on each start. A download
@@ -237,11 +241,17 @@ when the host starts; its pool connects at the first statement. While the
 database is down, or refuses the plugin's role, every statement answers
 `connection-failed`. Each step of a checkout is held to the connect timeout
 (`--retrieval-connect-timeout-secs`, 10 seconds unless set): the wait for the
-workload's share and a free connection, opening a new connection, and setting
+workload's share and a free connection, opening a new connection, setting
 up its session, which a server that stops answering after the handshake
-would otherwise hold for ever. So a statement can take a few times the connect
-timeout to fail, never longer. `space` still answers, because it comes from
-the model. A later statement works once the
+would otherwise hold for ever, and resetting a pooled connection before it is
+lent again: one that does not answer the reset in time is dropped, and the
+next one is tried or a new one opened. TCP keepalives (after 30 seconds of
+quiet, then every 10 seconds, 3 probes) and, on Linux, a 60-second TCP user
+timeout close a connection the network dropped without a word within about a
+minute, where TCP alone takes 15 minutes or more; the url's
+`keepalives_idle`, `keepalives_interval`, `keepalives_retries` and
+`tcp_user_timeout` win over these. `space` still answers, because it comes
+from the model. A later statement works once the
 database is back, with no host restart.
 
 So a wrong database url or password no longer stops the host: it shows as
@@ -267,9 +277,49 @@ same statement limit applies to a query's rows outside a transaction: if a
 component reads none of them for that long (it awaits the result before it
 reads the rows, say), the plugin ends the query, closes its connection and
 answers the result with `other`, naming the cause. Raise
-or turn off either limit with the two settings above. A component that stops
-waiting closes its connection, but Postgres may run the statement on until it
-finishes, reaches the time limit, or next writes to the closed connection.
+or turn off either limit with the two settings above.
+
+**A statement a component stops waiting for is cancelled.** When a component
+drops a call, or a query's rows before the last, or a transaction in the
+middle of a statement, the plugin asks Postgres to cancel the statement and
+then closes the connection. Until the server has ended the statement, for the
+connect timeout at most, the connection keeps its place in the pool and in
+the workload's share: closing it alone would leave Postgres running the
+statement on a session nothing counts, and a loop of dropped calls could fill
+the server's `max_connections`. If the server does not confirm in time, the
+plugin logs `retrieval_cancel_unconfirmed` and closes the connection anyway.
+Known: a component that drops a query's stream right after reading its last
+row can beat the plugin's own sight of the end of the rows, and the plugin
+then cancels a statement that had already finished, a needless cancel and a
+connection closed and replaced. It is harmless to the data, and not changed.
+
+**A transaction held open on purpose.** A consumer that keeps a transaction
+open longer than the idle-in-transaction limit on purpose, such as a lock held
+for a whole sync while it fetches, should raise the limit for that
+transaction alone: `SET LOCAL idle_in_transaction_session_timeout = '<time>'`
+as its first statement. Otherwise the server ends the session after 60
+seconds, and with it the lock. The reset before the connection is lent again
+puts the host's limit back. The Genius context provider does this itself on
+its lock transactions: it sets 1200 seconds (20 minutes), from its
+`RETRIEVAL_LOCK_IDLE_TIMEOUT_SECS`, so the host's 60 seconds does not end a
+sync's lock.
+
+**Size the pool for the consumer's peak.** A workload holds one connection
+for each statement it is running, each query whose rows it has not read to the
+end and each open transaction, up to its share
+(`--retrieval-connections-per-workload`, half the pool unless set); one more
+waits up to the connect timeout and fails with `pool-exhausted`. Set the pool
+size and the share to the most connections the consumer holds at once. The
+Genius context provider holds at most 2 for each sync it runs: its sync lock,
+and its statements on the same connection (its ingest lock is a savepoint on
+the sync lock's connection, not a connection of its own). The peak is
+2 x `RETRIEVAL_SYNC_CONCURRENCY` (default 1) x the component's warm instance
+count (`poolSize`, 4 on edge), plus 2 for each sync running in a one-call
+store that overflows the pool. One workload runs the syncs of every
+application, so with the defaults (a pool of 8, a share of 4) a second sync at
+the same time can already wait. For the Genius host group set
+`WASH_RETRIEVAL_POOL_SIZE=16` and
+`WASH_RETRIEVAL_CONNECTIONS_PER_WORKLOAD=12`.
 
 **TLS.** With `sslmode=require`, `verify-ca` or `verify-full` in the database
 url, the plugin connects with TLS and verifies the server's certificate chain
@@ -301,6 +351,20 @@ next statement waits for its last embedding to end, while other workloads go
 on. A statement whose call is cancelled stops embedding before its next
 text, and the two caps above keep one statement from holding the model for
 long.
+
+**How many rows the host holds.** Outside a transaction, a query's rows are
+read from the server as the component reads them: at most 16 wait in
+between, costing at most 64 MiB together, counted as for
+`--retrieval-transaction-query-max-bytes` above. A row's cost is checked
+before it is decoded, and the row as it came off the wire is dropped once
+it is. A single row that costs
+more than 64 MiB fails its query with `other` before the component gets it,
+and the next statement runs as usual. The host has the whole row in memory
+by then (Postgres sends each row whole, and a value can be up to 1 GB). The
+bound is for each running statement, so a workload can hold up to its share of
+such rows at once, one for each connection it may use. Inside a transaction, the query's rows are all
+read before the call returns, so they are held to the cap above and to
+1,000,000 rows.
 
 **What a component can and cannot read.** Rows come back as
 `wasmcloud:postgres` `pg-value`s. A column with no `pg-value`, such as

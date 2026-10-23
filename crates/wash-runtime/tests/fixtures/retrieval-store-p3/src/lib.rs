@@ -52,6 +52,13 @@
 //!     then its `commit`. The test sets a 1 KiB cap.
 //!   - `/unread-rows` — a query's completion awaited before its rows are read,
 //!     then the next statement on the pool. The test sets a 1 s time limit.
+//!   - `/cancel-loop` — statements that sleep, each dropped mid-flight (a
+//!     cancelled `execute`, or a query stream dropped after its first row),
+//!     and after each one how many sessions still run such a statement.
+//!   - `/null-rows-transaction-query` — a transaction's query of 100 rows that
+//!     hold only a NULL, then its `commit`. The test sets a 1 KiB cap.
+//!   - `/oversized-row` — a query whose one row holds 64 MiB, then the next
+//!     statement on the pool.
 //!
 //! The test runs the plugin with a pool of one connection, so the statements a
 //! route runs share one Postgres session unless the plugin replaced it; two for
@@ -118,6 +125,9 @@ async fn run(path: &str) -> Result<String, String> {
         "/wrong-scalar-type" => wrong_scalar_type().await,
         "/oversized-transaction-query" => oversized_transaction_query().await,
         "/unread-rows" => unread_rows().await,
+        "/cancel-loop" => cancel_loop().await,
+        "/null-rows-transaction-query" => null_rows_transaction_query().await,
+        "/oversized-row" => oversized_row().await,
         other => Err(format!("no route {other}")),
     }
 }
@@ -659,6 +669,52 @@ async fn oversized_transaction_query() -> Result<String, String> {
     ))
 }
 
+/// Rows of nothing but a NULL bring no value bytes, which a cap that counted
+/// only those let through however many there were.
+async fn null_rows_transaction_query() -> Result<String, String> {
+    let tx = begin().await?;
+    let refused = match tx
+        .query(
+            "SELECT NULL FROM generate_series(1, 100)".to_string(),
+            Vec::new(),
+        )
+        .await
+    {
+        Err(Error::Postgres(PgError::Other(message))) => message,
+        Err(other) => return Err(format!("the query failed with {other:?}")),
+        Ok(_) => return Err("the query answered its rows".to_string()),
+    };
+    Ok(format!(
+        "query={refused} commit={}",
+        failed_commit(tx).await?
+    ))
+}
+
+/// One row of 64 MiB: the host would hold it, and as many more as wait for
+/// the guest, before the guest read any.
+async fn oversized_row() -> Result<String, String> {
+    let (_columns, mut stream, completion) = store::query(
+        "SELECT repeat('x', 64 * 1024 * 1024)".to_string(),
+        Vec::new(),
+    )
+    .await
+    .map_err(debug)?;
+    let mut delivered = 0;
+    while stream.next().await.is_some() {
+        delivered += 1;
+    }
+    let outcome = match completion.await {
+        Err(Error::Postgres(PgError::Other(message))) => message,
+        other => {
+            return Err(format!(
+                "the completion answered {other:?} after {delivered} rows"
+            ))
+        }
+    };
+    let after = integer(only(&rows("SELECT 1", Vec::new()).await?)?)?;
+    Ok(format!("rows={delivered} done={outcome} then={after}"))
+}
+
 /// Awaits the completion first: the rows past the stream's buffer then wait
 /// for a reader that never comes.
 async fn unread_rows() -> Result<String, String> {
@@ -675,6 +731,60 @@ async fn unread_rows() -> Result<String, String> {
     drop(stream);
     let after = integer(only(&rows("SELECT 1", Vec::new()).await?)?)?;
     Ok(format!("done={outcome} then={after}"))
+}
+
+/// Marks the statements `/cancel-loop` drops, so that sessions still running
+/// one can be counted.
+const CANCEL_LOOP_MARKER: &str = "betty-it-cancel-loop";
+
+/// How many statements `/cancel-loop` drops.
+const CANCEL_LOOP_ROUNDS: usize = 6;
+
+/// Each round drops a statement that would run for half a minute: an
+/// `execute` cancelled once the timer fires, or, every other round, a query
+/// stream dropped after its first row while the server still has rows to
+/// make. Then it counts the sessions that are still running such a
+/// statement: a dropped statement the server goes on running holds a session
+/// outside the pool and the workload's share.
+async fn cancel_loop() -> Result<String, String> {
+    let mut running = Vec::new();
+    for round in 0..CANCEL_LOOP_ROUNDS {
+        if round % 2 == 0 {
+            let statement = Box::pin(store::execute(
+                format!("SELECT pg_sleep(30) /* {CANCEL_LOOP_MARKER} */"),
+                Vec::new(),
+            ));
+            let timer = Box::pin(monotonic_clock::wait_for(CANCEL_AFTER_NS));
+            if let Either::Left((finished, _)) = select(statement, timer).await {
+                return Err(format!(
+                    "pg_sleep finished before the timer fired: {finished:?}"
+                ));
+            }
+        } else {
+            let (_columns, mut stream, completion) = store::query(
+                // Each row fills Postgres's 8 KB send buffer, so it is sent as
+                // soon as it is made rather than with the next 8 KB.
+                format!(
+                    "SELECT repeat('x', 8192) || pg_sleep(0.05)::text \
+                     FROM generate_series(1, 600) /* {CANCEL_LOOP_MARKER} */"
+                ),
+                Vec::new(),
+            )
+            .await
+            .map_err(debug)?;
+            stream.next().await.ok_or("the query streamed no rows")?;
+            drop(stream);
+            drop(completion);
+        }
+        let still = rows(
+            "SELECT count(*) FROM pg_stat_activity \
+             WHERE state = 'active' AND strpos(query, $1) > 0 AND pid <> pg_backend_pid()",
+            vec![text(CANCEL_LOOP_MARKER)],
+        )
+        .await?;
+        running.push(integer(only(&still)?)?.to_string());
+    }
+    Ok(format!("running={}", running.join(",")))
 }
 
 /// Commit `tx`, expecting the database error an aborted transaction reports.

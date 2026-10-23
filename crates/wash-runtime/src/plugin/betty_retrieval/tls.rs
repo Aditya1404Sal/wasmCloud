@@ -2,6 +2,7 @@
 //! and TLS, which the plugin sets up itself.
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{Context as _, anyhow, bail};
 use rustls::pki_types::CertificateDer;
@@ -17,7 +18,8 @@ use url::Url;
 /// url first. `require`, `verify-ca` and `verify-full` all connect with TLS,
 /// and rustls always checks the certificate chain and the host name, so all
 /// three verify fully. The trust roots are the public web roots and, when
-/// one is given, a CA file.
+/// one is given, a CA file. The connection keeps itself alive (see
+/// [`KeepAlive`]).
 pub(crate) struct DatabaseConnection {
     pub(crate) pg: tokio_postgres::Config,
     /// `None` without TLS.
@@ -46,6 +48,13 @@ impl DatabaseConnection {
                 _ => true,
             })
             .collect();
+        let url_sets = |key: &str| kept.iter().any(|(set, _)| set == key);
+        let keep_alive = KeepAlive {
+            idle: !url_sets("keepalives_idle"),
+            interval: !url_sets("keepalives_interval"),
+            retries: !url_sets("keepalives_retries"),
+            user_timeout: !url_sets("tcp_user_timeout"),
+        };
         if kept.is_empty() {
             url.set_query(None);
         } else {
@@ -61,6 +70,7 @@ impl DatabaseConnection {
                 "database_url is not a connection string the postgres client accepts: {e}{cause}"
             )
         })?;
+        keep_alive.apply(&mut pg);
 
         let tls = match sslmode.as_deref() {
             None | Some("prefer" | "allow") => {
@@ -92,6 +102,40 @@ impl DatabaseConnection {
             None
         };
         Ok(Self { pg, tls })
+    }
+}
+
+/// TCP keepalives after 30 seconds of quiet, then every 10 seconds, giving up
+/// after 3 unanswered, and on Linux a 60-second TCP user timeout: a connection
+/// the network dropped without a word is noticed within about a minute,
+/// rather than when TCP gives up on it, about 15 minutes. Each applies unless
+/// the url sets its option.
+struct KeepAlive {
+    idle: bool,
+    interval: bool,
+    retries: bool,
+    user_timeout: bool,
+}
+
+impl KeepAlive {
+    const IDLE: Duration = Duration::from_secs(30);
+    const INTERVAL: Duration = Duration::from_secs(10);
+    const RETRIES: u32 = 3;
+    const USER_TIMEOUT: Duration = Duration::from_secs(60);
+
+    fn apply(&self, pg: &mut tokio_postgres::Config) {
+        if self.idle {
+            pg.keepalives_idle(Self::IDLE);
+        }
+        if self.interval {
+            pg.keepalives_interval(Self::INTERVAL);
+        }
+        if self.retries {
+            pg.keepalives_retries(Self::RETRIES);
+        }
+        if self.user_timeout {
+            pg.tcp_user_timeout(Self::USER_TIMEOUT);
+        }
     }
 }
 
@@ -242,6 +286,45 @@ mod tests {
         assert!(err.contains("missing.pem"), "{err}");
         DatabaseConnection::from_url(&with_root(&missing), Some(&ca))
             .expect("with the setting given, sslrootcert's file is not the one read");
+    }
+
+    /// TCP keepalives and, where the platform has it, a TCP user timeout find
+    /// a connection the network dropped without a word. Without them such a
+    /// connection is noticed only once TCP gives up, about 15 minutes.
+    #[test]
+    fn a_connection_the_network_drops_silently_is_noticed_within_a_minute() {
+        use std::time::Duration;
+        let pg = DatabaseConnection::from_url(&url(""), None)
+            .expect("a plain url parses")
+            .pg;
+        assert!(pg.get_keepalives());
+        assert_eq!(pg.get_keepalives_idle(), Duration::from_secs(30));
+        assert_eq!(pg.get_keepalives_interval(), Some(Duration::from_secs(10)));
+        assert_eq!(pg.get_keepalives_retries(), Some(3));
+        assert_eq!(pg.get_tcp_user_timeout(), Some(&Duration::from_secs(60)));
+    }
+
+    #[test]
+    fn keepalive_options_the_url_sets_win() {
+        use std::time::Duration;
+        let pg = DatabaseConnection::from_url(
+            &url(
+                "?keepalives_idle=7200&keepalives_interval=2&keepalives_retries=9&\
+                 tcp_user_timeout=5",
+            ),
+            None,
+        )
+        .expect("a url with keepalive options parses")
+        .pg;
+        assert_eq!(pg.get_keepalives_idle(), Duration::from_secs(7200));
+        assert_eq!(pg.get_keepalives_interval(), Some(Duration::from_secs(2)));
+        assert_eq!(pg.get_keepalives_retries(), Some(9));
+        assert_eq!(pg.get_tcp_user_timeout(), Some(&Duration::from_secs(5)));
+
+        let pg = DatabaseConnection::from_url(&url("?keepalives=0"), None)
+            .expect("a url that turns keepalives off parses")
+            .pg;
+        assert!(!pg.get_keepalives());
     }
 
     #[test]
