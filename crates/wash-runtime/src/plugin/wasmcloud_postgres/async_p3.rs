@@ -61,8 +61,8 @@ type CompletionFuture = FutureReader<Result<(), Error>>;
 /// the sync `result-row` of named entries).
 mod conversions {
     use super::bindings::wasmcloud::postgres0_2_0::types::{
-        Date, HashableF64, MacAddressEui48, MacAddressEui64, Numeric, Offset, PgValue, Time,
-        Timestamp, TimestampTz,
+        Date, HashableF64, MacAddressEui48, MacAddressEui64, Offset, PgValue, Time, Timestamp,
+        TimestampTz,
     };
 
     include!("conversions.rs");

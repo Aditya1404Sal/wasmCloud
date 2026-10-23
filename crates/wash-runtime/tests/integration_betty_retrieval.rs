@@ -535,6 +535,19 @@ async fn an_undecodable_column_is_value_conversion_failed_naming_the_cause() -> 
     Ok(())
 }
 
+/// `numeric` and `money` columns were read as text, so `1::numeric` came back
+/// as `"\0\u{1}\0\0\0\0\0\0\0\u{1}"`. The money amount assumes the
+/// server's `lc_monetary` has two places, as the test database's does.
+#[tokio::test]
+#[ignore = "needs a pgvector database; run with `-- --ignored`"]
+async fn numeric_and_money_columns_decode_off_the_pool_and_in_a_transaction() -> Result<()> {
+    assert_eq!(
+        ask("/numeric-columns").await?,
+        "one=1 scaled=123.45 sum=5050 money=12.34 list=[1.5,-2,NaN] bound=100000"
+    );
+    Ok(())
+}
+
 #[tokio::test]
 #[ignore = "needs a pgvector database; run with `-- --ignored`"]
 async fn path_and_polygon_columns_decode_off_the_pool_and_in_a_transaction() -> Result<()> {

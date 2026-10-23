@@ -374,8 +374,18 @@ read before the call returns, so they are held to the cap above and to
 time binds only to a parameter of its own type (`timestamp` and
 `timestamptz` to either), and text does not bind to a fixed-width type such
 as `int4`, `float8` or `uuid`: each would be stored as a different value.
-Such a parameter is `invalid-params`. Text still binds to the types Postgres
+A `numeric`, `decimal` or `money` value (`NaN` and the infinities among them) binds only to a `numeric` parameter, not to an `int8`, `float8`, `money` or `timestamp` one, which would read its bytes as another value. Such a parameter is `invalid-params`. Text still binds to the types Postgres
 stores as text, such as `json`, `xml` and enums.
+
+`numeric` and `money` are decimal text both ways. A `numeric` column reads as
+Postgres prints it (`123.45`, `NaN`, `Infinity`); a `money` column as its
+amount with two places, which assumes the server's `lc_monetary` has two, as
+`C` and most locales do (otherwise select it as `::numeric`). A `numeric`
+parameter takes a sign, digits, a point and an exponent (`-1.5e3`), or `NaN`
+and the infinities; one past what Postgres holds (131072 digits before the
+point, 16383 after it) is `invalid-params`. A `money` value is still written
+as a `numeric`, which a `money` parameter refuses or misreads: bind a
+`numeric` and cast it in SQL (`$1::numeric::money`).
 
 ## A component has to be built for this host's wasmtime
 
