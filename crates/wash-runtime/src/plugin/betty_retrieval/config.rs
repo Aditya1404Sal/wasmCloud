@@ -15,12 +15,27 @@ use url::Url;
 /// when the right bytes are not already there. Naming a model is what lets an
 /// operator change models by changing the environment rather than by
 /// rebuilding this host.
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// `Debug` runs `catalog` and `mirror` through `redact_url`: either can carry
+/// a password in its userinfo or a token in its query string.
+#[derive(Clone, PartialEq, Eq)]
 pub struct ModelSelection {
     pub spec: String,
     pub catalog: Option<String>,
     pub cache: Option<PathBuf>,
     pub mirror: Option<String>,
+}
+
+impl std::fmt::Debug for ModelSelection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        use genius_embed::resolve::redact_url;
+        f.debug_struct("ModelSelection")
+            .field("spec", &self.spec)
+            .field("catalog", &self.catalog.as_deref().map(redact_url))
+            .field("cache", &self.cache)
+            .field("mirror", &self.mirror.as_deref().map(redact_url))
+            .finish()
+    }
 }
 
 impl ModelSelection {
@@ -234,6 +249,23 @@ impl BettyRetrievalConfig {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn model_selection_debug_keeps_urls_credentials_out() {
+        let selection = ModelSelection {
+            spec: "granite".to_string(),
+            catalog: Some("https://user:pass@example.com/c?token=abc".to_string()),
+            cache: Some(PathBuf::from("/var/cache/models")),
+            mirror: Some("https://mirroruser:mirrorpw@mirror.example.com/m".to_string()),
+        };
+        let printed = format!("{selection:?}");
+        assert!(!printed.contains("pass"), "{printed}");
+        assert!(!printed.contains("user:"), "{printed}");
+        assert!(!printed.contains("token=abc"), "{printed}");
+        assert!(!printed.contains("mirrorpw"), "{printed}");
+        assert!(printed.contains("example.com"), "{printed}");
+        assert!(printed.contains("granite"), "{printed}");
+    }
 
     fn config() -> BettyRetrievalConfig {
         BettyRetrievalConfig::new(

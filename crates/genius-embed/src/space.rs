@@ -22,7 +22,7 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::modelcfg::{ModelConfig, Pooling};
+use crate::modelcfg::{sha256_file, ModelConfig, Pooling};
 
 /// Domain separation tag, byte-for-byte from ruvector-core, trailing NUL
 /// included — it keeps the tag from running into the JSON's leading `{`.
@@ -234,15 +234,15 @@ fn sha256_hex(bytes: &[u8]) -> String {
 /// learns it from a real forward pass at load rather than trusting
 /// configuration, and the identity must describe what the code does.
 pub fn space_identity(cfg: &ModelConfig, output_dimension: usize) -> Result<SpaceIdentity> {
-    let model_bytes = std::fs::read(&cfg.model_path)
+    // Streamed: the graph is over 400 MB and need not be resident to be named.
+    let artifact = sha256_file(&cfg.model_path)
         .with_context(|| format!("hash ONNX model {}", cfg.model_path.display()))?;
-    let tokenizer_bytes = std::fs::read(&cfg.tokenizer_path)
+    let tokenizer_sha256 = sha256_file(&cfg.tokenizer_path)
         .with_context(|| format!("hash tokenizer {}", cfg.tokenizer_path.display()))?;
 
     // Both digests are the artifact digest for a single-file ONNX export: the
     // artifact *is* the graph. Two fields exist for runtimes that compile a
     // graph separately from its weights.
-    let artifact = sha256_hex(&model_bytes);
 
     // The bundle format is ruvector-core's `PromptTemplates` preimage. For a
     // symmetric, unprefixed model this reproduces the exact MiniLM bundle
@@ -264,7 +264,7 @@ pub fn space_identity(cfg: &ModelConfig, output_dimension: usize) -> Result<Spac
         model_id: cfg.model_id.clone(),
         model_artifact_sha256: artifact.clone(),
         model_graph_sha256: artifact,
-        tokenizer_sha256: sha256_hex(&tokenizer_bytes),
+        tokenizer_sha256,
         prompt_template_sha256: sha256_hex(template_bundle.as_bytes()),
         pooling_strategy: match cfg.pooling {
             Pooling::Mean => PoolingStrategy::Named(PoolingStrategyName::Mean),

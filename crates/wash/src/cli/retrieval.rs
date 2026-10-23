@@ -9,7 +9,10 @@ use std::time::Duration;
 use wash_runtime::plugin::betty_retrieval::{BettyRetrievalConfig, ModelSelection};
 
 /// Everything either front end can say about which model to run.
-#[derive(Debug, Clone, Default)]
+///
+/// `Debug` prints the catalog and mirror without their credentials or query
+/// string, which can carry a token.
+#[derive(Clone, Default)]
 pub(crate) struct ModelSettings {
     /// A model name, or a path to a descriptor.
     pub model: Option<String>,
@@ -18,6 +21,24 @@ pub(crate) struct ModelSettings {
     pub catalog: Option<String>,
     pub cache: Option<PathBuf>,
     pub mirror: Option<String>,
+}
+
+impl std::fmt::Debug for ModelSettings {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ModelSettings")
+            .field("model", &self.model)
+            .field("model_config", &self.model_config)
+            .field(
+                "catalog",
+                &self.catalog.as_deref().map(crate::config::redact_address),
+            )
+            .field("cache", &self.cache)
+            .field(
+                "mirror",
+                &self.mirror.as_deref().map(crate::config::redact_address),
+            )
+            .finish()
+    }
 }
 
 /// Which model to run, or `None` when no model was configured at all.
@@ -222,6 +243,23 @@ mod tests {
         .expect_err("a zero pool size must be refused by the plugin's own validate()")
         .to_string();
         assert!(err.contains("pool_size"), "{err}");
+    }
+
+    #[test]
+    fn model_settings_debug_leaves_out_catalog_and_mirror_credentials() {
+        let printed = format!(
+            "{:?}",
+            ModelSettings {
+                catalog: Some("https://u:hunter2@models.example/c?token=s3cr3t".to_string()),
+                mirror: Some("https://mirror.example/m?sig=s3cr3t".to_string()),
+                ..Default::default()
+            }
+        );
+        assert!(
+            !printed.contains("hunter2") && !printed.contains("s3cr3t"),
+            "{printed}"
+        );
+        assert!(printed.contains("models.example/c"), "{printed}");
     }
 
     #[test]

@@ -246,8 +246,15 @@ impl ModelConfig {
     pub fn parse(path: &Path) -> Result<Self> {
         let bytes = std::fs::read(path)
             .map_err(|e| anyhow::anyhow!("read model config {}: {e}", path.display()))?;
-        let mut cfg: Self = serde_json::from_slice(&bytes)
-            .map_err(|e| anyhow::anyhow!("parse model config {}: {e}", path.display()))?;
+        Self::parse_bytes(&bytes, &path.display().to_string())
+    }
+
+    /// [`ModelConfig::parse`] on bytes already in hand, for a caller that must
+    /// not re-read a file another process may be replacing. `origin` names the
+    /// bytes in an error.
+    pub fn parse_bytes(bytes: &[u8], origin: &str) -> Result<Self> {
+        let mut cfg: Self = serde_json::from_slice(bytes)
+            .map_err(|e| anyhow::anyhow!("parse model config {origin}: {e}"))?;
         // A digest is hex, and hex has two cases: `sha256_file` writes lower
         // case, PowerShell's Get-FileHash upper case. Compared as text, an
         // upper-case pin would refuse the very bytes it names.

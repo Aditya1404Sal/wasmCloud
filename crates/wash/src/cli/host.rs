@@ -451,9 +451,16 @@ pub struct HostCommand {
 
     /// Where model names are looked up: a directory, or an http(s) base URL,
     /// holding one `<name>.json` descriptor per model.
+    ///
+    /// An address can carry a token, so `--help` does not print the
+    /// environment variable's value and `Debug` prints a placeholder.
     #[cfg(feature = "betty-retrieval")]
-    #[arg(long = "retrieval-model-catalog", env = "WASH_RETRIEVAL_MODEL_CATALOG")]
-    pub retrieval_model_catalog: Option<String>,
+    #[arg(
+        long = "retrieval-model-catalog",
+        env = "WASH_RETRIEVAL_MODEL_CATALOG",
+        hide_env_values = true
+    )]
+    pub retrieval_model_catalog: Option<SecretUrl>,
 
     /// Where fetched model artifacts are kept. Unset uses the user's cache
     /// directory, so a second checkout does not download them again.
@@ -463,10 +470,15 @@ pub struct HostCommand {
 
     /// Download model artifacts from here instead of the address their
     /// descriptor names, for a machine that cannot reach the public one. The
-    /// pinned digests still decide whether the bytes are accepted.
+    /// pinned digests still decide whether the bytes are accepted. Withheld
+    /// from `--help` and `Debug` like `--retrieval-model-catalog`.
     #[cfg(feature = "betty-retrieval")]
-    #[arg(long = "retrieval-model-mirror", env = "WASH_RETRIEVAL_MODEL_MIRROR")]
-    pub retrieval_model_mirror: Option<String>,
+    #[arg(
+        long = "retrieval-model-mirror",
+        env = "WASH_RETRIEVAL_MODEL_MIRROR",
+        hide_env_values = true
+    )]
+    pub retrieval_model_mirror: Option<SecretUrl>,
 
     /// Maximum size of the betty-blocks:retrieval plugin's connection pool.
     /// Unset keeps the plugin's own default (8).
@@ -1245,9 +1257,15 @@ impl CliCommand for HostCommand {
         let retrieval_model = model_selection(ModelSettings {
             model: self.retrieval_model.clone(),
             model_config: self.retrieval_model_config.clone(),
-            catalog: self.retrieval_model_catalog.clone(),
+            catalog: self
+                .retrieval_model_catalog
+                .as_ref()
+                .map(|url| url.expose().to_string()),
             cache: self.retrieval_model_cache.clone(),
-            mirror: self.retrieval_model_mirror.clone(),
+            mirror: self
+                .retrieval_model_mirror
+                .as_ref()
+                .map(|url| url.expose().to_string()),
         });
         #[cfg(feature = "betty-retrieval")]
         match (&self.retrieval_database_url, retrieval_model) {
@@ -1943,6 +1961,18 @@ mod retrieval_tests {
             .find(|a| a.get_long() == Some("retrieval-database-url"))
             .expect("--retrieval-database-url must be a defined flag");
         assert!(arg.is_hide_env_values_set());
+    }
+
+    #[test]
+    fn help_does_not_print_the_model_catalog_or_mirror_environment_values() {
+        let command = TestCli::command();
+        for flag in ["retrieval-model-catalog", "retrieval-model-mirror"] {
+            let arg = command
+                .get_arguments()
+                .find(|a| a.get_long() == Some(flag))
+                .unwrap_or_else(|| panic!("--{flag} must be a defined flag"));
+            assert!(arg.is_hide_env_values_set(), "{flag}");
+        }
     }
 
     /// Locks in the env var names `wash host --help` documents and that

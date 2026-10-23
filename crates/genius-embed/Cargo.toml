@@ -37,7 +37,7 @@ fake = []
 # and digest-checking them when the cache does not already hold them. Optional
 # because only a host that may have to download needs an HTTP client; the wasm
 # component never resolves anything.
-fetch = ["dep:ureq"]
+fetch = ["dep:ureq", "dep:url"]
 
 [dependencies]
 anyhow     = "1"
@@ -55,3 +55,6 @@ tokenizers = { version = "=0.20.4", default-features = false, features = ["onig"
 # that is already about to load a 400 MB model, and a runtime-free client keeps
 # this crate usable from both a plain binary and a host plugin's init.
 ureq       = { version = "3", optional = true }
+# Parses a catalog or mirror address to decide whether it is loopback and to
+# strip credentials from what is logged; string slicing got both wrong.
+url        = { workspace = true, optional = true }
