@@ -113,6 +113,19 @@ impl Config {
         {
             dev.retrieval_database_url = Some(SecretUrl::new("<redacted>"));
         }
+        // The catalog and mirror may carry a token: keep where they point,
+        // drop the credentials and query string.
+        if let Some(dev) = shown.dev.as_mut() {
+            for address in [
+                &mut dev.retrieval_model_catalog,
+                &mut dev.retrieval_model_mirror,
+            ]
+            .into_iter()
+            .flatten()
+            {
+                *address = SecretUrl::new(redact_address(address.expose()));
+            }
+        }
         shown
     }
 
@@ -1345,6 +1358,9 @@ pub struct DevConfig {
     /// `WASH_RETRIEVAL_MODEL`), or `dev.retrieval_model_config`. Only takes
     /// effect in a wash build with the `betty-retrieval` feature.
     ///
+    /// Left unset, `WASH_RETRIEVAL_DATABASE_URL` supplies it, as it does for
+    /// `wash host`, for a project that names a model; a value here wins.
+    ///
     /// A [`SecretUrl`]: a plain string in the config file, a placeholder
     /// wherever this struct is printed with `Debug`.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1374,7 +1390,7 @@ pub struct DevConfig {
     /// holding one `<name>.json` descriptor per model. Overridden by
     /// `WASH_RETRIEVAL_MODEL_CATALOG`.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub retrieval_model_catalog: Option<String>,
+    pub retrieval_model_catalog: Option<SecretUrl>,
 
     /// Where fetched model artifacts are kept. Unset uses the user's cache
     /// directory. Overridden by `WASH_RETRIEVAL_MODEL_CACHE`.
@@ -1385,7 +1401,7 @@ pub struct DevConfig {
     /// descriptor names. The pinned digests still decide whether the bytes are
     /// accepted. Overridden by `WASH_RETRIEVAL_MODEL_MIRROR`.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub retrieval_model_mirror: Option<String>,
+    pub retrieval_model_mirror: Option<SecretUrl>,
 
     /// Maximum size of the betty-blocks:retrieval plugin's connection pool.
     /// Unset keeps the plugin's own default (8).
@@ -1709,14 +1725,45 @@ impl DevConfig {
         RetrievalModelSettings {
             model,
             model_config: self.retrieval_model_config_path(project_dir),
-            catalog: env("WASH_RETRIEVAL_MODEL_CATALOG")
-                .or_else(|| self.retrieval_model_catalog.clone()),
+            catalog: env("WASH_RETRIEVAL_MODEL_CATALOG").or_else(|| {
+                self.retrieval_model_catalog
+                    .as_ref()
+                    .map(|url| url.expose().to_string())
+            }),
             cache: env("WASH_RETRIEVAL_MODEL_CACHE")
                 .map(PathBuf::from)
                 .or_else(|| self.retrieval_model_cache.clone()),
-            mirror: env("WASH_RETRIEVAL_MODEL_MIRROR")
-                .or_else(|| self.retrieval_model_mirror.clone()),
+            mirror: env("WASH_RETRIEVAL_MODEL_MIRROR").or_else(|| {
+                self.retrieval_model_mirror
+                    .as_ref()
+                    .map(|url| url.expose().to_string())
+            }),
         }
+    }
+
+    /// The plugin's database url: `dev.retrieval_database_url` if the file
+    /// sets it, otherwise `WASH_RETRIEVAL_DATABASE_URL`, as `wash host` takes
+    /// the same variable (there an explicit flag beats the variable, here an
+    /// explicit file value does).
+    ///
+    /// Like the other `WASH_RETRIEVAL_*` variables, it counts only for a
+    /// project that already uses the plugin by naming a model, so exporting it
+    /// for `wash host` does not turn the plugin on, or fail `wash dev`, for
+    /// every project on the machine. A blank value names nothing.
+    pub fn retrieval_database_url_with_env(
+        &self,
+        read_env: impl Fn(&str) -> Option<String>,
+    ) -> Option<SecretUrl> {
+        if self.retrieval_database_url.is_some() {
+            return self.retrieval_database_url.clone();
+        }
+        let names_a_model = self.retrieval_model.is_some() || self.retrieval_model_config.is_some();
+        names_a_model
+            .then(|| read_env("WASH_RETRIEVAL_DATABASE_URL"))
+            .flatten()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .map(SecretUrl::new)
     }
 
     pub fn validate(&self) -> Result<()> {
@@ -1777,10 +1824,11 @@ impl DevConfig {
                 &mut errors,
             );
         }
-        if let Some(url) = &self.retrieval_database_url {
+        let retrieval_database_url = self.retrieval_database_url_with_env(&read_env);
+        if let Some(url) = &retrieval_database_url {
             // The value is left out of the message: a url can carry a password.
             match url::Url::parse(url.expose()) {
-                Ok(url) => check_url_scheme(
+                Ok(url) => check_url_scheme_only(
                     "dev.retrieval_database_url",
                     &url,
                     &["postgres", "postgresql"],
@@ -1804,7 +1852,7 @@ impl DevConfig {
         // named only in the environment means is `wash dev`'s to decide when
         // it starts.
         let model_in_env = names_a_model(read_env("WASH_RETRIEVAL_MODEL"));
-        match (self.retrieval_database_url.is_some(), model_in_file) {
+        match (retrieval_database_url.is_some(), model_in_file) {
             (true, false) if !model_in_env => errors.push(
                 "dev.retrieval_database_url is set but no model is: set dev.retrieval_model \
                  (or WASH_RETRIEVAL_MODEL) to a model name or a descriptor path, or \
@@ -2207,6 +2255,37 @@ impl From<String> for SecretUrl {
     }
 }
 
+/// Whether `s` begins `scheme://`, with a scheme as RFC 3986 spells one. A
+/// directory path has a `/` or `\\` before any `://`, so it never matches.
+fn has_scheme(s: &str) -> bool {
+    let Some((scheme, _)) = s.trim_start().split_once("://") else {
+        return false;
+    };
+    let mut chars = scheme.chars();
+    chars.next().is_some_and(|c| c.is_ascii_alphabetic())
+        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+}
+
+/// A catalog or mirror address as it may be printed: for a `scheme://` address,
+/// without its userinfo, query string or fragment; a directory as written.
+pub(crate) fn redact_address(address: &str) -> String {
+    // Any `scheme://`, not only http(s): `s3://k:secret@b` is no directory.
+    if !has_scheme(address) {
+        return address.to_string();
+    }
+    match url::Url::parse(address.trim()) {
+        Ok(mut parsed) => {
+            let _ = parsed.set_username("");
+            let _ = parsed.set_password(None);
+            parsed.set_query(None);
+            parsed.set_fragment(None);
+            parsed.to_string()
+        }
+        // Not echoed: what failed to parse may still hold the secret.
+        Err(_) => "<unparseable address>".to_string(),
+    }
+}
+
 /// Returns `url` with its username and password masked, for logs and errors.
 pub(crate) fn redact_url(url: &url::Url) -> url::Url {
     let mut redacted = url.clone();
@@ -2228,6 +2307,25 @@ fn check_url_scheme(field: &str, value: &url::Url, expected: &[&str], errors: &m
     errors.push(format!(
         "{field} '{}' has scheme '{}', expected one of: {}",
         redact_url(value),
+        value.scheme(),
+        expected.join(", ")
+    ));
+}
+
+/// [`check_url_scheme`] for a url whose secret can sit anywhere in it, in the
+/// userinfo or in a query parameter: the message names the scheme alone.
+fn check_url_scheme_only(
+    field: &str,
+    value: &url::Url,
+    expected: &[&str],
+    errors: &mut Vec<String>,
+) {
+    if expected.contains(&value.scheme()) {
+        return;
+    }
+
+    errors.push(format!(
+        "{field} has scheme '{}', expected one of: {}",
         value.scheme(),
         expected.join(", ")
     ));
@@ -2699,6 +2797,140 @@ workload:
     }
 
     #[test]
+    fn a_scheme_error_names_the_scheme_and_nothing_else_of_the_url() {
+        for url in [
+            "mysql://localhost/db?password=hunter2",
+            "mysql://u:hunter2@localhost/db",
+            "mysql://localhost/db?sslpassword=hunter2#hunter2",
+        ] {
+            let cfg = DevConfig {
+                retrieval_database_url: Some(SecretUrl::new(url)),
+                retrieval_model_config: Some(PathBuf::from("models/granite.json")),
+                ..Default::default()
+            };
+            let err = cfg.validate().unwrap_err().to_string();
+            assert!(err.contains("scheme 'mysql'"), "{err}");
+            assert!(!err.contains("hunter2"), "{err}");
+        }
+    }
+
+    #[test]
+    fn the_catalog_and_mirror_print_without_their_credentials() {
+        let dev = DevConfig {
+            retrieval_model_catalog: Some(SecretUrl::new(
+                "https://u:hunter2@models.example/c?token=s3cr3t",
+            )),
+            retrieval_model_mirror: Some(SecretUrl::new("https://mirror.example/m?sig=s3cr3t")),
+            ..Default::default()
+        };
+        let config = Config {
+            dev: Some(dev.clone()),
+            ..Default::default()
+        };
+        // Debug withholds the value, and `wash config show` keeps the host.
+        for printed in [format!("{dev:?}"), format!("{config:#?}")] {
+            assert!(
+                !printed.contains("hunter2") && !printed.contains("s3cr3t"),
+                "{printed}"
+            );
+        }
+        let shown = config.for_display();
+        for printed in [
+            serde_yaml_ng::to_string(&shown).unwrap(),
+            serde_json::to_value(&shown).unwrap().to_string(),
+        ] {
+            assert!(
+                !printed.contains("hunter2") && !printed.contains("s3cr3t"),
+                "{printed}"
+            );
+            assert!(printed.contains("models.example/c"), "{printed}");
+            assert!(printed.contains("mirror.example/m"), "{printed}");
+        }
+        // The saved config keeps what was written.
+        assert!(
+            serde_yaml_ng::to_string(&config)
+                .unwrap()
+                .contains("s3cr3t")
+        );
+    }
+
+    #[test]
+    fn redact_address_strips_userinfo_query_and_fragment_but_leaves_a_directory() {
+        assert_eq!(
+            redact_address("HTTPS://u:p@models.example:8443/c?token=t#f"),
+            "https://models.example:8443/c"
+        );
+        assert_eq!(redact_address("/srv/catalog"), "/srv/catalog");
+        assert_eq!(
+            redact_address("s3://k:secret@bucket/m?sig=1"),
+            "s3://bucket/m"
+        );
+        assert_eq!(
+            redact_address("S3://k:secret@[bad"),
+            "<unparseable address>"
+        );
+        assert_eq!(redact_address("rel/a://b@c"), "rel/a://b@c");
+        assert_eq!(redact_address("https://[bad"), "<unparseable address>");
+    }
+
+    #[test]
+    fn dev_takes_the_database_url_from_the_environment_as_wash_host_does() {
+        let in_env = |key: &str| {
+            (key == "WASH_RETRIEVAL_DATABASE_URL")
+                .then(|| "postgres://u:hunter2@db.internal/retrieval".to_string())
+        };
+        // A project that names a model uses the plugin, so the variable counts.
+        let dev = DevConfig {
+            retrieval_model: Some("granite".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            dev.retrieval_database_url_with_env(in_env)
+                .as_ref()
+                .map(SecretUrl::expose),
+            Some("postgres://u:hunter2@db.internal/retrieval")
+        );
+        dev.validate_with_env(in_env)
+            .expect("model in the file, database in the environment");
+
+        // The file wins, as an explicit flag wins over the variable in `wash host`.
+        let both = DevConfig {
+            retrieval_database_url: Some(SecretUrl::new("postgres://file/db")),
+            ..dev.clone()
+        };
+        assert_eq!(
+            both.retrieval_database_url_with_env(in_env)
+                .as_ref()
+                .map(SecretUrl::expose),
+            Some("postgres://file/db")
+        );
+
+        // A project that does not use the plugin ignores it, and a blank
+        // variable names nothing.
+        assert!(
+            DevConfig::default()
+                .retrieval_database_url_with_env(in_env)
+                .is_none()
+        );
+        assert!(
+            dev.retrieval_database_url_with_env(|_| Some("  ".to_string()))
+                .is_none()
+        );
+
+        // The environment's value is checked like the file's, without echoing it.
+        let err = dev
+            .validate_with_env(|key| {
+                (key == "WASH_RETRIEVAL_DATABASE_URL").then(|| "mysql://u:hunter2@h/db".to_string())
+            })
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("scheme 'mysql'") && !err.contains("hunter2"),
+            "{err}"
+        );
+    }
+
+    #[test]
     fn dev_retrieval_url_errors_leave_out_the_password() {
         for url in [
             "postgres://genius:hunter2@127.0.0.1:5543x/genius_retrieval",
@@ -2970,7 +3202,7 @@ workload:
         // file.
         let dev = DevConfig {
             retrieval_model: Some("from-the-file".to_string()),
-            retrieval_model_catalog: Some("/catalog/from/file".to_string()),
+            retrieval_model_catalog: Some(SecretUrl::new("/catalog/from/file")),
             ..Default::default()
         };
         let project = Path::new("/project");
@@ -2999,9 +3231,9 @@ workload:
         assert!(DevConfig::default().retrieval_keys_set().is_empty());
         let dev = DevConfig {
             retrieval_model: Some("granite-107m".to_string()),
-            retrieval_model_catalog: Some("https://models.example/catalog".to_string()),
+            retrieval_model_catalog: Some(SecretUrl::new("https://models.example/catalog")),
             retrieval_model_cache: Some(PathBuf::from("cache")),
-            retrieval_model_mirror: Some("https://mirror.example".to_string()),
+            retrieval_model_mirror: Some(SecretUrl::new("https://mirror.example")),
             retrieval_ca_file: Some(PathBuf::from("ca.pem")),
             ..Default::default()
         };

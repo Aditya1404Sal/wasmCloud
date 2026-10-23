@@ -46,7 +46,7 @@ So:
 
 ## What differs from the source, on purpose
 
-Only files the source does not have, three lines of `Cargo.toml`, one
+Only files the source does not have, a few lines of `Cargo.toml`, one
 comment, and how a model reaches the disk:
 
 - `Cargo.toml`: `default = []` where the source has `default = ["adapter"]`.
@@ -82,6 +82,24 @@ comment, and how a model reaches the disk:
     descriptor is replaced the same way. Two hosts sharing one cache no longer
     write into each other's files, and a mismatch no longer deletes a file
     another host just put in place.
+  - Every request has a connect (10 s), response (30 s) and whole-body
+    (10 min) timeout, so a stalled catalog, mirror or source fails the
+    resolve instead of hanging host startup.
+  - An artifact is streamed into its temp file while its SHA-256 is computed,
+    with a hard cap of 2 GiB (a catalog entry: 1 MiB); it is never held in
+    memory. A stale cached artifact is replaced by the rename, not deleted
+    first, and the descriptor is parsed from the bytes fetched (or read once
+    from the cache), not re-read from the shared path. Temp files are removed
+    on every error path, and `.partial` files over an hour old are swept.
+  - Catalog, mirror and source addresses are parsed with the `url` crate, so
+    the plain-http check looks at the real host and the scheme is
+    case-insensitive. `redact_url` strips userinfo, query and fragment from
+    every error, and `Request`'s `Debug` uses it.
+  - A model name made only of dots is refused.
+- `src/space.rs`: `space_identity` hashes the two artifacts by streaming
+  (`sha256_file`) rather than reading them whole. The digests are the same.
+- `src/modelcfg.rs`: `ModelConfig::parse_bytes`, which `parse` now calls.
+- `Cargo.toml`: `fetch` also enables the optional `url` dependency.
 - `README.md` (this file) and `rustfmt.toml`, which keeps the crate on
   rustfmt's defaults so that `cargo fmt` here does not reformat it away from
   the source.

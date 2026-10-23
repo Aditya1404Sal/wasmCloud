@@ -2108,6 +2108,7 @@ dependencies = [
  "sha2 0.10.9",
  "tokenizers",
  "ureq",
+ "url",
 ]
 
 [[package]]

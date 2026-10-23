@@ -407,7 +407,10 @@ impl CliCommand for DevCommand {
             })
         };
         #[cfg(feature = "betty-retrieval")]
-        match (&dev_config.retrieval_database_url, retrieval_model) {
+        match (
+            &dev_config.retrieval_database_url_with_env(|key| std::env::var(key).ok()),
+            retrieval_model,
+        ) {
             (Some(database_url), Some(model)) => {
                 let retrieval_config = build_betty_retrieval_config(
                     database_url.expose().to_string(),
