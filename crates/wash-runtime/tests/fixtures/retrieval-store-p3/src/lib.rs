@@ -59,6 +59,9 @@
 //!     hold only a NULL, then its `commit`. The test sets a 1 KiB cap.
 //!   - `/oversized-row` — a query whose one row holds 64 MiB, then the next
 //!     statement on the pool.
+//!   - `/numeric-columns` — `numeric`, `money` and `numeric[]` columns, and a
+//!     numeric bound in exponent form, read off the pool and again in a
+//!     transaction.
 //!
 //! The test runs the plugin with a pool of one connection, so the statements a
 //! route runs share one Postgres session unless the plugin replaced it; two for
@@ -128,6 +131,7 @@ async fn run(path: &str) -> Result<String, String> {
         "/cancel-loop" => cancel_loop().await,
         "/null-rows-transaction-query" => null_rows_transaction_query().await,
         "/oversized-row" => oversized_row().await,
+        "/numeric-columns" => numeric_columns().await,
         other => Err(format!("no route {other}")),
     }
 }
@@ -713,6 +717,55 @@ async fn oversized_row() -> Result<String, String> {
     };
     let after = integer(only(&rows("SELECT 1", Vec::new()).await?)?)?;
     Ok(format!("rows={delivered} done={outcome} then={after}"))
+}
+
+/// A `numeric` literal, one with a scale, a sum of `int8`s (which is a
+/// `numeric`; a sum of `int4`s is an `int8`), a `money`, a `numeric[]`, and
+/// `1e5` bound as a numeric and read back.
+const NUMERIC_SQL: &str = "SELECT 1::numeric, 123.45::numeric, \
+            (SELECT sum(g::int8) FROM generate_series(1, 100) AS g), \
+            '12.34'::money, ARRAY[1.5, -2, 'NaN']::numeric[], $1::numeric";
+
+/// What each numeric column decoded to, off the pool and in a transaction:
+/// the two paths decode rows in different places on the host.
+async fn numeric_columns() -> Result<String, String> {
+    let bound = || vec![Param::Value(PgValue::Numeric("1e5".to_string()))];
+    let pooled = numeric_row(&rows(NUMERIC_SQL, bound()).await?)?;
+    let tx = begin().await?;
+    let (_columns, mut stream, completion) = tx
+        .query(NUMERIC_SQL.to_string(), bound())
+        .await
+        .map_err(debug)?;
+    let mut in_transaction = Vec::new();
+    while let Some(row) = stream.next().await {
+        in_transaction.push(row);
+    }
+    completion.await.map_err(debug)?;
+    Transaction::commit(tx).await.map_err(debug)?;
+    let in_transaction = numeric_row(&in_transaction)?;
+    if pooled != in_transaction {
+        return Err(format!(
+            "the pool read {pooled}, the transaction {in_transaction}"
+        ));
+    }
+    Ok(pooled)
+}
+
+fn numeric_row(rows: &[Vec<PgValue>]) -> Result<String, String> {
+    match rows {
+        [row] => match row.as_slice() {
+            [PgValue::Numeric(one), PgValue::Numeric(scaled), PgValue::Numeric(sum), PgValue::Money(money), PgValue::NumericArray(list), PgValue::Numeric(bound)] => {
+                Ok(format!(
+                    "one={one} scaled={scaled} sum={sum} money={money} list=[{}] bound={bound}",
+                    list.join(",")
+                ))
+            }
+            _ => Err(format!(
+                "expected numerics, a money and a numeric array, got {row:?}"
+            )),
+        },
+        _ => Err(format!("expected one row, got {rows:?}")),
+    }
 }
 
 /// Awaits the completion first: the rows past the stream's buffer then wait

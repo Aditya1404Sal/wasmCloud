@@ -196,6 +196,9 @@ fn scalar_fits(value: &PgValue, ty: &Type) -> bool {
         PgValue::Timestamp(_) | PgValue::TimestampTz(_) => {
             matches!(*ty, Type::TIMESTAMP | Type::TIMESTAMPTZ)
         }
+        // Written in the numeric wire format, NaN and the infinities too, and
+        // money as a numeric (the statement casts it: `$1::numeric::money`).
+        PgValue::Numeric(_) | PgValue::Decimal(_) | PgValue::Money(_) => *ty == Type::NUMERIC,
         PgValue::Text(_) => !FIXED_WIDTH.contains(ty),
         _ => true,
     }
@@ -844,6 +847,43 @@ mod tests {
                 "{ty}: {err}"
             );
             assert!(out.is_empty(), "{ty}: a refused parameter writes nothing");
+        }
+    }
+
+    /// A numeric, decimal or money value (NaN and the infinities among them)
+    /// is written in the numeric wire format, so only a `numeric` parameter
+    /// reads it back as itself. Bound to an int8, float8, money or timestamp,
+    /// Postgres would read the bytes as a different value, or fail.
+    #[test]
+    fn a_numeric_value_binds_only_to_a_numeric_parameter() {
+        let domain = custom_type("price", Kind::Domain(Type::NUMERIC));
+        for value in [
+            PgValue::Numeric("NaN".to_string()),
+            PgValue::Decimal("Infinity".to_string()),
+            PgValue::Money("-Infinity".to_string()),
+            PgValue::Numeric("12.50".to_string()),
+        ] {
+            for ty in [
+                Type::INT8,
+                Type::INT4,
+                Type::FLOAT8,
+                Type::MONEY,
+                Type::TIMESTAMP,
+                Type::TEXT,
+            ] {
+                let mut out = BytesMut::new();
+                let err = Bound::Value(value.clone())
+                    .to_sql_checked(&ty, &mut out)
+                    .err()
+                    .unwrap_or_else(|| panic!("{value:?} must not bind to {ty}"));
+                assert!(err.is::<ParamEncodeError>(), "{ty}: {err}");
+                assert!(out.is_empty(), "{ty}: a refused parameter writes nothing");
+            }
+            for ty in [Type::NUMERIC, domain.clone()] {
+                Bound::Value(value.clone())
+                    .to_sql_checked(&ty, &mut BytesMut::new())
+                    .unwrap_or_else(|e| panic!("{value:?} must bind to {ty}: {e}"));
+            }
         }
     }
 
