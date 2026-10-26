@@ -495,18 +495,70 @@ mod tests {
         assert!(element_size(&Type::INT8) >= size_of::<i64>());
     }
 
+    /// `BETTY_RETRIEVAL_TEST_DATABASE_URL` when set; otherwise a
+    /// `pgvector/pgvector:pg17` container, which lives as long as the handle
+    /// returned with its URL. This is the rule of `tests/common/retrieval.rs`:
+    /// CI's step for ignored tests sets no database URL and has Docker.
+    async fn test_database() -> (
+        String,
+        Option<testcontainers::ContainerAsync<testcontainers::GenericImage>>,
+    ) {
+        use testcontainers::{
+            GenericImage, ImageExt,
+            core::{IntoContainerPort, WaitFor},
+            runners::AsyncRunner,
+        };
+        if let Ok(url) = std::env::var("BETTY_RETRIEVAL_TEST_DATABASE_URL") {
+            return (url, None);
+        }
+        let container = GenericImage::new("pgvector/pgvector", "pg17")
+            .with_exposed_port(5432.tcp())
+            .with_wait_for(WaitFor::message_on_stderr(
+                "database system is ready to accept connections",
+            ))
+            .with_env_var("POSTGRES_PASSWORD", "postgres")
+            .start()
+            .await
+            .expect("start a pgvector container");
+        let port = container
+            .get_host_port_ipv4(5432)
+            .await
+            .expect("the container's postgres port");
+        (
+            format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres"),
+            Some(container),
+        )
+    }
+
+    /// A client of `url`, retried while the server starts: the image logs its
+    /// ready line for its initdb server too, which takes no TCP connections.
+    async fn connect(url: &str) -> tokio_postgres::Client {
+        for _ in 0..40 {
+            if let Ok((client, connection)) =
+                tokio_postgres::connect(url, tokio_postgres::NoTls).await
+            {
+                tokio::spawn(connection);
+                return client;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
+        let (client, connection) = tokio_postgres::connect(url, tokio_postgres::NoTls)
+            .await
+            .expect("postgres never became ready");
+        tokio::spawn(connection);
+        client
+    }
+
     /// The same bounds against rows a server really sends: what a row is
     /// charged is not less than the decoded values hold, and is far more than
-    /// the wire bytes for the shapes that grow. Needs a database.
+    /// the wire bytes for the shapes that grow. Needs a database:
+    /// `BETTY_RETRIEVAL_TEST_DATABASE_URL`, or Docker for a container.
     #[tokio::test]
-    #[ignore = "needs a database; set BETTY_RETRIEVAL_TEST_DATABASE_URL"]
+    #[ignore = "needs a database: BETTY_RETRIEVAL_TEST_DATABASE_URL, or Docker"]
     async fn a_row_off_the_wire_costs_what_it_decodes_to() {
         use super::super::bindings::conversions::row_to_values;
-        let url = std::env::var("BETTY_RETRIEVAL_TEST_DATABASE_URL").expect("database url");
-        let (client, connection) = tokio_postgres::connect(&url, tokio_postgres::NoTls)
-            .await
-            .expect("connect");
-        tokio::spawn(connection);
+        let (url, _container) = test_database().await;
+        let client = connect(&url).await;
         let wire = |row: &tokio_postgres::Row| -> usize {
             (0..row.len())
                 .map(|i| row.try_get::<_, Wire>(i).map_or(0, |w| w.0))
