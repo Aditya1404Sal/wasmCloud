@@ -27,7 +27,6 @@ use chrono::{
 };
 use cidr::IpCidr;
 use geo_types::{LineString, Point, Rect, coord};
-use pg_bigdecimal::PgNumeric;
 use postgres_types::{FromSql, IsNull, PgLsn, ToSql, Type as PgType};
 use tokio_postgres::Row;
 use uuid::Uuid;
@@ -377,6 +376,308 @@ impl FromSql<'_> for MacAddressEui64 {
     }
 }
 
+// ── numeric and money, written from and read to their decimal text ─────────
+
+/// The most digits a `numeric` holds before its point, and after it:
+/// Postgres's own limits (a weight of `i16::MAX` base-10000 digits, and
+/// `NUMERIC_DSCALE_MAX`).
+const NUMERIC_MAX_INTEGER_DIGITS: i64 = 131_072;
+const NUMERIC_MAX_SCALE: i64 = 16_383;
+
+/// The sign word of Postgres's binary `numeric`.
+const NUMERIC_POSITIVE: u16 = 0x0000;
+const NUMERIC_NEGATIVE: u16 = 0x4000;
+const NUMERIC_NAN: u16 = 0xC000;
+const NUMERIC_INFINITY: u16 = 0xD000;
+const NUMERIC_NEGATIVE_INFINITY: u16 = 0xF000;
+
+/// The start of `text`, for an error message: a guest may send megabytes.
+fn numeric_shown(text: &str) -> String {
+    let mut end = text.len().min(64);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    if end < text.len() {
+        format!("{}…", &text[..end])
+    } else {
+        text.to_string()
+    }
+}
+
+/// A numeric's exponent, `[+-]digits`, if it is one and within `i32`, which
+/// keeps the arithmetic on it from overflowing and is far past what any
+/// numeric can hold anyway.
+fn numeric_exponent(text: &str) -> Option<i64> {
+    let digits = text.strip_prefix(['+', '-']).unwrap_or(text);
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    i32::from_str(text).ok().map(i64::from)
+}
+
+/// `text` as Postgres's binary `numeric`: a decimal number with an optional
+/// sign, point and exponent (`-12.50`, `1.5e3`), or `NaN`, `Infinity` or
+/// `-Infinity`. Each digit is read once and placed by where it falls.
+///
+/// Not through `pg_bigdecimal`: a value in exponent form (`1e5`) made that
+/// raise ten to a power of about four billion, which never finished and took
+/// memory until the host was killed, and its arithmetic grows with the
+/// square of the digits. A value past what Postgres holds (131072 digits
+/// before the point, 16383 after it) is refused before anything is expanded.
+fn numeric_to_sql(text: &str, out: &mut BytesMut) -> Result<IsNull, Box<dyn Error + Sync + Send>> {
+    fn header(out: &mut BytesMut, digits: u16, weight: i16, sign: u16, scale: u16) {
+        out.put_u16(digits);
+        out.put_i16(weight);
+        out.put_u16(sign);
+        out.put_u16(scale);
+    }
+
+    if text.len() <= "+Infinity".len() {
+        let special = match text.to_ascii_lowercase().as_str() {
+            "nan" => Some(NUMERIC_NAN),
+            "infinity" | "+infinity" | "inf" | "+inf" => Some(NUMERIC_INFINITY),
+            "-infinity" | "-inf" => Some(NUMERIC_NEGATIVE_INFINITY),
+            _ => None,
+        };
+        if let Some(sign) = special {
+            header(out, 0, 0, sign, 0);
+            return Ok(IsNull::No);
+        }
+    }
+
+    let invalid = || format!("invalid numeric [{}]", numeric_shown(text));
+    let (negative, unsigned) = match text.strip_prefix('-') {
+        Some(unsigned) => (true, unsigned),
+        None => (false, text.strip_prefix('+').unwrap_or(text)),
+    };
+    let (mantissa, exponent) = match unsigned.split_once(['e', 'E']) {
+        Some((mantissa, exponent)) => (
+            mantissa,
+            numeric_exponent(exponent).ok_or_else(|| {
+                format!(
+                    "invalid numeric [{}]: its exponent is not an integer within ±2^31",
+                    numeric_shown(text)
+                )
+            })?,
+        ),
+        None => (unsigned, 0),
+    };
+    let (integer, fraction) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+    let all_digits = |part: &str| part.bytes().all(|b| b.is_ascii_digit());
+    if (integer.is_empty() && fraction.is_empty()) || !all_digits(integer) || !all_digits(fraction)
+    {
+        return Err(invalid().into());
+    }
+
+    let too_long = || format!("invalid numeric [{}]: it is too long", numeric_shown(text));
+    let integer_len = i64::try_from(integer.len()).map_err(|_| too_long())?;
+    let fraction_len = i64::try_from(fraction.len()).map_err(|_| too_long())?;
+    // The display scale: the digits after the point once the exponent has
+    // moved it, as Postgres counts them.
+    let scale = (fraction_len - exponent).max(0);
+    if scale > NUMERIC_MAX_SCALE {
+        return Err(format!(
+            "numeric [{}] has {scale} digits after the point; Postgres holds at most \
+             {NUMERIC_MAX_SCALE}",
+            numeric_shown(text)
+        )
+        .into());
+    }
+    let scale = u16::try_from(scale).map_err(|_| invalid())?;
+
+    let digits = || integer.bytes().chain(fraction.bytes()).map(|b| b - b'0');
+    let Some(first) = digits().position(|d| d != 0) else {
+        // Zero: no digits, and never negative.
+        header(out, 0, 0, NUMERIC_POSITIVE, scale);
+        return Ok(IsNull::No);
+    };
+    let count = integer.len() + fraction.len();
+    let last = count - 1 - digits().rev().position(|d| d != 0).unwrap_or(0);
+
+    // The power of ten of the digit at index `i` is `point - 1 - i`.
+    let point = integer_len + exponent;
+    let index = |i: usize| i64::try_from(i).map_err(|_| too_long());
+    let first_power = point - 1 - index(first)?;
+    let last_power = point - 1 - index(last)?;
+    if first_power + 1 > NUMERIC_MAX_INTEGER_DIGITS {
+        return Err(format!(
+            "numeric [{}] has {} digits before the point; Postgres holds at most \
+             {NUMERIC_MAX_INTEGER_DIGITS}",
+            numeric_shown(text),
+            first_power + 1
+        )
+        .into());
+    }
+
+    // Base-10000 digits, the first at `weight`: each holds the four decimal
+    // digits whose powers of ten floor-divide by four to its position.
+    const POWERS: [i16; 4] = [1, 10, 100, 1000];
+    let weight = first_power.div_euclid(4);
+    let groups = usize::try_from(weight - last_power.div_euclid(4) + 1).map_err(|_| invalid())?;
+    let mut base_10000 = vec![0_i16; groups];
+    for (i, digit) in digits().enumerate().take(last + 1).skip(first) {
+        let power = point - 1 - index(i)?;
+        let group = usize::try_from(weight - power.div_euclid(4)).map_err(|_| invalid())?;
+        let place = usize::try_from(power.rem_euclid(4)).map_err(|_| invalid())?;
+        if let (Some(slot), Some(unit)) = (base_10000.get_mut(group), POWERS.get(place)) {
+            *slot += i16::from(digit) * unit;
+        }
+    }
+
+    header(
+        out,
+        u16::try_from(groups).map_err(|_| invalid())?,
+        i16::try_from(weight).map_err(|_| invalid())?,
+        if negative {
+            NUMERIC_NEGATIVE
+        } else {
+            NUMERIC_POSITIVE
+        },
+        scale,
+    );
+    for group in base_10000 {
+        out.put_i16(group);
+    }
+    Ok(IsNull::No)
+}
+
+/// One member of a `numeric[]` or `money[]` value, written by
+/// [`numeric_to_sql`].
+#[derive(Debug)]
+struct NumericText<'a>(&'a str);
+
+impl ToSql for NumericText<'_> {
+    fn to_sql(
+        &self,
+        _ty: &PgType,
+        out: &mut BytesMut,
+    ) -> Result<IsNull, Box<dyn Error + Sync + Send>> {
+        numeric_to_sql(self.0, out)
+    }
+
+    fn accepts(_ty: &PgType) -> bool {
+        true
+    }
+
+    tokio_postgres::types::to_sql_checked!();
+}
+
+/// A binary `numeric` as Postgres prints it (`-12.50`, `NaN`, `Infinity`),
+/// worked out from its base-10000 digits. Each digit is read once.
+///
+/// Not through `pg_bigdecimal`: its decoder raises 10000 to the power of each
+/// digit's place, which grows faster than the square of the digits (18
+/// seconds for 40,000 digits in a debug build), and a guest chooses the
+/// values it selects.
+fn numeric_from_sql(raw: &[u8]) -> Result<String, Box<dyn Error + Sync + Send>> {
+    use std::fmt::Write as _;
+
+    let (header, body) = raw
+        .split_first_chunk::<8>()
+        .ok_or_else(|| format!("a numeric value carries {} bytes, too few for its header", raw.len()))?;
+    let [count_hi, count_lo, weight_hi, weight_lo, sign_hi, sign_lo, scale_hi, scale_lo] = *header;
+    let count = usize::from(u16::from_be_bytes([count_hi, count_lo]));
+    let weight = i64::from(i16::from_be_bytes([weight_hi, weight_lo]));
+    let scale = usize::from(u16::from_be_bytes([scale_hi, scale_lo]));
+    let negative = match u16::from_be_bytes([sign_hi, sign_lo]) {
+        NUMERIC_POSITIVE => false,
+        NUMERIC_NEGATIVE => true,
+        NUMERIC_NAN => return Ok("NaN".to_string()),
+        NUMERIC_INFINITY => return Ok("Infinity".to_string()),
+        NUMERIC_NEGATIVE_INFINITY => return Ok("-Infinity".to_string()),
+        other => return Err(format!("a numeric value has the unknown sign {other:#06x}").into()),
+    };
+    let (digits, rest) = body.as_chunks::<2>();
+    if digits.len() != count || !rest.is_empty() {
+        return Err(format!(
+            "a numeric value says it holds {count} digits but carries {} bytes of them",
+            body.len()
+        )
+        .into());
+    }
+    let digits: Vec<u16> = digits.iter().map(|digit| u16::from_be_bytes(*digit)).collect();
+    if digits.iter().any(|digit| *digit > 9999) {
+        return Err("a numeric value holds a base-10000 digit past 9999".into());
+    }
+    if i64::try_from(scale).map_or(true, |scale| scale > NUMERIC_MAX_SCALE) {
+        return Err(format!("a numeric value has the display scale {scale}").into());
+    }
+    // The base-10000 digit at `place`, counted from the first one.
+    let digit = |place: i64| {
+        usize::try_from(place)
+            .ok()
+            .and_then(|place| digits.get(place))
+            .copied()
+            .unwrap_or(0)
+    };
+
+    let mut text = String::new();
+    if negative {
+        text.push('-');
+    }
+    if weight < 0 {
+        text.push('0');
+    } else {
+        for place in 0..=weight {
+            // The first digit without leading zeros, as Postgres prints it.
+            let _ = if place == 0 {
+                write!(text, "{}", digit(place))
+            } else {
+                write!(text, "{:04}", digit(place))
+            };
+        }
+    }
+    if scale > 0 {
+        text.push('.');
+        let start = text.len();
+        let mut place = weight + 1;
+        while text.len() - start < scale {
+            let _ = write!(text, "{:04}", digit(place));
+            place += 1;
+        }
+        text.truncate(start + scale);
+    }
+    Ok(text)
+}
+
+/// A binary `money` as its amount with two places. Postgres sends money as
+/// an `int8` of the currency's smallest unit, which is a hundredth under the
+/// `C` locale and most others of `lc_monetary`.
+fn money_from_sql(raw: &[u8]) -> Result<String, Box<dyn Error + Sync + Send>> {
+    let cents = <[u8; 8]>::try_from(raw)
+        .map(i64::from_be_bytes)
+        .map_err(|_| format!("a money value carries {} bytes, not 8", raw.len()))?;
+    let sign = if cents < 0 { "-" } else { "" };
+    let cents = cents.unsigned_abs();
+    Ok(format!("{sign}{}.{:02}", cents / 100, cents % 100))
+}
+
+/// One member of a `numeric[]` value, decoded by [`numeric_from_sql`].
+struct NumericValue(String);
+
+impl FromSql<'_> for NumericValue {
+    fn from_sql(_ty: &PgType, raw: &[u8]) -> Result<Self, Box<dyn Error + Sync + Send>> {
+        numeric_from_sql(raw).map(Self)
+    }
+
+    fn accepts(ty: &PgType) -> bool {
+        *ty == PgType::NUMERIC
+    }
+}
+
+/// One member of a `money[]` value, decoded by [`money_from_sql`].
+struct MoneyValue(String);
+
+impl FromSql<'_> for MoneyValue {
+    fn from_sql(_ty: &PgType, raw: &[u8]) -> Result<Self, Box<dyn Error + Sync + Send>> {
+        money_from_sql(raw).map(Self)
+    }
+
+    fn accepts(ty: &PgType) -> bool {
+        *ty == PgType::MONEY
+    }
+}
+
 // ── ToSql for PgValue ───────────────────────────────────────────────────────
 
 impl ToSql for PgValue {
@@ -407,19 +708,11 @@ impl ToSql for PgValue {
                 .to_sql(ty, out),
             PgValue::Integer(n) | PgValue::Int(n) | PgValue::Int4(n) => n.to_sql(ty, out),
             PgValue::Int4Array(ns) => ns.to_sql(ty, out),
-            PgValue::Numeric(s) | PgValue::Decimal(s) | PgValue::Money(s) => {
-                let bigd = pg_bigdecimal::BigDecimal::parse_bytes(s.as_bytes(), 10)
-                    .ok_or_else(|| format!("failed to parse bigint [{s}]"))?;
-                PgNumeric::new(Some(bigd)).to_sql(ty, out)
-            }
+            PgValue::Numeric(s) | PgValue::Decimal(s) | PgValue::Money(s) => numeric_to_sql(s, out),
             PgValue::NumericArray(ss) | PgValue::MoneyArray(ss) => ss
                 .iter()
-                .map(|s| {
-                    pg_bigdecimal::BigDecimal::parse_bytes(s.as_bytes(), 10)
-                        .map(|v| PgNumeric::new(Some(v)))
-                        .ok_or_else(|| format!("failed to parse bigint [{s}]"))
-                })
-                .collect::<Result<Vec<PgNumeric>, _>>()?
+                .map(|s| NumericText(s))
+                .collect::<Vec<_>>()
                 .to_sql(ty, out),
             PgValue::SmallInt(n) | PgValue::Int2(n) => n.to_sql(ty, out),
             PgValue::Int2Array(ns) => ns.to_sql(ty, out),
@@ -828,16 +1121,21 @@ impl FromSql<'_> for PgValue {
                 Err("int8 ranges are not yet supported".into())
             }
 
-            &tokio_postgres::types::Type::MONEY => Ok(PgValue::Money(Numeric::from_sql(ty, raw)?)),
-            &tokio_postgres::types::Type::MONEY_ARRAY => {
-                Ok(PgValue::MoneyArray(Vec::<Numeric>::from_sql(ty, raw)?))
-            }
-            &tokio_postgres::types::Type::NUMERIC => {
-                Ok(PgValue::Numeric(Numeric::from_sql(ty, raw)?))
-            }
-            &tokio_postgres::types::Type::NUMERIC_ARRAY => {
-                Ok(PgValue::NumericArray(Vec::<Numeric>::from_sql(ty, raw)?))
-            }
+            // Both used to be read as text, which their binary forms are not.
+            &tokio_postgres::types::Type::MONEY => Ok(PgValue::Money(money_from_sql(raw)?)),
+            &tokio_postgres::types::Type::MONEY_ARRAY => Ok(PgValue::MoneyArray(
+                Vec::<MoneyValue>::from_sql(ty, raw)?
+                    .into_iter()
+                    .map(|money| money.0)
+                    .collect(),
+            )),
+            &tokio_postgres::types::Type::NUMERIC => Ok(PgValue::Numeric(numeric_from_sql(raw)?)),
+            &tokio_postgres::types::Type::NUMERIC_ARRAY => Ok(PgValue::NumericArray(
+                Vec::<NumericValue>::from_sql(ty, raw)?
+                    .into_iter()
+                    .map(|numeric| numeric.0)
+                    .collect(),
+            )),
             &tokio_postgres::types::Type::NUMMULTI_RANGE
             | &tokio_postgres::types::Type::NUMMULTI_RANGE_ARRAY
             | &tokio_postgres::types::Type::NUM_RANGE
@@ -1322,5 +1620,369 @@ mod tests {
             let err = decode(&PgType::PATH, raw).expect_err(what);
             assert!(err.contains("path"), "{what}: {err}");
         }
+    }
+
+    /// `value` encoded as `ty` on a thread of its own, giving up after a
+    /// second. A numeric in exponent form used to make that encoding raise ten
+    /// to a power of about four billion, which never finished and took memory
+    /// until the host was killed.
+    fn encode_within_a_second(value: PgValue, ty: PgType) -> Result<BytesMut, String> {
+        use std::sync::mpsc::{RecvTimeoutError, channel};
+        let what = format!("{value:?} as {ty}");
+        let (done, outcome) = channel();
+        std::thread::spawn(move || {
+            let mut out = BytesMut::new();
+            let encoded = value
+                .to_sql(&ty, &mut out)
+                .map(|_| out)
+                .map_err(|e| e.to_string());
+            let _ = done.send(encoded);
+        });
+        match outcome.recv_timeout(std::time::Duration::from_secs(1)) {
+            Ok(encoded) => encoded,
+            Err(RecvTimeoutError::Timeout) => panic!("encoding {what} took over a second"),
+            Err(RecvTimeoutError::Disconnected) => panic!("encoding {what} panicked"),
+        }
+    }
+
+    /// What Postgres reads from an encoded `numeric`, by an independent decoder.
+    fn numeric_read_back(raw: &[u8]) -> String {
+        pg_bigdecimal::PgNumeric::from_sql(&PgType::NUMERIC, raw)
+            .expect("an encoded numeric decodes")
+            .n
+            .expect("not NaN")
+            .to_string()
+    }
+
+    #[test]
+    fn a_numeric_in_exponent_form_encodes_its_value_quickly() {
+        for (text, value) in [
+            ("1e5", "100000"),
+            ("1e+21", "1000000000000000000000"),
+            ("1.5e3", "1500"),
+            ("-2.5E2", "-250"),
+            ("12e-1", "1.2"),
+            ("1.50e1", "15.0"),
+        ] {
+            for variant in [
+                PgValue::Numeric(text.to_string()),
+                PgValue::Decimal(text.to_string()),
+            ] {
+                let raw = encode_within_a_second(variant, PgType::NUMERIC)
+                    .unwrap_or_else(|e| panic!("{text} must encode: {e}"));
+                assert_eq!(numeric_read_back(&raw), value, "{text}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_numeric_array_with_an_exponent_member_encodes_its_values_quickly() {
+        let raw = encode_within_a_second(
+            PgValue::NumericArray(vec!["1e5".to_string(), "2.50".to_string()]),
+            PgType::NUMERIC_ARRAY,
+        )
+        .expect("the array encodes");
+        let members: Vec<String> =
+            Vec::<pg_bigdecimal::PgNumeric>::from_sql(&PgType::NUMERIC_ARRAY, &raw)
+                .expect("the encoded array decodes")
+                .into_iter()
+                .map(|member| member.n.expect("not NaN").to_string())
+                .collect();
+        assert_eq!(members, ["100000", "2.50"]);
+    }
+
+    /// Postgres holds at most 131072 digits before a numeric's point and
+    /// 16383 after it. A value past either is refused before any of it is
+    /// expanded, and an exponent past an `i64` is refused rather than
+    /// overflowing.
+    #[test]
+    fn a_numeric_past_what_postgres_holds_is_refused_quickly() {
+        for text in [
+            "1e131072",
+            "-9.9e131072",
+            "1e-16384",
+            "0.5e-16383",
+            "1e99999999999999999999",
+            "1e-9223372036854775808",
+            "1e9223372036854775807",
+        ] {
+            let refused = encode_within_a_second(PgValue::Numeric(text.to_string()), PgType::NUMERIC);
+            assert!(refused.is_err(), "{text} must be refused");
+        }
+        let array = PgValue::NumericArray(vec!["1".to_string(), "1e131072".to_string()]);
+        assert!(encode_within_a_second(array, PgType::NUMERIC_ARRAY).is_err());
+    }
+
+    /// The numerics at Postgres's two limits, in its binary form: a digit
+    /// count, a weight in base 10000, a sign, a display scale, then the digits.
+    /// One followed by 131071 zeros is the digit 1000 at weight 32767; one at
+    /// the 16383rd place after the point is the digit 10 at weight -4096.
+    #[test]
+    fn a_numeric_at_postgres_limits_still_encodes() {
+        let raw = encode_within_a_second(PgValue::Numeric("1e131071".to_string()), PgType::NUMERIC)
+            .expect("131072 digits before the point fit");
+        assert_eq!(raw[..], [0, 1, 0x7f, 0xff, 0, 0, 0, 0, 0x03, 0xe8]);
+        let raw = encode_within_a_second(PgValue::Numeric("1e-16383".to_string()), PgType::NUMERIC)
+            .expect("16383 digits after the point fit");
+        assert_eq!(raw[..], [0, 1, 0xf0, 0x00, 0, 0, 0x3f, 0xff, 0, 10]);
+    }
+
+    /// Every digit Postgres holds, before the point and after it, still
+    /// encodes well inside the second: each digit is read once.
+    #[test]
+    fn a_numeric_with_every_digit_postgres_holds_encodes_quickly() {
+        let widest = format!("{}.{}", "9".repeat(131_072), "9".repeat(16_383));
+        let raw = encode_within_a_second(PgValue::Numeric(widest), PgType::NUMERIC)
+            .expect("the widest numeric encodes");
+        // 32768 base-10000 digits before the point and 4096 after it.
+        assert_eq!(raw[..8], [0x90, 0x00, 0x7f, 0xff, 0, 0, 0x3f, 0xff]);
+        assert_eq!(raw.len(), 8 + 2 * 36_864);
+    }
+
+    #[test]
+    fn nan_and_the_infinities_encode_as_their_own_signs() {
+        for (text, sign) in [
+            ("NaN", 0xc0_u8),
+            ("nan", 0xc0),
+            ("Infinity", 0xd0),
+            ("+inf", 0xd0),
+            ("-Infinity", 0xf0),
+        ] {
+            let raw = encode_within_a_second(PgValue::Numeric(text.to_string()), PgType::NUMERIC)
+                .unwrap_or_else(|e| panic!("{text} must encode: {e}"));
+            assert_eq!(raw[..], [0, 0, 0, 0, sign, 0, 0, 0], "{text}");
+        }
+    }
+
+    #[test]
+    fn text_that_is_not_a_number_is_refused_as_a_numeric() {
+        for text in [
+            "", "-", ".", "e5", "1e", "1e+", "1.2.3", "1,5", " 1", "1 ", "0x10", "1_000",
+        ] {
+            assert!(
+                encode_within_a_second(PgValue::Numeric(text.to_string()), PgType::NUMERIC).is_err(),
+                "{text:?} must be refused"
+            );
+        }
+    }
+
+    /// Every ordinary value encodes byte for byte as the `pg_bigdecimal`
+    /// encoder, which handled these correctly, wrote it.
+    #[test]
+    fn an_ordinary_numeric_encodes_as_before() {
+        use std::str::FromStr as _;
+        for text in [
+            "1",
+            "-1",
+            "7",
+            "10000",
+            "10000.5",
+            "123.45",
+            "1.50",
+            "0.001",
+            "-0.0000001",
+            "0.00010000",
+            "99999999",
+            "100000000",
+            "98765432109876543210.0123456789",
+            "+42.4200",
+            "000123.4500",
+        ] {
+            let mut expected = BytesMut::new();
+            pg_bigdecimal::PgNumeric::new(Some(
+                pg_bigdecimal::BigDecimal::from_str(text).expect("the reference parses it"),
+            ))
+            .to_sql(&PgType::NUMERIC, &mut expected)
+            .expect("the reference encodes it");
+            let raw = encode_within_a_second(PgValue::Numeric(text.to_string()), PgType::NUMERIC)
+                .unwrap_or_else(|e| panic!("{text} must encode: {e}"));
+            assert_eq!(raw, expected, "{text}");
+        }
+    }
+
+    /// Zero has no digits, whatever its scale or sign.
+    #[test]
+    fn zero_encodes_with_no_digits_and_its_scale() {
+        for (text, value) in [
+            ("0", "0"),
+            ("-0", "0"),
+            ("0.00", "0.00"),
+            ("0e5", "0"),
+            ("0.0e-3", "0.0000"),
+        ] {
+            let raw = encode_within_a_second(PgValue::Numeric(text.to_string()), PgType::NUMERIC)
+                .unwrap_or_else(|e| panic!("{text} must encode: {e}"));
+            assert_eq!(raw[..2], [0, 0], "{text}: no digits");
+            assert_eq!(numeric_read_back(&raw), value, "{text}");
+        }
+    }
+
+    /// `text` encoded as a `numeric`, the way the server sends one.
+    fn numeric_bytes(text: &str) -> BytesMut {
+        let mut out = BytesMut::new();
+        PgValue::Numeric(text.to_string())
+            .to_sql(&PgType::NUMERIC, &mut out)
+            .unwrap_or_else(|e| panic!("{text} encodes: {e}"));
+        out
+    }
+
+    /// A `numeric` column was read as text, so `SELECT 1::numeric` gave
+    /// `"\0\u{1}\0\0\0\0\0\0\0\u{1}"`.
+    #[test]
+    fn a_numeric_column_decodes_to_its_decimal_text() {
+        for (text, read) in [
+            ("1", "1"),
+            ("123.45", "123.45"),
+            ("-0.001", "-0.001"),
+            ("1.50", "1.50"),
+            ("0", "0"),
+            ("0.00", "0.00"),
+            ("10000", "10000"),
+            ("5050", "5050"),
+            ("1e5", "100000"),
+            (
+                "98765432109876543210.0123456789",
+                "98765432109876543210.0123456789",
+            ),
+            ("-123456789.000000001", "-123456789.000000001"),
+            ("NaN", "NaN"),
+            ("Infinity", "Infinity"),
+            ("-Infinity", "-Infinity"),
+        ] {
+            match decode(&PgType::NUMERIC, &numeric_bytes(text)) {
+                Ok(PgValue::Numeric(decoded)) => assert_eq!(decoded, read, "{text}"),
+                other => panic!("{text}: expected a numeric, got {other:?}"),
+            }
+        }
+    }
+
+    /// Zero as `pg_bigdecimal` wrote it, at weight -2: a sender other than
+    /// Postgres may not normalise it.
+    #[test]
+    fn a_numeric_zero_at_any_weight_decodes_to_zero() {
+        let raw = [0, 0, 0xff, 0xfe, 0, 0, 0, 2];
+        match decode(&PgType::NUMERIC, &raw) {
+            Ok(PgValue::Numeric(decoded)) => assert_eq!(decoded, "0.00"),
+            other => panic!("expected a numeric, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_numeric_array_column_decodes_each_member() {
+        let raw = array_bytes(
+            &PgType::NUMERIC_ARRAY,
+            vec![
+                numeric_bytes("1.5"),
+                numeric_bytes("-2"),
+                numeric_bytes("NaN"),
+            ],
+        );
+        match decode(&PgType::NUMERIC_ARRAY, &raw) {
+            Ok(PgValue::NumericArray(decoded)) => assert_eq!(decoded, ["1.5", "-2", "NaN"]),
+            other => panic!("expected a numeric array, got {other:?}"),
+        }
+    }
+
+    /// Decoding reads each digit once: the widest numeric Postgres holds
+    /// comes back well inside a second. `pg_bigdecimal`'s decoder took 18
+    /// seconds for 40,000 digits.
+    #[test]
+    fn the_widest_numeric_decodes_quickly() {
+        use std::sync::mpsc::channel;
+        let widest = format!("{}.{}", "9".repeat(131_072), "9".repeat(16_383));
+        let raw = numeric_bytes(&widest);
+        let (done, decoded) = channel();
+        std::thread::spawn(move || {
+            let _ = done.send(decode(&PgType::NUMERIC, &raw));
+        });
+        match decoded.recv_timeout(std::time::Duration::from_secs(1)) {
+            Ok(Ok(PgValue::Numeric(text))) => assert!(text == widest, "the widest numeric changed"),
+            Ok(other) => panic!(
+                "expected a numeric, got {:?}",
+                other.map(|_| "another value")
+            ),
+            Err(e) => panic!("decoding the widest numeric did not finish within a second: {e}"),
+        }
+    }
+
+    #[test]
+    fn a_malformed_numeric_is_an_error_not_a_value() {
+        let mut too_long = numeric_bytes("1.5").to_vec();
+        too_long.push(0);
+        for (what, raw) in [
+            ("no bytes", vec![]),
+            ("a short header", vec![0, 1, 0, 0]),
+            ("a missing digit", vec![0, 1, 0, 0, 0, 0, 0, 0]),
+            (
+                "a digit past 9999",
+                vec![0, 1, 0, 0, 0, 0, 0, 0, 0x27, 0x10],
+            ),
+            ("an unknown sign", vec![0, 0, 0, 0, 0x12, 0x34, 0, 0]),
+            ("a trailing byte", too_long),
+        ] {
+            assert!(decode(&PgType::NUMERIC, &raw).is_err(), "{what}");
+        }
+    }
+
+    /// Postgres sends `money` as an `int8` of cents (two places for `C` and
+    /// most locales of `lc_monetary`).
+    #[test]
+    fn a_money_column_decodes_to_its_amount() {
+        for (cents, amount) in [
+            (12_345_i64, "123.45"),
+            (-5, "-0.05"),
+            (0, "0.00"),
+            (100, "1.00"),
+            (i64::MIN, "-92233720368547758.08"),
+            (i64::MAX, "92233720368547758.07"),
+        ] {
+            match decode(&PgType::MONEY, &cents.to_be_bytes()) {
+                Ok(PgValue::Money(decoded)) => assert_eq!(decoded, amount, "{cents}"),
+                other => panic!("{cents}: expected money, got {other:?}"),
+            }
+        }
+        let raw = array_bytes(
+            &PgType::MONEY_ARRAY,
+            [1_234_i64, -1]
+                .iter()
+                .map(|cents| BytesMut::from(&cents.to_be_bytes()[..]))
+                .collect(),
+        );
+        match decode(&PgType::MONEY_ARRAY, &raw) {
+            Ok(PgValue::MoneyArray(decoded)) => assert_eq!(decoded, ["12.34", "-0.01"]),
+            other => panic!("expected a money array, got {other:?}"),
+        }
+        assert!(
+            decode(&PgType::MONEY, &[0, 1, 2]).is_err(),
+            "three bytes are no money"
+        );
+    }
+
+    /// A `PgValue::Numeric` bound to a parameter of type `ty`.
+    fn bind_numeric(text: &str, ty: &PgType) -> Result<BytesMut, String> {
+        let mut out = BytesMut::new();
+        PgValue::Numeric(text.to_string())
+            .to_sql_checked(ty, &mut out)
+            .map(|_| out)
+            .map_err(|e| e.to_string())
+    }
+
+    #[test]
+    fn a_numeric_bound_to_a_numeric_or_a_domain_over_one_encodes() {
+        let domain = PgType::new(
+            "price".to_string(),
+            u32::MAX,
+            postgres_types::Kind::Domain(PgType::NUMERIC),
+            "public".to_string(),
+        );
+        let expected = numeric_bytes("12.50");
+        for ty in [PgType::NUMERIC, domain] {
+            let raw = bind_numeric("12.50", &ty).unwrap_or_else(|e| panic!("{ty}: {e}"));
+            assert_eq!(raw, expected, "{ty}");
+        }
+        let mut out = BytesMut::new();
+        PgValue::NumericArray(vec!["1".to_string()])
+            .to_sql_checked(&PgType::NUMERIC_ARRAY, &mut out)
+            .expect("a numeric array binds to numeric[]");
     }
 }

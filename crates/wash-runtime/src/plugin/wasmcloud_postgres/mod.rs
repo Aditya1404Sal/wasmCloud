@@ -9,7 +9,7 @@ mod async_p3;
 mod conversions {
     use super::bindings::wasmcloud::postgres0_1_1_draft::query::{PgValue, ResultRow};
     use super::bindings::wasmcloud::postgres0_1_1_draft::types::{
-        Date, HashableF64, MacAddressEui48, MacAddressEui64, Numeric, Offset, ResultRowEntry, Time,
+        Date, HashableF64, MacAddressEui48, MacAddressEui64, Offset, ResultRowEntry, Time,
         Timestamp, TimestampTz,
     };
 
